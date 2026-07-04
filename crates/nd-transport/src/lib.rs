@@ -8,7 +8,7 @@
 //! Note : le squelette utilise `Vec<u8>` ; l'implémentation passera à `bytes::Bytes`
 //! (zéro-copie) et à `quinn` pour QUIC.
 
-use nd_proto::{ChannelKind, NdError, Reliability, Result};
+use nd_proto::{ChannelKind, Reliability, Result};
 
 /// Poignée opaque d'un canal logique ouvert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,10 +34,5 @@ pub trait Transport: Send {
     fn path_estimate(&self) -> PathEstimate;
 }
 
-/// Ouvre une connexion de transport vers un pair (adresse déjà résolue via
-/// `nd-signaling`). Non implémenté à ce stade.
-pub fn connect(_remote: &str) -> Result<Box<dyn Transport>> {
-    Err(NdError::NotImplemented(
-        "nd-transport::connect (QUIC/quinn à venir, voir plan 04/16)",
-    ))
-}
+mod quic;
+pub use quic::{bind, connect, Listener, QuicTransport};
