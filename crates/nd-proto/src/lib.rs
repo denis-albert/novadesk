@@ -134,6 +134,8 @@ pub enum NdError {
     Capture(String),
     /// Erreur d'encodage/décodage (voir `nd-codec`).
     Codec(String),
+    /// Erreur d'injection d'entrées (voir `nd-input`).
+    Input(String),
     /// Erreur d'entrée/sortie sous-jacente.
     Io(std::io::Error),
     /// Fonctionnalité pas encore implémentée à ce stade du projet.
@@ -148,6 +150,7 @@ impl fmt::Display for NdError {
             NdError::Crypto(m) => write!(f, "crypto : {m}"),
             NdError::Capture(m) => write!(f, "capture : {m}"),
             NdError::Codec(m) => write!(f, "codec : {m}"),
+            NdError::Input(m) => write!(f, "input : {m}"),
             NdError::Io(e) => write!(f, "io : {e}"),
             NdError::NotImplemented(what) => write!(f, "non implémenté : {what}"),
         }

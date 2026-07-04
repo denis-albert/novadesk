@@ -5,7 +5,7 @@
 //! priorité maximale (voir plan 04). Mapping clavier, écran sécurisé/UAC et Wayland :
 //! `../../plan-technique/07-injection-entrees.md`.
 
-use nd_proto::{MonitorId, NdError, Result};
+use nd_proto::{MonitorId, Result};
 
 /// Bouton de souris.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,9 +40,21 @@ pub trait InputInjector: Send + Sync {
     fn release_all(&self);
 }
 
+#[cfg(windows)]
+mod win;
+
 /// Crée l'injecteur adapté à la plateforme courante.
+///
+/// Windows : `SendInput`. Autres OS : à venir (Phase 4+, voir plan 07/16).
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
-    Err(NdError::NotImplemented(
-        "nd-input::create_injector (impl OS à venir, voir plan 07/16)",
-    ))
+    #[cfg(windows)]
+    {
+        Ok(Box::new(win::SendInputInjector::new()))
+    }
+    #[cfg(not(windows))]
+    {
+        Err(nd_proto::NdError::NotImplemented(
+            "nd-input::create_injector (impl macOS/Linux à venir, voir plan 07/16)",
+        ))
+    }
 }
