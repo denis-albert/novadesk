@@ -1,0 +1,12 @@
+[package]
+name = "nd-rendezvous"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Serveur de signalisation / rendez-vous (analogue hbbs). Voir plan 05/11."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

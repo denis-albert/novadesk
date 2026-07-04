@@ -1,0 +1,12 @@
+[package]
+name = "nd-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Session chiffrée de bout en bout (Noise), empreintes et SAS (voir plan 06)."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

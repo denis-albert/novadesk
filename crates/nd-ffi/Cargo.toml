@@ -1,0 +1,13 @@
+[package]
+name = "nd-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pont entre le cœur Rust et l'UI Flutter via flutter_rust_bridge (voir plan 10)."
+
+[dependencies]
+nd-proto = { workspace = true }
+nd-core = { workspace = true }
+
+[lints]
+workspace = true

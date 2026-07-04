@@ -1,0 +1,12 @@
+[package]
+name = "nd-files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Transfert de fichiers, presse-papiers partagé, impression (voir plan 09)."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

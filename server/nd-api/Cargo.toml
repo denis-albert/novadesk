@@ -1,0 +1,12 @@
+[package]
+name = "nd-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "API applicative : carnet d'adresses, licences, mises à jour. Voir plan 11/15."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

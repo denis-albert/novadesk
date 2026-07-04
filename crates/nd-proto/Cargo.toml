@@ -1,0 +1,11 @@
+[package]
+name = "nd-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Types partagés, versions de protocole et erreurs communes de NovaDesk."
+
+[dependencies]
+
+[lints]
+workspace = true

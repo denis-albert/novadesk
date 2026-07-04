@@ -1,0 +1,12 @@
+[package]
+name = "nd-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Injection d'entrées clavier/souris/tactile par OS (voir plan 07)."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

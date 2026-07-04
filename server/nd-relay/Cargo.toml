@@ -1,0 +1,12 @@
+[package]
+name = "nd-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Serveur de relais / TURN (analogue hbbr), tuyau chiffré aveugle. Voir plan 05/11."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

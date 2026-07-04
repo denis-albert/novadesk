@@ -1,0 +1,15 @@
+[package]
+name = "nd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Orchestration de session NovaDesk : machine à états, assemblage du pipeline."
+
+[dependencies]
+nd-proto = { workspace = true }
+nd-transport = { workspace = true }
+nd-crypto = { workspace = true }
+nd-features = { workspace = true }
+
+[lints]
+workspace = true

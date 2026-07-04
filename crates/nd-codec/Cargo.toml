@@ -1,0 +1,13 @@
+[package]
+name = "nd-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Codec vidéo : traits VideoEncoder/VideoDecoder, matériel d'abord (voir plan 03)."
+
+[dependencies]
+nd-proto = { workspace = true }
+nd-capture = { workspace = true }
+
+[lints]
+workspace = true

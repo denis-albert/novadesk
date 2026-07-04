@@ -1,0 +1,6 @@
+# Normalisation des fins de ligne : LF partout dans le dépôt (projet multiplateforme).
+* text=auto eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+Cargo.lock text eol=lf

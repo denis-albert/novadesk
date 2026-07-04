@@ -1,0 +1,12 @@
+[package]
+name = "nd-signaling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Client de rendez-vous, ICE/STUN/TURN, mise en relation P2P (voir plan 05)."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

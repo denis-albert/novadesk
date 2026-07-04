@@ -1,0 +1,12 @@
+[package]
+name = "nd-accounts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Service comptes / authentification (OAuth2/OIDC, 2FA). Voir plan 11."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

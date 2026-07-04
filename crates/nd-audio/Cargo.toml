@@ -1,0 +1,12 @@
+[package]
+name = "nd-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Capture et lecture audio, codec Opus, synchro A/V (voir plan 08)."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+[lints]
+workspace = true

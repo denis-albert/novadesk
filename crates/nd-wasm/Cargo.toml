@@ -1,0 +1,17 @@
+[package]
+name = "nd-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Cible WebAssembly du client web (voir plan 12)."
+
+[dependencies]
+nd-proto = { workspace = true }
+nd-core = { workspace = true }
+
+[lib]
+# `cdylib` requis pour la cible wasm ; `rlib` pour pouvoir tester sur l'hôte.
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

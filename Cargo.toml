@@ -1,0 +1,53 @@
+# Workspace NovaDesk — squelette de la Phase 0/1.
+# Structure conforme à ../plan-technique/01-architecture-globale.md §3.
+[workspace]
+resolver = "2"
+members = [
+    "crates/nd-proto",
+    "crates/nd-capture",
+    "crates/nd-codec",
+    "crates/nd-input",
+    "crates/nd-audio",
+    "crates/nd-transport",
+    "crates/nd-crypto",
+    "crates/nd-signaling",
+    "crates/nd-files",
+    "crates/nd-features",
+    "crates/nd-core",
+    "crates/nd-ffi",
+    "crates/nd-wasm",
+    "server/nd-rendezvous",
+    "server/nd-relay",
+    "server/nd-accounts",
+    "server/nd-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+authors = ["Équipe NovaDesk"]
+
+# Dépendances internes (chemins). Les dépendances externes lourdes (tokio, quinn,
+# snow, windows-rs...) sont ajoutées crate par crate au fil de l'implémentation.
+[workspace.dependencies]
+nd-proto = { path = "crates/nd-proto" }
+nd-capture = { path = "crates/nd-capture" }
+nd-codec = { path = "crates/nd-codec" }
+nd-input = { path = "crates/nd-input" }
+nd-audio = { path = "crates/nd-audio" }
+nd-transport = { path = "crates/nd-transport" }
+nd-crypto = { path = "crates/nd-crypto" }
+nd-signaling = { path = "crates/nd-signaling" }
+nd-files = { path = "crates/nd-files" }
+nd-features = { path = "crates/nd-features" }
+nd-core = { path = "crates/nd-core" }
+
+# Barre de qualité (voir ../plan-technique/14-tests-qualite-performance.md).
+# `unsafe_code = "warn"` : les crates plateforme le passeront en `allow` localement
+# et documenteront chaque bloc `// SAFETY:`.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

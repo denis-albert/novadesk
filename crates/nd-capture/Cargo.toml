@@ -1,0 +1,22 @@
+[package]
+name = "nd-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Capture d'écran : trait ScreenCapturer et implémentations par OS (voir plan 02)."
+
+[dependencies]
+nd-proto = { workspace = true }
+
+# Implémentation Windows : DXGI Desktop Duplication via windows-rs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[lints]
+workspace = true
