@@ -121,6 +121,108 @@ pub enum Reliability {
     UnreliableFec,
 }
 
+/// Événement d'entrée transporté du contrôleur vers la machine contrôlée (canal
+/// `Input`). Voir `plan-technique/07-injection-entrees.md`.
+///
+/// Sérialisation binaire compacte maison (grand-boutiste) — `nd-proto` reste sans
+/// dépendance externe. Le mapping vers l'injection OS est dans `nd-core::apply_input`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    /// Déplacement absolu, coordonnées normalisées 0.0–1.0 sur le moniteur.
+    MouseMoveAbs { x: f64, y: f64, monitor: u32 },
+    /// Déplacement relatif en pixels.
+    MouseMoveRel { dx: f64, dy: f64 },
+    /// Bouton souris (0=gauche, 1=droit, 2=milieu, 3=X1, 4=X2).
+    MouseButton { button: u8, down: bool },
+    /// Molette (crans ; positif = haut/droite).
+    Scroll { dx: f64, dy: f64 },
+    /// Touche par scancode physique.
+    Key { scancode: u32, down: bool },
+    /// Caractère Unicode (point de code).
+    Unicode { codepoint: u32 },
+}
+
+impl InputEvent {
+    /// Sérialise l'événement en binaire.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24);
+        match *self {
+            InputEvent::MouseMoveAbs { x, y, monitor } => {
+                out.push(0);
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
+                out.extend_from_slice(&monitor.to_be_bytes());
+            }
+            InputEvent::MouseMoveRel { dx, dy } => {
+                out.push(1);
+                out.extend_from_slice(&dx.to_be_bytes());
+                out.extend_from_slice(&dy.to_be_bytes());
+            }
+            InputEvent::MouseButton { button, down } => {
+                out.push(2);
+                out.push(button);
+                out.push(u8::from(down));
+            }
+            InputEvent::Scroll { dx, dy } => {
+                out.push(3);
+                out.extend_from_slice(&dx.to_be_bytes());
+                out.extend_from_slice(&dy.to_be_bytes());
+            }
+            InputEvent::Key { scancode, down } => {
+                out.push(4);
+                out.extend_from_slice(&scancode.to_be_bytes());
+                out.push(u8::from(down));
+            }
+            InputEvent::Unicode { codepoint } => {
+                out.push(5);
+                out.extend_from_slice(&codepoint.to_be_bytes());
+            }
+        }
+        out
+    }
+
+    /// Désérialise un événement depuis le format de [`InputEvent::to_bytes`].
+    /// Renvoie `None` si les octets sont invalides ou incomplets.
+    #[must_use]
+    pub fn from_bytes(data: &[u8]) -> Option<InputEvent> {
+        let (&tag, rest) = data.split_first()?;
+        let f64_at = |o: usize| -> Option<f64> {
+            Some(f64::from_be_bytes(rest.get(o..o + 8)?.try_into().ok()?))
+        };
+        let u32_at = |o: usize| -> Option<u32> {
+            Some(u32::from_be_bytes(rest.get(o..o + 4)?.try_into().ok()?))
+        };
+        match tag {
+            0 => Some(InputEvent::MouseMoveAbs {
+                x: f64_at(0)?,
+                y: f64_at(8)?,
+                monitor: u32_at(16)?,
+            }),
+            1 => Some(InputEvent::MouseMoveRel {
+                dx: f64_at(0)?,
+                dy: f64_at(8)?,
+            }),
+            2 => Some(InputEvent::MouseButton {
+                button: *rest.first()?,
+                down: *rest.get(1)? != 0,
+            }),
+            3 => Some(InputEvent::Scroll {
+                dx: f64_at(0)?,
+                dy: f64_at(8)?,
+            }),
+            4 => Some(InputEvent::Key {
+                scancode: u32_at(0)?,
+                down: *rest.get(4)? != 0,
+            }),
+            5 => Some(InputEvent::Unicode {
+                codepoint: u32_at(0)?,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Erreur commune du projet. Chaque couche l'enrichit via ses variantes.
 #[derive(Debug)]
 pub enum NdError {
@@ -216,5 +318,32 @@ mod tests {
     fn affichage_id_groupe_par_trois() {
         assert_eq!(NovaId(123_456_789).to_string(), "123 456 789");
         assert_eq!(NovaId(1_000).to_string(), "000 001 000");
+    }
+
+    #[test]
+    fn input_event_roundtrip() {
+        let events = [
+            InputEvent::MouseMoveAbs {
+                x: 0.25,
+                y: 0.75,
+                monitor: 1,
+            },
+            InputEvent::MouseMoveRel { dx: -3.5, dy: 12.0 },
+            InputEvent::MouseButton {
+                button: 2,
+                down: true,
+            },
+            InputEvent::Scroll { dx: 0.0, dy: -1.0 },
+            InputEvent::Key {
+                scancode: 0x1E,
+                down: false,
+            },
+            InputEvent::Unicode { codepoint: 0x41 },
+        ];
+        for ev in events {
+            assert_eq!(InputEvent::from_bytes(&ev.to_bytes()), Some(ev));
+        }
+        assert_eq!(InputEvent::from_bytes(&[]), None);
+        assert_eq!(InputEvent::from_bytes(&[99]), None);
     }
 }

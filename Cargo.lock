@@ -405,6 +405,7 @@ dependencies = [
  "nd-codec",
  "nd-crypto",
  "nd-features",
+ "nd-input",
  "nd-proto",
  "nd-transport",
 ]

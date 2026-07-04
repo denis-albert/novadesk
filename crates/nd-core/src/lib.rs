@@ -11,7 +11,10 @@ use nd_capture::{CaptureConfig, CapturedFrame, ScreenCapturer};
 use nd_codec::{CodecKind, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder};
 use nd_crypto::SecureSession;
 use nd_features::Permissions;
-use nd_proto::{ChannelKind, MonitorId, NdError, NovaId, ProtocolVersion, Reliability, Result};
+use nd_input::{InputInjector, MouseButton};
+use nd_proto::{
+    ChannelKind, InputEvent, MonitorId, NdError, NovaId, ProtocolVersion, Reliability, Result,
+};
 use nd_transport::{ChannelHandle, Transport};
 
 /// Rôle du poste local dans la session.
@@ -127,6 +130,35 @@ impl Session {
 #[must_use]
 pub fn engine_version() -> ProtocolVersion {
     ProtocolVersion::CURRENT
+}
+
+/// Applique un événement d'entrée reçu à un injecteur (côté machine contrôlée).
+///
+/// Convertit le message de protocole [`InputEvent`] (voir `nd-proto`) en appels au
+/// trait [`InputInjector`] (voir `nd-input`). Voir plan 07.
+pub fn apply_input(injector: &dyn InputInjector, event: &InputEvent) -> Result<()> {
+    match *event {
+        InputEvent::MouseMoveAbs { x, y, monitor } => {
+            injector.mouse_move_abs(x, y, MonitorId(monitor))
+        }
+        InputEvent::MouseMoveRel { dx, dy } => injector.mouse_move_rel(dx, dy),
+        InputEvent::MouseButton { button, down } => {
+            let btn = match button {
+                0 => MouseButton::Left,
+                1 => MouseButton::Right,
+                2 => MouseButton::Middle,
+                3 => MouseButton::X1,
+                _ => MouseButton::X2,
+            };
+            injector.mouse_button(btn, down)
+        }
+        InputEvent::Scroll { dx, dy } => injector.scroll(dx, dy),
+        InputEvent::Key { scancode, down } => injector.key(scancode, down),
+        InputEvent::Unicode { codepoint } => match char::from_u32(codepoint) {
+            Some(ch) => injector.unicode(ch),
+            None => Ok(()),
+        },
+    }
 }
 
 /// Étage **hôte** de la tranche verticale : capture d'écran → encodage H.264 → envoi
