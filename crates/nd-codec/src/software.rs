@@ -136,9 +136,12 @@ impl VideoDecoder for Openh264Decoder {
         match self.inner.decode(&chunk.data).map_err(codec_err)? {
             Some(yuv) => {
                 let (w, h) = yuv.dimensions();
+                let mut rgba = vec![0u8; w * h * 4];
+                yuv.write_rgba8(&mut rgba);
                 Ok(Some(DecodedFrame {
                     width: w as u32,
                     height: h as u32,
+                    rgba,
                 }))
             }
             None => Ok(None),

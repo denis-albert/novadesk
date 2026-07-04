@@ -14,5 +14,9 @@ nd-transport = { workspace = true }
 nd-crypto = { workspace = true }
 nd-features = { workspace = true }
 
+[dev-dependencies]
+# Fenêtre de démonstration (viewer). L'UI définitive sera en Flutter (voir plan 10).
+minifb = "0.27"
+
 [lints]
 workspace = true

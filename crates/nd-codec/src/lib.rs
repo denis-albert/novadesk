@@ -66,11 +66,13 @@ pub trait VideoEncoder: Send {
     fn set_target_bitrate(&mut self, kbps: u32);
 }
 
-/// Image décodée (métadonnées ; les pixels iront à la surface de rendu, plan 10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Image décodée : dimensions + pixels RGBA prêts pour l'affichage (voir plan 10).
+#[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
+    /// Pixels RGBA (largeur × hauteur × 4 octets), ordre R, G, B, A.
+    pub rgba: Vec<u8>,
 }
 
 /// Décodeur vidéo côté viewer. Le rendu de la texture décodée est confié à l'UI
