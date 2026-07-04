@@ -12,10 +12,12 @@ use openh264::decoder::Decoder;
 use openh264::encoder::{
     Encoder, EncoderConfig as OhConfig, FrameType, RateControlMode, UsageType,
 };
-use openh264::formats::{BgraSliceU8, YUVBuffer};
+use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
 use openh264::OpenH264API;
 
-use crate::{CodecCaps, CodecKind, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder};
+use crate::{
+    CodecCaps, CodecKind, DecodedFrame, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder,
+};
 
 /// Convertit une erreur `openh264` en `NdError::Codec`.
 fn codec_err(e: openh264::Error) -> NdError {
@@ -128,9 +130,18 @@ impl Openh264Decoder {
 }
 
 impl VideoDecoder for Openh264Decoder {
-    fn decode(&mut self, chunk: &EncodedChunk) -> Result<()> {
-        // Décode le flux ; le rendu de la YUV décodée sera confié à l'UI (voir plan 10).
-        self.inner.decode(&chunk.data).map_err(codec_err)?;
-        Ok(())
+    fn decode(&mut self, chunk: &EncodedChunk) -> Result<Option<DecodedFrame>> {
+        // Le rendu de la YUV décodée sera confié à l'UI (voir plan 10) ; ici on renvoie
+        // les dimensions décodées comme preuve de décodage.
+        match self.inner.decode(&chunk.data).map_err(codec_err)? {
+            Some(yuv) => {
+                let (w, h) = yuv.dimensions();
+                Ok(Some(DecodedFrame {
+                    width: w as u32,
+                    height: h as u32,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 }

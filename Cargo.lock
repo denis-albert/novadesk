@@ -401,6 +401,8 @@ dependencies = [
 name = "nd-core"
 version = "0.1.0"
 dependencies = [
+ "nd-capture",
+ "nd-codec",
  "nd-crypto",
  "nd-features",
  "nd-proto",

@@ -7,6 +7,8 @@ description = "Orchestration de session NovaDesk : machine à états, assemblage
 
 [dependencies]
 nd-proto = { workspace = true }
+nd-capture = { workspace = true }
+nd-codec = { workspace = true }
 nd-transport = { workspace = true }
 nd-crypto = { workspace = true }
 nd-features = { workspace = true }

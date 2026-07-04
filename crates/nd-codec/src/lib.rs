@@ -66,11 +66,19 @@ pub trait VideoEncoder: Send {
     fn set_target_bitrate(&mut self, kbps: u32);
 }
 
+/// Image décodée (métadonnées ; les pixels iront à la surface de rendu, plan 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedFrame {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Décodeur vidéo côté viewer. Le rendu de la texture décodée est confié à l'UI
 /// (voir plan 10).
 pub trait VideoDecoder: Send {
-    /// Décode une unité ; le résultat est remis à la surface de rendu.
-    fn decode(&mut self, chunk: &EncodedChunk) -> Result<()>;
+    /// Décode une unité. Renvoie `Some(frame)` quand une image complète est produite ;
+    /// `None` en début de flux (avant la première image-clé exploitable).
+    fn decode(&mut self, chunk: &EncodedChunk) -> Result<Option<DecodedFrame>>;
 }
 
 /// Backend logiciel H.264 (openh264). Voir plan 03.
