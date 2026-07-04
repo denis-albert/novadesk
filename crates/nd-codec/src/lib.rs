@@ -73,16 +73,28 @@ pub trait VideoDecoder: Send {
     fn decode(&mut self, chunk: &EncodedChunk) -> Result<()>;
 }
 
-/// Crée l'encodeur le plus adapté (matériel si possible), pour le codec demandé.
-pub fn create_encoder(_kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
-    Err(NdError::NotImplemented(
-        "nd-codec::create_encoder (backends HW/SW à venir, voir plan 03/16)",
-    ))
+/// Backend logiciel H.264 (openh264). Voir plan 03.
+mod software;
+
+/// Crée l'encodeur pour le codec demandé.
+///
+/// H.264 : backend **logiciel** openh264 (le matériel — NVENC / Media Foundation —
+/// viendra derrière ce même trait, voir plan 03/16). Autres codecs : à venir.
+pub fn create_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
+    match kind {
+        CodecKind::H264 => Ok(Box::new(software::Openh264Encoder::new())),
+        _ => Err(NdError::NotImplemented(
+            "nd-codec::create_encoder : seul H.264 (logiciel) est implémenté, voir plan 03/16",
+        )),
+    }
 }
 
-/// Crée le décodeur correspondant.
-pub fn create_decoder(_kind: CodecKind) -> Result<Box<dyn VideoDecoder>> {
-    Err(NdError::NotImplemented(
-        "nd-codec::create_decoder (backends HW/SW à venir, voir plan 03/16)",
-    ))
+/// Crée le décodeur pour le codec demandé (H.264 logiciel openh264).
+pub fn create_decoder(kind: CodecKind) -> Result<Box<dyn VideoDecoder>> {
+    match kind {
+        CodecKind::H264 => Ok(Box::new(software::Openh264Decoder::new()?)),
+        _ => Err(NdError::NotImplemented(
+            "nd-codec::create_decoder : seul H.264 (logiciel) est implémenté, voir plan 03/16",
+        )),
+    }
 }

@@ -8,6 +8,9 @@ description = "Codec vidéo : traits VideoEncoder/VideoDecoder, matériel d'abor
 [dependencies]
 nd-proto = { workspace = true }
 nd-capture = { workspace = true }
+# Encodeur H.264 logiciel (repli du plan 03). Backends matériels (NVENC / Media
+# Foundation) ajoutés ultérieurement derrière le même trait VideoEncoder.
+openh264 = "0.6"
 
 [lints]
 workspace = true

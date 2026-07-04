@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use nd_proto::{NdError, Result};
+use nd_proto::{MonitorId, NdError, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
@@ -18,16 +18,19 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice, IDXGIOutputDuplication, IDXGIOutput1, IDXGIResource,
+    IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 
-use crate::{CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, PixelFormat, Rect, ScreenCapturer};
+use crate::{
+    CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, PixelFormat, Rect,
+    ScreenCapturer,
+};
 
 /// Convertit une erreur `windows` en `NdError::Capture`.
 fn cap(e: windows::core::Error) -> NdError {
@@ -42,6 +45,7 @@ pub struct DxgiCapturer {
     width: u32,
     height: u32,
     output_index: u32,
+    monitor: MonitorId,
     capture_cursor: bool,
     start: Instant,
 }
@@ -83,6 +87,7 @@ impl DxgiCapturer {
             width: 0,
             height: 0,
             output_index: 0,
+            monitor: MonitorId(0),
             capture_cursor: false,
             start: Instant::now(),
         })
@@ -111,6 +116,7 @@ impl DxgiCapturer {
         CapturedFrame {
             width: self.width,
             height: self.height,
+            monitor: self.monitor,
             format: PixelFormat::Bgra8,
             dirty: Vec::new(),
             cursor: None,
@@ -120,7 +126,11 @@ impl DxgiCapturer {
     }
 
     /// Lit les régions modifiées associées à la frame courante.
-    fn read_dirty(&self, dupl: &IDXGIOutputDuplication, info: &DXGI_OUTDUPL_FRAME_INFO) -> Vec<Rect> {
+    fn read_dirty(
+        &self,
+        dupl: &IDXGIOutputDuplication,
+        info: &DXGI_OUTDUPL_FRAME_INFO,
+    ) -> Vec<Rect> {
         let size = info.TotalMetadataBufferSize;
         let mut dirty = Vec::new();
         if size == 0 {
@@ -153,6 +163,7 @@ impl DxgiCapturer {
 impl ScreenCapturer for DxgiCapturer {
     fn start(&mut self, cfg: CaptureConfig) -> Result<()> {
         self.capture_cursor = cfg.capture_cursor;
+        self.monitor = cfg.monitor;
         self.init_duplication(cfg.monitor.0)
     }
 
@@ -205,7 +216,8 @@ impl DxgiCapturer {
         info: &DXGI_OUTDUPL_FRAME_INFO,
         resource: Option<IDXGIResource>,
     ) -> Result<CapturedFrame> {
-        let resource = resource.ok_or_else(|| NdError::Capture("ressource de frame nulle".into()))?;
+        let resource =
+            resource.ok_or_else(|| NdError::Capture("ressource de frame nulle".into()))?;
         let frame_tex: ID3D11Texture2D = resource.cast().map_err(cap)?;
 
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -223,7 +235,11 @@ impl DxgiCapturer {
 
         let mut staging: Option<ID3D11Texture2D> = None;
         // SAFETY : `sdesc` valide ; pas de données initiales ; pointeur de sortie valide.
-        unsafe { self.device.CreateTexture2D(&sdesc, None, Some(&mut staging)) }.map_err(cap)?;
+        unsafe {
+            self.device
+                .CreateTexture2D(&sdesc, None, Some(&mut staging))
+        }
+        .map_err(cap)?;
         let staging = staging.ok_or_else(|| NdError::Capture("texture de staging nulle".into()))?;
 
         // SAFETY : source et destination sont des textures compatibles.
@@ -243,8 +259,11 @@ impl DxgiCapturer {
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY : `staging` est mappable en lecture (USAGE_STAGING + CPU_ACCESS_READ).
-        unsafe { self.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-            .map_err(cap)?;
+        unsafe {
+            self.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        }
+        .map_err(cap)?;
 
         let row_bytes = w as usize * 4;
         let pitch = mapped.RowPitch as usize;
@@ -263,6 +282,7 @@ impl DxgiCapturer {
         Ok(CapturedFrame {
             width: w,
             height: h,
+            monitor: self.monitor,
             format: PixelFormat::Bgra8,
             dirty,
             cursor,

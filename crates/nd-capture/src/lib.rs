@@ -82,6 +82,8 @@ impl std::fmt::Debug for FrameImage {
 pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
+    /// Moniteur d'où provient la frame.
+    pub monitor: MonitorId,
     pub format: PixelFormat,
     /// Régions modifiées depuis la frame précédente (vide = rien n'a changé).
     pub dirty: Vec<Rect>,
