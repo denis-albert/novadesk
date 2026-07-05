@@ -596,6 +596,7 @@ dependencies = [
  "nd-features",
  "nd-input",
  "nd-proto",
+ "nd-signaling",
  "nd-transport",
 ]
 
@@ -652,6 +653,7 @@ name = "nd-rendezvous"
 version = "0.1.0"
 dependencies = [
  "nd-proto",
+ "nd-signaling",
 ]
 
 [[package]]
