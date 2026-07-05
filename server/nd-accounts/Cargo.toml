@@ -7,6 +7,9 @@ description = "Service comptes / authentification (OAuth2/OIDC, 2FA). Voir plan 
 
 [dependencies]
 nd-proto = { workspace = true }
+# Hachage de mots de passe Argon2id (format PHC). La feature `std` active
+# `rand_core/getrandom`, nécessaire à `OsRng` (sels et jetons aléatoires).
+argon2 = { version = "0.5", features = ["std"] }
 
 [lints]
 workspace = true

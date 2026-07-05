@@ -7,6 +7,16 @@ description = "Transfert de fichiers, presse-papiers partagé, impression (voir 
 
 [dependencies]
 nd-proto = { workspace = true }
+# Intégrité des transferts : hash BLAKE3 par chunk + hash racine (plan 09).
+blake3 = "1"
+
+# Presse-papiers Windows (CF_UNICODETEXT) via windows-rs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
 
 [lints]
 workspace = true

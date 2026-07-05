@@ -4,7 +4,18 @@
 //! commun avec la vidéo. Détails par OS (WASAPI/CoreAudio/PipeWire) :
 //! `../../plan-technique/08-audio.md`.
 
-use nd_proto::{NdError, Result};
+pub mod codec;
+pub mod convert;
+#[cfg(windows)]
+mod win;
+
+#[cfg(not(windows))]
+use nd_proto::NdError;
+use nd_proto::Result;
+
+pub use codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus, TRAME_MS};
+#[cfg(windows)]
+pub use win::WasapiLoopbackCapturer;
 
 /// Format audio PCM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +54,19 @@ pub trait AudioPlayer: Send {
     fn play(&mut self, packet: &AudioPacket) -> Result<()>;
 }
 
-/// Crée un capteur de l'audio système (loopback). Non implémenté à ce stade.
+/// Crée un capteur de l'audio système (loopback).
+///
+/// Windows : boucle de retour WASAPI sur le périphérique de rendu par défaut,
+/// convertie en 48 kHz stéréo et encodée en Opus (trames de 20 ms).
+#[cfg(windows)]
+pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Ok(Box::new(win::WasapiLoopbackCapturer::new()?))
+}
+
+/// Crée un capteur de l'audio système (loopback). Non implémenté sur cet OS.
+#[cfg(not(windows))]
 pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
     Err(NdError::NotImplemented(
-        "nd-audio::create_system_capturer (WASAPI/CoreAudio/PipeWire à venir, voir plan 08/16)",
+        "nd-audio::create_system_capturer (CoreAudio/PipeWire à venir, voir plan 08/16)",
     ))
 }

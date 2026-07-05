@@ -7,6 +7,8 @@ description = "Session chiffrée de bout en bout (Noise), empreintes et SAS (voi
 
 [dependencies]
 nd-proto = { workspace = true }
+# Noise Protocol Framework (handshake XX, AEAD ChaCha20-Poly1305) — voir plan 06.
+snow = "0.9"
 
 [lints]
 workspace = true

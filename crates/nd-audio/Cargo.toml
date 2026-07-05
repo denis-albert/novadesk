@@ -7,6 +7,20 @@ description = "Capture et lecture audio, codec Opus, synchro A/V (voir plan 08).
 
 [dependencies]
 nd-proto = { workspace = true }
+# Codec Opus : FFI vers libopus 1.5 vendoré (lien statique, build cmake ≥ 3.16).
+# Choisi plutôt que `opus`/`audiopus` dont le libopus embarqué (2018) est
+# rejeté par CMake ≥ 4. L'enveloppe sûre est dans `src/codec.rs`.
+libopus_sys = "0.4"
+
+# Implémentation Windows : boucle de retour (loopback) WASAPI via windows-rs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+] }
 
 [lints]
 workspace = true
