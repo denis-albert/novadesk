@@ -1,0 +1,118 @@
+# Release NovaDesk — squelette de la chaîne du plan 15
+# (../plan-technique/15-deploiement-mise-a-jour.md).
+#
+# Déclenché par un tag `vX.Y.Z`. Construit le workspace en `--release` sur les
+# trois OS de bureau, rassemble les binaires SERVEUR et publie un brouillon de
+# release GitHub avec les archives par plateforme.
+#
+# CE QUI N'EST PAS FAIT ICI (volontairement — voir plan 15 et packaging/README.md) :
+# - Packaging installateurs : MSI/MSIX (WiX v4 via cargo-wix), .dmg/.pkg macOS,
+#   .deb/.rpm/AppImage/Flatpak Linux. Le client de bureau (UI Flutter + service
+#   système, plans 10 et 15) n'a pas encore de binaire installable.
+# - Signature de code (exige des secrets/certificats absents de ce dépôt) :
+#     Windows : Authenticode EV via HSM —
+#               `signtool sign /fd SHA256 /tr <TSA> /td SHA256 …`
+#     macOS   : `codesign --options runtime` (Hardened Runtime, Developer ID),
+#               notarisation `xcrun notarytool submit --wait`,
+#               agrafage `xcrun stapler staple`
+#     Linux   : dépôts apt/dnf signés GPG
+# - Chaîne de mise à jour applicative : métadonnées TUF signées Ed25519
+#   (plan 15 §15.6.4), rollout progressif (canari) et rollback automatique.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  # Nécessaire à la création de la release GitHub par le job `publier`.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build --release (${{ matrix.plateforme }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            plateforme: windows-x86_64
+            ext: ".exe"
+          - os: ubuntu-latest
+            plateforme: linux-x86_64
+            ext: ""
+          # macos-latest = runner Apple Silicon. Ajouter une entrée
+          # `macos-13` (Intel) ou un build universel si nécessaire.
+          - os: macos-latest
+            plateforme: macos-aarch64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mêmes dépendances système que la CI (voir ci.yml pour le détail).
+      - name: Dépendances système (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm libasound2-dev libpipewire-0.3-dev
+
+      - name: Toolchain Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build --release
+        run: cargo build --workspace --release
+
+      # Seuls les binaires serveur sont livrables aujourd'hui ; les exemples
+      # (« sondes ») restent des outils de développement, non distribués.
+      - name: Rassembler les binaires serveur
+        shell: bash
+        run: |
+          mkdir -p dist
+          for bin in nd-rendezvous nd-relay nd-accounts nd-api; do
+            cp "target/release/${bin}${{ matrix.ext }}" dist/
+          done
+
+      # >>> Point d'insertion de la SIGNATURE DE CODE par plateforme (plan 15),
+      # >>> avant l'archivage : signtool / codesign+notarytool / GPG.
+
+      - name: Publier les binaires (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: novadesk-server-${{ matrix.plateforme }}
+          path: dist/
+
+  publier:
+    name: Brouillon de release GitHub
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Télécharger les artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+
+      - name: Archiver par plateforme
+        run: |
+          cd artefacts
+          for d in */; do
+            d="${d%/}"
+            (cd "$d" && zip -r "../${d}.zip" .)
+          done
+
+      # Brouillon : la publication réelle reste un geste humain (relecture des
+      # notes de version, vérification des artefacts), conformément au plan 15
+      # (rollout progressif, pas de publication automatique aveugle).
+      - name: Créer la release (brouillon)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artefacts/*.zip

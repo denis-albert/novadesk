@@ -1,0 +1,146 @@
+# CI NovaDesk — application de la barre de qualité du plan 14
+# (../plan-technique/14-tests-qualite-performance.md).
+#
+# Quatre commandes bloquantes, identiques à celles exécutées en local :
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo build --workspace
+#   cargo test --workspace
+#
+# Notes multiplateforme (importantes pour lire les résultats) :
+# - La capture (nd-capture), l'injection (nd-input), l'audio (nd-audio) et le
+#   presse-papiers (nd-files) ont des implémentations spécifiques par OS
+#   (aujourd'hui DXGI / WASAPI / SendInput sur Windows ; PipeWire, CoreGraphics…
+#   viendront selon les plans 02, 07, 08 et 12). Ces crates ne se testent donc
+#   PLEINEMENT que sur leur OS : ailleurs, les fabriques renvoient
+#   `NdError::NotImplemented` et seuls les tests portables s'exécutent.
+#   Le workspace doit néanmoins COMPILER et passer Clippy sur les trois OS.
+# - Les exemples (« sondes ») exigent une session graphique / des périphériques
+#   réels : ils ne sont pas exécutés en CI (runners headless), mais
+#   `--all-targets` garantit qu'ils compilent et passent Clippy.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Une seule exécution par branche/PR : la plus récente annule les précédentes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qualite:
+    name: fmt + clippy + build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Une régression sur un OS ne doit pas masquer l'état des deux autres.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dépendances système Linux (installables via apt) :
+      # - cmake : build de libopus vendoré (libopus_sys, dépendance de nd-audio) ;
+      # - nasm  : optimisations assembleur d'openh264 (nd-codec) ;
+      # - libasound2-dev / libpipewire-0.3-dev : backends audio/capture Linux à
+      #   venir (ALSA + PipeWire via portail xdg-desktop-portal, plans 02 et 08).
+      #   Inoffensif tant que ces backends ne sont pas mergés, prêt le jour où
+      #   ils le seront.
+      - name: Dépendances système (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm libasound2-dev libpipewire-0.3-dev
+
+      # rust-toolchain.toml (stable + rustfmt + clippy) fait foi ; cette action
+      # pré-installe la même toolchain pour éviter le téléchargement implicite
+      # au premier appel de cargo.
+      - name: Toolchain Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format (rustfmt)
+        run: cargo fmt --all --check
+
+      - name: Lints (clippy, zéro avertissement)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Tests
+        run: cargo test --workspace
+
+  # Audit des dépendances contre la base RustSec (https://rustsec.org).
+  # cargo-deny est l'alternative « couteau suisse » (avis + licences + doublons
+  # + sources) : à activer plus tard avec un deny.toml dédié si le besoin de
+  # contrôle des licences se précise.
+  audit:
+    name: Audit RustSec (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Installer cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # En cas d'avis sans correctif disponible en amont, documenter l'exception
+      # dans .cargo/audit.toml ([advisories] ignore = ["RUSTSEC-…"]) avec une
+      # justification — ne jamais désactiver le job.
+      - name: cargo audit
+        run: cargo audit
+
+  # Couverture de code (OPTIONNELLE, non bloquante) via cargo-llvm-cov.
+  # Chiffre à lire avec prudence : mesuré sur Linux, il n'exerce pas les chemins
+  # spécifiques Windows (DXGI, Media Foundation, WASAPI, SendInput, presse-papiers
+  # Win32…). La couverture réelle du code plateforme se mesure sur son OS.
+  couverture:
+    name: Couverture (cargo-llvm-cov, indicatif)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances système (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm libasound2-dev libpipewire-0.3-dev
+
+      - name: Toolchain Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Installer cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Mesurer la couverture
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Publier le rapport (artefact lcov)
+        uses: actions/upload-artifact@v4
+        with:
+          name: couverture-lcov
+          path: lcov.info
