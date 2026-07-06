@@ -5,13 +5,21 @@
 //! zéro-copie GPU et de la détection de régions modifiées est dans
 //! `../../plan-technique/02-capture-ecran.md`.
 //!
-//! Phase 1 : l'implémentation **Windows (DXGI Desktop Duplication)** est active (module
-//! [`win`]). Elle produit pour l'instant des frames en mémoire CPU (chemin de repli)
-//! via une texture de *staging* ; le chemin zéro-copie GPU (texture passée directement
-//! à l'encodeur matériel, voir plan 03) sera branché avec `nd-codec`.
+//! Backends actifs :
+//! - **Windows** : DXGI Desktop Duplication (module `win`), frames CPU via une
+//!   texture de *staging* ; le chemin zéro-copie GPU (texture passée directement
+//!   à l'encodeur matériel, voir plan 03) sera branché avec `nd-codec`.
+//! - **macOS** : CoreGraphics `CGDisplayCreateImage` (module `macos`), instantanés
+//!   cadencés ; ScreenCaptureKit (flux poussé, zéro-copie) au jet suivant.
+//! - **Linux** : X11 `GetImage` via `x11rb` (module `linux`), moniteurs RandR ;
+//!   Wayland (PipeWire + portail `xdg-desktop-portal`) au jet suivant.
 
 use nd_proto::{MonitorId, Result};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -20,9 +28,11 @@ mod win_cursor;
 /// Description d'un moniteur physique attaché au bureau.
 ///
 /// Multi-écran (plan 13) : [`MonitorInfo::id`] est directement utilisable comme
-/// [`CaptureConfig::monitor`] — l'index est celui de la sortie DXGI de l'adaptateur
-/// par défaut, le même que celui employé par le capteur Windows (`MonitorId(0)` =
-/// sortie 0).
+/// [`CaptureConfig::monitor`] — l'index suit l'ordre d'énumération du backend de la
+/// plateforme (sortie DXGI de l'adaptateur par défaut sous Windows, liste
+/// `CGGetActiveDisplayList` sous macOS, réponse RandR `GetMonitors` sous Linux),
+/// le même que celui employé par le capteur correspondant (`MonitorId(0)` =
+/// première sortie).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorInfo {
     pub id: MonitorId,
@@ -38,19 +48,28 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
-/// Énumère les moniteurs attachés au bureau, dans l'ordre des sorties DXGI.
+/// Énumère les moniteurs attachés au bureau, dans l'ordre du backend plateforme.
 ///
 /// Windows : DXGI (`IDXGIFactory1` → adaptateur par défaut → `EnumOutputs`).
-/// Autres OS : à venir (Phases 4+, voir plan 16).
+/// macOS : CoreGraphics (`CGGetActiveDisplayList`). Linux : X11/RandR
+/// (`GetMonitors`, repli « racine entière » sans RandR ; Wayland au jet suivant).
 pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
     #[cfg(windows)]
     {
         win::enumerate_monitors()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::enumerate_monitors()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::enumerate_monitors()
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Err(nd_proto::NdError::NotImplemented(
-            "nd-capture::enumerate_monitors (impl macOS/Linux à venir, voir plan 02/16)",
+            "nd-capture::enumerate_monitors (OS non pris en charge, voir plan 02/16)",
         ))
     }
 }
@@ -206,16 +225,27 @@ pub trait ScreenCapturer: Send {
 
 /// Crée le capteur adapté à la plateforme courante.
 ///
-/// Windows : DXGI Desktop Duplication. Autres OS : à venir (Phases 4+, voir plan 16).
+/// Windows : DXGI Desktop Duplication. macOS : CoreGraphics
+/// (`CGDisplayCreateImage` ; ScreenCaptureKit au jet suivant). Linux : X11
+/// `GetImage` via `x11rb` (Wayland/PipeWire au jet suivant — `NotImplemented`
+/// en session Wayland pure).
 pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
     #[cfg(windows)]
     {
         Ok(Box::new(win::DxgiCapturer::new()?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::CgCapturer::new()?))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux::X11Capturer::new()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Err(nd_proto::NdError::NotImplemented(
-            "nd-capture::create_capturer (impl macOS/Linux à venir, voir plan 02/16)",
+            "nd-capture::create_capturer (OS non pris en charge, voir plan 02/16)",
         ))
     }
 }

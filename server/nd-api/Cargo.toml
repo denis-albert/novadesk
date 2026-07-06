@@ -7,6 +7,9 @@ description = "API applicative : carnet d'adresses, licences, mises à jour. Voi
 
 [dependencies]
 nd-proto = { workspace = true }
+# Persistance légère (storage.rs) : état JSON écrit de façon atomique.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

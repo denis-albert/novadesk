@@ -15,6 +15,8 @@ rcgen = "0.13"
 # FEC par effacement (Reed-Solomon) pour la vidéo/audio sur datagrammes non fiables.
 # Rust pur (pas de feature `simd-accel`) : portable, suffisant pour nos tailles de trames.
 reed-solomon-erasure = "6"
+# Tampons partagés : `quinn::Connection::send_datagram` prend un `bytes::Bytes`.
+bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
 
 [lints]

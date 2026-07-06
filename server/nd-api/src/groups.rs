@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 /// Erreurs métier des groupes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupError {
@@ -33,7 +35,7 @@ impl fmt::Display for GroupError {
 impl std::error::Error for GroupError {}
 
 /// Groupe (équipe) : id attribué à la création, nom lisible, membres (comptes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Group {
     /// Id du groupe, attribué par le [`GroupStore`] (croissant, jamais réutilisé).
     pub id: u64,
@@ -145,6 +147,27 @@ impl GroupStore {
             .collect();
         groupes.sort_by_key(|g| g.id);
         groupes
+    }
+
+    /// Instantané complet : dernier id attribué + groupes triés par id (pour
+    /// la persistance, voir `storage`).
+    #[must_use]
+    pub fn snapshot(&self) -> (u64, Vec<Group>) {
+        let inner = self.0.lock().unwrap();
+        let mut groupes: Vec<Group> = inner.groupes.values().cloned().collect();
+        groupes.sort_by_key(|g| g.id);
+        (inner.dernier_id, groupes)
+    }
+
+    /// Reconstruit un magasin depuis un instantané persisté. `dernier_id` doit
+    /// être au moins égal au plus grand id de `groupes` (garanti par
+    /// [`Self::snapshot`]), pour ne jamais réutiliser un id.
+    #[must_use]
+    pub fn from_snapshot(dernier_id: u64, groupes: Vec<Group>) -> Self {
+        Self(Arc::new(Mutex::new(GroupesInner {
+            dernier_id,
+            groupes: groupes.into_iter().map(|g| (g.id, g)).collect(),
+        })))
     }
 }
 

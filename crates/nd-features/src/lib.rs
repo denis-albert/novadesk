@@ -8,6 +8,7 @@
 pub mod annotation;
 pub mod hotkeys;
 pub mod invite;
+pub mod permissions;
 pub mod privacy;
 pub mod reconnect;
 pub mod recording;
@@ -15,17 +16,29 @@ pub mod settings;
 pub mod tunnel;
 pub mod wol;
 
-pub use annotation::{AnnotationLayer, Stroke};
+pub use annotation::{AnnotationLayer, RgbaCanvas, Stroke};
 pub use hotkeys::{ActionCodec, HostAction, Hotkey, HotkeyMap};
 pub use invite::{generate_invite, InviteStore, RedeemResult, SessionInvite};
+pub use permissions::{
+    AuditEntry, AuditEvent, Capability, PermissionBroker, PermissionDecision, PermissionRequest,
+    PermissionSet,
+};
 pub use privacy::{PrivacyAction, PrivacyState};
 pub use reconnect::{ReconnectPolicy, ReconnectState};
-pub use recording::{RecordedFrame, SessionReader, SessionRecorder};
+pub use recording::{
+    IndexedRecorder, KeyframeEntry, RecordedFrame, RecordingMetadata, SessionReader,
+    SessionRecorder, ValidationReport,
+};
 pub use settings::{QualityParams, QualityPreset, SessionSettings};
 pub use tunnel::{pipe_bidirectional, LocalForwarder};
 pub use wol::{magic_packet, wake_on_lan};
 
 /// Permissions accordées à une session par le poste contrôlé.
+///
+/// Modèle historique à six booléens, conservé pour compatibilité. Le modèle
+/// granulaire ([`PermissionSet`], [`Capability`], journal d'audit) vit dans
+/// [`permissions`] ; les conversions `From` dans les deux sens sont
+/// conservatrices (elles n'élargissent jamais les droits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Permissions {
     pub keyboard: bool,

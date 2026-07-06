@@ -49,18 +49,40 @@ mod win;
 #[cfg(windows)]
 pub use win::{send_secure_attention_sequence, SendInputInjector};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use macos::QuartzInjector;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::XtestInjector;
+
 /// Crée l'injecteur adapté à la plateforme courante.
 ///
-/// Windows : `SendInput`. Autres OS : à venir (Phase 4+, voir plan 07/16).
+/// Windows : `SendInput`. macOS : Quartz Event Services (`CGEventPost`, permission
+/// Accessibilité/TCC requise). Linux : XTEST sur X11 (Wayland : jet ultérieur, voir
+/// plan 07 §Wayland). Autres OS : `NotImplemented`.
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(windows)]
     {
         Ok(Box::new(win::SendInputInjector::new()))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::QuartzInjector::new()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux::XtestInjector::new()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Err(nd_proto::NdError::NotImplemented(
-            "nd-input::create_injector (impl macOS/Linux à venir, voir plan 07/16)",
+            "nd-input::create_injector (OS non pris en charge, voir plan 07/16)",
         ))
     }
 }

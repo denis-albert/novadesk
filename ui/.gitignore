@@ -1,0 +1,24 @@
+# Artefacts Flutter / Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+
+# Binding flutter_rust_bridge généré (régénérable, voir lib/bridge/README.md)
+lib/bridge/generated/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Couverture de tests
+coverage/
+
+# Symboles natifs éventuels
+*.pdb
+*.so
+*.dylib
+*.dll

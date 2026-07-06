@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 /// Permission élémentaire accordée sur une ressource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -29,7 +31,7 @@ pub enum Permission {
 /// L'ordre dérivé (`Ord`) reflète la hiérarchie `Viewer < Operator < Admin` :
 /// il sert à résoudre le rôle **effectif** quand plusieurs sources (partage
 /// direct, groupes) attribuent des rôles différents — on garde le plus élevé.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Role {
     /// Lecture seule : voit l'écran, ne touche à rien.
     Viewer,
@@ -67,8 +69,9 @@ impl Role {
     }
 }
 
-/// Table interne : compte → (ressource → rôle attribué).
-type AttributionMap = HashMap<String, HashMap<String, Role>>;
+/// Table d'attributions : compte → (ressource → rôle attribué).
+/// (Alias public : sert aussi à l'état persisté, voir `storage`.)
+pub type AttributionMap = HashMap<String, HashMap<String, Role>>;
 
 /// Attributions de rôles partagées, en mémoire (thread-safe, clonable).
 #[derive(Clone, Default)]
@@ -117,6 +120,18 @@ impl RoleStore {
     pub fn has_permission(&self, compte: &str, ressource: &str, perm: Permission) -> bool {
         self.role_of(compte, ressource)
             .is_some_and(|role| role.allows(perm))
+    }
+
+    /// Instantané complet des attributions (pour la persistance, voir `storage`).
+    #[must_use]
+    pub fn snapshot(&self) -> AttributionMap {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Reconstruit un magasin depuis un instantané persisté.
+    #[must_use]
+    pub fn from_snapshot(attributions: AttributionMap) -> Self {
+        Self(Arc::new(Mutex::new(attributions)))
     }
 }
 

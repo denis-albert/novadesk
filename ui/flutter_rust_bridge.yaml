@@ -1,0 +1,9 @@
+# Configuration flutter_rust_bridge (v2) — génération du binding Dart
+# depuis la façade Rust `nd-ffi` (module `api`).
+#
+#   flutter_rust_bridge_codegen generate
+#
+# à lancer depuis ce dossier (novadesk/ui). Voir lib/bridge/README.md.
+rust_input: crate::api
+rust_root: ../crates/nd-ffi
+dart_output: lib/bridge/generated

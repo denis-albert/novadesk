@@ -1,7 +1,9 @@
 //! Annotation d'écran (« tableau blanc ») : traits dessinés par-dessus
 //! l'image transmise, par le contrôleur ou le contrôlé, sans modifier le
-//! bureau réel. Ce module fournit le modèle ([`Stroke`], [`AnnotationLayer`])
-//! et sa sérialisation binaire pour le transport (voir plan 13, §annotation).
+//! bureau réel. Ce module fournit le modèle ([`Stroke`], [`AnnotationLayer`]),
+//! sa sérialisation binaire pour le transport, et le **rendu** de la couche
+//! en tampon RGBA ([`RgbaCanvas`], [`AnnotationLayer::render`]) prêt à être
+//! superposé à l'image décodée (voir plan 13, §annotation).
 //!
 //! Format binaire (entiers et flottants petit-boutistes) :
 //! - en-tête : magic `NDANN1` (6 octets) puis version `u16` ;
@@ -326,6 +328,369 @@ impl Default for AnnotationLayer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rendu (rastérisation) de la couche en tampon RGBA
+// ---------------------------------------------------------------------------
+
+/// Tampon d'image RGBA 8 bits par canal — octets `[R, G, B, A]` par pixel,
+/// lignes de haut en bas — destiné à être superposé à l'image décodée par
+/// l'interface. Le tampon naît entièrement transparent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbaCanvas {
+    largeur: u32,
+    hauteur: u32,
+    pixels: Vec<u8>,
+}
+
+impl RgbaCanvas {
+    /// Tampon transparent de `largeur × hauteur` pixels. L'appelant fournit
+    /// des dimensions raisonnables (celles de l'écran superposé).
+    #[must_use]
+    pub fn new(largeur: u32, hauteur: u32) -> Self {
+        RgbaCanvas {
+            largeur,
+            hauteur,
+            pixels: vec![0; largeur as usize * hauteur as usize * 4],
+        }
+    }
+
+    /// Largeur du tampon, en pixels.
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.largeur
+    }
+
+    /// Hauteur du tampon, en pixels.
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.hauteur
+    }
+
+    /// Les octets RGBA bruts (`largeur × hauteur × 4`), lignes de haut en bas.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Le pixel `(x, y)` sous forme `[R, G, B, A]`, ou `None` hors du tampon.
+    #[must_use]
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.largeur || y >= self.hauteur {
+            return None;
+        }
+        let base = (y as usize * self.largeur as usize + x as usize) * 4;
+        Some([
+            self.pixels[base],
+            self.pixels[base + 1],
+            self.pixels[base + 2],
+            self.pixels[base + 3],
+        ])
+    }
+
+    /// Compose `couleur` (RGBA empaqueté `0xRRGGBBAA`, alpha direct) sur le
+    /// pixel d'indice `indice` avec l'opérateur « source over ».
+    fn composer(&mut self, indice: usize, couleur: u32) {
+        let source = [
+            (couleur >> 24) as u8,
+            (couleur >> 16) as u8,
+            (couleur >> 8) as u8,
+            couleur as u8,
+        ];
+        if source[3] == 0 {
+            return;
+        }
+        let base = indice * 4;
+        let alpha_source = f32::from(source[3]) / 255.0;
+        let alpha_fond = f32::from(self.pixels[base + 3]) / 255.0;
+        let alpha_final = alpha_source + alpha_fond * (1.0 - alpha_source);
+        let fond = &mut self.pixels[base..base + 3];
+        for (canal, valeur_source) in fond.iter_mut().zip(source) {
+            let valeur = (f32::from(valeur_source) * alpha_source
+                + f32::from(*canal) * alpha_fond * (1.0 - alpha_source))
+                / alpha_final;
+            *canal = valeur.round() as u8;
+        }
+        self.pixels[base + 3] = (alpha_final * 255.0).round() as u8;
+    }
+}
+
+impl AnnotationLayer {
+    /// Rend la couche dans un tampon transparent de `largeur × hauteur`.
+    /// Les coordonnées des traits sont interprétées en pixels du tampon
+    /// (l'appelant convertit d'abord si son repère est normalisé).
+    #[must_use]
+    pub fn render(&self, largeur: u32, hauteur: u32) -> RgbaCanvas {
+        let mut toile = RgbaCanvas::new(largeur, hauteur);
+        self.render_into(&mut toile);
+        toile
+    }
+
+    /// Rend la couche par-dessus le contenu existant de `toile`, dans l'ordre
+    /// de dessin. Chaque trait est d'abord rastérisé dans un masque de
+    /// couverture puis composé **une seule fois** par pixel : un trait
+    /// semi-transparent ne fonce pas là où ses tampons internes se recouvrent.
+    pub fn render_into(&self, toile: &mut RgbaCanvas) {
+        let largeur = toile.largeur as usize;
+        let hauteur = toile.hauteur as usize;
+        if largeur == 0 || hauteur == 0 {
+            return;
+        }
+        let mut masque = vec![false; largeur * hauteur];
+        for (_, forme) in &self.traits {
+            masque.fill(false);
+            forme.rasteriser(&mut masque, largeur, hauteur);
+            let couleur = forme.couleur();
+            for (indice, couvert) in masque.iter().enumerate() {
+                if *couvert {
+                    toile.composer(indice, couleur);
+                }
+            }
+        }
+    }
+}
+
+impl Stroke {
+    /// Couleur RGBA empaquetée du trait.
+    fn couleur(&self) -> u32 {
+        match self {
+            Stroke::Line { color, .. }
+            | Stroke::Rect { color, .. }
+            | Stroke::Ellipse { color, .. }
+            | Stroke::Arrow { color, .. }
+            | Stroke::Text { color, .. } => *color,
+        }
+    }
+
+    /// Marque dans `masque` (dimensions `largeur × hauteur`) les pixels
+    /// couverts par le trait. Les coordonnées non finies sont ignorées sans
+    /// paniquer ; tout est borné au tampon.
+    fn rasteriser(&self, masque: &mut [bool], largeur: usize, hauteur: usize) {
+        match self {
+            Stroke::Line { points, width, .. } => {
+                let rayon = rayon_de_trait(*width);
+                if let [seul] = points.as_slice() {
+                    marquer_disque(masque, largeur, hauteur, seul.0, seul.1, rayon);
+                }
+                for paire in points.windows(2) {
+                    tracer_segment(masque, largeur, hauteur, paire[0], paire[1], rayon);
+                }
+            }
+            Stroke::Rect {
+                min, max, width, ..
+            } => {
+                let rayon = rayon_de_trait(*width);
+                let (x0, x1) = (min.0.min(max.0), min.0.max(max.0));
+                let (y0, y1) = (min.1.min(max.1), min.1.max(max.1));
+                for (de, vers) in [
+                    ((x0, y0), (x1, y0)),
+                    ((x1, y0), (x1, y1)),
+                    ((x1, y1), (x0, y1)),
+                    ((x0, y1), (x0, y0)),
+                ] {
+                    tracer_segment(masque, largeur, hauteur, de, vers, rayon);
+                }
+            }
+            Stroke::Ellipse {
+                center,
+                radii,
+                width,
+                ..
+            } => {
+                let rayon = rayon_de_trait(*width);
+                let (rx, ry) = (radii.0.abs(), radii.1.abs());
+                if !(center.0.is_finite()
+                    && center.1.is_finite()
+                    && rx.is_finite()
+                    && ry.is_finite())
+                {
+                    return;
+                }
+                // Polygone régulier : assez de côtés pour que la corde reste
+                // sous le demi-pixel, borné pour les rayons hostiles.
+                let cotes = ((std::f32::consts::TAU * rx.max(ry)).ceil() as usize).clamp(16, 2048);
+                let mut precedent = (center.0 + rx, center.1);
+                for i in 1..=cotes {
+                    let angle = std::f32::consts::TAU * (i as f32) / (cotes as f32);
+                    let courant = (center.0 + rx * angle.cos(), center.1 + ry * angle.sin());
+                    tracer_segment(masque, largeur, hauteur, precedent, courant, rayon);
+                    precedent = courant;
+                }
+            }
+            Stroke::Arrow {
+                from, to, width, ..
+            } => {
+                let rayon = rayon_de_trait(*width);
+                tracer_segment(masque, largeur, hauteur, *from, *to, rayon);
+                let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+                let longueur = (dx * dx + dy * dy).sqrt();
+                if !longueur.is_finite() || longueur <= f32::EPSILON {
+                    return;
+                }
+                let (ux, uy) = (dx / longueur, dy / longueur);
+                // Tête : deux barbillons à ±30° du corps, ~4× l'épaisseur,
+                // jamais plus longs que la flèche elle-même.
+                let angle_tete = 30.0_f32.to_radians();
+                let (cos_a, sin_a) = (angle_tete.cos(), angle_tete.sin());
+                let longueur_tete = (4.0 * width.max(1.0)).clamp(6.0, longueur);
+                for signe in [1.0f32, -1.0] {
+                    let direction = (
+                        ux * cos_a - uy * sin_a * signe,
+                        ux * sin_a * signe + uy * cos_a,
+                    );
+                    let barbillon = (
+                        to.0 - longueur_tete * direction.0,
+                        to.1 - longueur_tete * direction.1,
+                    );
+                    tracer_segment(masque, largeur, hauteur, *to, barbillon, rayon);
+                }
+            }
+            Stroke::Text {
+                position,
+                contenu,
+                size,
+                ..
+            } => {
+                // Le rendu des glyphes appartient à l'interface (polices
+                // système) : ici, un soulignement matérialise l'emprise du
+                // texte pour la superposition.
+                let caracteres = contenu.chars().count();
+                if caracteres == 0 {
+                    return;
+                }
+                let emprise = 0.6 * size * caracteres as f32;
+                let rayon = rayon_de_trait((size / 10.0).max(1.0));
+                tracer_segment(
+                    masque,
+                    largeur,
+                    hauteur,
+                    *position,
+                    (position.0 + emprise, position.1),
+                    rayon,
+                );
+            }
+        }
+    }
+}
+
+/// Rayon du pinceau pour une épaisseur de trait donnée (au moins un
+/// demi-pixel, pour qu'un trait fin marque quand même).
+fn rayon_de_trait(width: f32) -> f32 {
+    if width.is_finite() {
+        (width * 0.5).max(0.5)
+    } else {
+        0.5
+    }
+}
+
+/// Trace le segment `de → vers` dans le masque en tamponnant un disque de
+/// `rayon` tous les demi-pixels (aucune lacune, même en diagonale fine). Le
+/// segment est d'abord coupé au tampon élargi du rayon : le coût reste borné
+/// par la taille de la toile, même pour des coordonnées lointaines.
+fn tracer_segment(
+    masque: &mut [bool],
+    largeur: usize,
+    hauteur: usize,
+    de: (f32, f32),
+    vers: (f32, f32),
+    rayon: f32,
+) {
+    if !(de.0.is_finite() && de.1.is_finite() && vers.0.is_finite() && vers.1.is_finite()) {
+        return;
+    }
+    // Un pinceau plus large que la toile la couvre de toute façon : borner le
+    // rayon garde la marge de coupe (et donc le parcours) proportionnelle.
+    let rayon = rayon.min((largeur + hauteur) as f32 + 1.0);
+    let Some((p, q)) = couper_segment(de, vers, largeur, hauteur, rayon) else {
+        return;
+    };
+    let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+    let longueur = (dx * dx + dy * dy).sqrt();
+    let pas = ((longueur * 2.0).ceil() as usize).max(1);
+    for i in 0..=pas {
+        let t = i as f32 / pas as f32;
+        marquer_disque(masque, largeur, hauteur, p.0 + t * dx, p.1 + t * dy, rayon);
+    }
+}
+
+/// Coupe le segment `p → q` au rectangle `[-marge, largeur + marge] ×
+/// [-marge, hauteur + marge]` (algorithme de Liang-Barsky). `None` si le
+/// segment passe entièrement à côté.
+fn couper_segment(
+    p: (f32, f32),
+    q: (f32, f32),
+    largeur: usize,
+    hauteur: usize,
+    marge: f32,
+) -> Option<((f32, f32), (f32, f32))> {
+    let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    let bornes = [
+        (-dx, p.0 + marge),                 // x >= -marge
+        (dx, largeur as f32 + marge - p.0), // x <= largeur + marge
+        (-dy, p.1 + marge),                 // y >= -marge
+        (dy, hauteur as f32 + marge - p.1), // y <= hauteur + marge
+    ];
+    for (pente, distance) in bornes {
+        if pente == 0.0 {
+            if distance < 0.0 {
+                return None; // parallèle à la borne, entièrement dehors
+            }
+            continue;
+        }
+        let t = distance / pente;
+        if pente < 0.0 {
+            if t > t1 {
+                return None;
+            }
+            if t > t0 {
+                t0 = t;
+            }
+        } else {
+            if t < t0 {
+                return None;
+            }
+            if t < t1 {
+                t1 = t;
+            }
+        }
+    }
+    Some((
+        (p.0 + t0 * dx, p.1 + t0 * dy),
+        (p.0 + t1 * dx, p.1 + t1 * dy),
+    ))
+}
+
+/// Marque les pixels dont le **centre** est à `rayon` ou moins de `(cx, cy)`.
+fn marquer_disque(
+    masque: &mut [bool],
+    largeur: usize,
+    hauteur: usize,
+    cx: f32,
+    cy: f32,
+    rayon: f32,
+) {
+    if !(cx.is_finite() && cy.is_finite() && rayon.is_finite()) {
+        return;
+    }
+    let rayon = rayon.max(0.5);
+    // Boîte englobante, bornée au tampon (les conversions f32 → usize
+    // saturent : une boîte entièrement dehors donne des bornes vides).
+    let x0 = (cx - rayon).floor().max(0.0) as usize;
+    let y0 = (cy - rayon).floor().max(0.0) as usize;
+    let x1 = (((cx + rayon).ceil() + 1.0).max(0.0) as usize).min(largeur);
+    let y1 = (((cy + rayon).ceil() + 1.0).max(0.0) as usize).min(hauteur);
+    let rayon_carre = rayon * rayon;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= rayon_carre {
+                masque[y * largeur + x] = true;
+            }
+        }
+    }
+}
+
 /// Écrit un point `(x, y)` en deux `f32` petit-boutistes.
 fn ecrire_point(sortie: &mut Vec<u8>, point: (f32, f32)) {
     sortie.extend_from_slice(&point.0.to_le_bytes());
@@ -560,5 +925,221 @@ mod tests {
         octets[33] = 0xFF;
         octets[34] = 0xFE;
         assert!(AnnotationLayer::from_bytes(&octets).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_rendu {
+    use super::*;
+
+    const ROUGE: u32 = 0xFF00_00FF;
+    const TRANSPARENT: [u8; 4] = [0, 0, 0, 0];
+
+    fn couche_avec(forme: Stroke) -> AnnotationLayer {
+        let mut couche = AnnotationLayer::new();
+        couche.add(forme);
+        couche
+    }
+
+    #[test]
+    fn ligne_horizontale_marque_sa_rangee() {
+        let toile = couche_avec(Stroke::Line {
+            points: vec![(2.5, 10.5), (20.5, 10.5)],
+            color: ROUGE,
+            width: 1.0,
+        })
+        .render(32, 32);
+        assert_eq!(toile.pixel(10, 10), Some([255, 0, 0, 255]));
+        assert_eq!(toile.pixel(2, 10), Some([255, 0, 0, 255])); // départ
+        assert_eq!(toile.pixel(20, 10), Some([255, 0, 0, 255])); // arrivée
+        assert_eq!(toile.pixel(10, 9), Some(TRANSPARENT)); // rangée au-dessus
+        assert_eq!(toile.pixel(10, 11), Some(TRANSPARENT)); // rangée en dessous
+        assert_eq!(toile.pixel(0, 10), Some(TRANSPARENT)); // avant le départ
+    }
+
+    #[test]
+    fn epaisseur_couvre_plusieurs_rangees() {
+        let toile = couche_avec(Stroke::Line {
+            points: vec![(2.5, 10.5), (20.5, 10.5)],
+            color: ROUGE,
+            width: 5.0,
+        })
+        .render(32, 32);
+        // Rayon 2,5 : les rangées à ±2 pixels sont couvertes, pas ±3.
+        assert_eq!(toile.pixel(10, 8).unwrap()[3], 255);
+        assert_eq!(toile.pixel(10, 12).unwrap()[3], 255);
+        assert_eq!(toile.pixel(10, 7), Some(TRANSPARENT));
+        assert_eq!(toile.pixel(10, 13), Some(TRANSPARENT));
+    }
+
+    #[test]
+    fn rectangle_contour_sans_interieur() {
+        let toile = couche_avec(Stroke::Rect {
+            min: (2.5, 3.5),
+            max: (10.5, 8.5),
+            color: ROUGE,
+            width: 1.0,
+        })
+        .render(16, 16);
+        assert_eq!(toile.pixel(6, 3).unwrap()[3], 255); // bord haut
+        assert_eq!(toile.pixel(6, 8).unwrap()[3], 255); // bord bas
+        assert_eq!(toile.pixel(2, 5).unwrap()[3], 255); // bord gauche
+        assert_eq!(toile.pixel(10, 5).unwrap()[3], 255); // bord droit
+        assert_eq!(toile.pixel(6, 5), Some(TRANSPARENT)); // intérieur vide
+    }
+
+    #[test]
+    fn ellipse_passe_par_ses_extremes() {
+        let toile = couche_avec(Stroke::Ellipse {
+            center: (16.5, 16.5),
+            radii: (8.0, 5.0),
+            color: ROUGE,
+            width: 1.0,
+        })
+        .render(32, 32);
+        assert_eq!(toile.pixel(24, 16).unwrap()[3], 255); // centre + rx
+        assert_eq!(toile.pixel(8, 16).unwrap()[3], 255); // centre − rx
+        assert_eq!(toile.pixel(16, 21).unwrap()[3], 255); // centre + ry
+        assert_eq!(toile.pixel(16, 11).unwrap()[3], 255); // centre − ry
+        assert_eq!(toile.pixel(16, 16), Some(TRANSPARENT)); // centre vide
+    }
+
+    #[test]
+    fn fleche_corps_et_barbillons() {
+        let toile = couche_avec(Stroke::Arrow {
+            from: (2.5, 10.5),
+            to: (20.5, 10.5),
+            color: ROUGE,
+            width: 2.0,
+        })
+        .render(32, 32);
+        assert_eq!(toile.pixel(10, 10).unwrap()[3], 255); // corps
+                                                          // Barbillons à ±30°, longueur 8 : extrémités vers (13,6) et (13,14).
+        assert_eq!(toile.pixel(13, 6).unwrap()[3], 255);
+        assert_eq!(toile.pixel(13, 14).unwrap()[3], 255);
+        assert_eq!(toile.pixel(2, 5), Some(TRANSPARENT)); // loin de la tête
+    }
+
+    #[test]
+    fn texte_rend_un_soulignement() {
+        let toile = couche_avec(Stroke::Text {
+            position: (5.5, 20.5),
+            contenu: "ab".into(),
+            color: ROUGE,
+            size: 10.0,
+        })
+        .render(32, 32);
+        // Emprise : 0,6 × 10 × 2 = 12 pixels à partir de la position.
+        assert_eq!(toile.pixel(10, 20).unwrap()[3], 255);
+        assert_eq!(toile.pixel(17, 20).unwrap()[3], 255);
+        assert_eq!(toile.pixel(25, 20), Some(TRANSPARENT));
+        assert_eq!(toile.pixel(10, 10), Some(TRANSPARENT));
+    }
+
+    #[test]
+    fn trait_semi_transparent_compose_une_seule_fois() {
+        let toile = couche_avec(Stroke::Line {
+            points: vec![(2.5, 10.5), (20.5, 10.5)],
+            color: 0xFF00_0080, // rouge, alpha 128
+            width: 6.0,
+        })
+        .render(32, 32);
+        // Les tampons internes se recouvrent, mais chaque pixel n'est composé
+        // qu'une fois : l'alpha reste exactement celui du trait.
+        assert_eq!(toile.pixel(10, 10), Some([255, 0, 0, 128]));
+    }
+
+    #[test]
+    fn les_traits_se_composent_dans_l_ordre() {
+        let mut couche = AnnotationLayer::new();
+        couche.add(Stroke::Line {
+            points: vec![(2.5, 10.5), (20.5, 10.5)],
+            color: 0xFF00_00FF, // rouge opaque
+            width: 3.0,
+        });
+        couche.add(Stroke::Line {
+            points: vec![(2.5, 10.5), (20.5, 10.5)],
+            color: 0x00FF_0080, // vert semi-transparent par-dessus
+            width: 3.0,
+        });
+        let toile = couche.render(32, 32);
+        let pixel = toile.pixel(10, 10).unwrap();
+        assert_eq!(pixel[3], 255); // le fond opaque le reste
+        assert!(pixel[1] > 100); // le vert s'est déposé
+        assert!(pixel[0] > 50 && pixel[0] < 200); // le rouge transparaît
+    }
+
+    #[test]
+    fn point_isole_marque() {
+        let toile = couche_avec(Stroke::Line {
+            points: vec![(8.5, 8.5)],
+            color: ROUGE,
+            width: 3.0,
+        })
+        .render(16, 16);
+        assert_eq!(toile.pixel(8, 8).unwrap()[3], 255);
+        assert_eq!(toile.pixel(8, 11), Some(TRANSPARENT));
+    }
+
+    #[test]
+    fn coordonnees_hostiles_sans_panique() {
+        let mut couche = AnnotationLayer::new();
+        // Segment gigantesque et très épais : coupé puis borné à la toile.
+        couche.add(Stroke::Line {
+            points: vec![(-1e9, -1e9), (1e9, 1e9)],
+            color: ROUGE,
+            width: 1e9,
+        });
+        // Coordonnées non finies : ignorées sans paniquer.
+        couche.add(Stroke::Line {
+            points: vec![(f32::NAN, 0.0), (10.0, f32::INFINITY)],
+            color: ROUGE,
+            width: f32::NAN,
+        });
+        couche.add(Stroke::Ellipse {
+            center: (16.0, 16.0),
+            radii: (f32::INFINITY, 4.0),
+            color: ROUGE,
+            width: 1.0,
+        });
+        let toile = couche.render(16, 16);
+        // Le premier trait couvre la diagonale (pinceau borné à la toile).
+        assert!(toile.pixel(8, 8).unwrap()[3] > 0);
+    }
+
+    #[test]
+    fn toile_vide_et_couche_vide_sans_panique() {
+        let toile = couche_avec(Stroke::Rect {
+            min: (0.0, 0.0),
+            max: (4.0, 4.0),
+            color: ROUGE,
+            width: 1.0,
+        })
+        .render(0, 0);
+        assert!(toile.pixels().is_empty());
+        assert_eq!(toile.pixel(0, 0), None);
+
+        let vide = AnnotationLayer::new().render(4, 4);
+        assert!(vide.pixels().iter().all(|octet| *octet == 0));
+    }
+
+    #[test]
+    fn render_into_preserve_le_fond() {
+        let mut toile = RgbaCanvas::new(8, 8);
+        couche_avec(Stroke::Line {
+            points: vec![(0.5, 1.5), (6.5, 1.5)],
+            color: ROUGE,
+            width: 1.0,
+        })
+        .render_into(&mut toile);
+        // Deuxième passe par-dessus la première, ailleurs.
+        couche_avec(Stroke::Line {
+            points: vec![(0.5, 5.5), (6.5, 5.5)],
+            color: 0x00FF_00FF,
+            width: 1.0,
+        })
+        .render_into(&mut toile);
+        assert_eq!(toile.pixel(3, 1), Some([255, 0, 0, 255]));
+        assert_eq!(toile.pixel(3, 5), Some([0, 255, 0, 255]));
     }
 }

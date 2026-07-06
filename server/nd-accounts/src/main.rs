@@ -1,9 +1,16 @@
-//! Service comptes / authentification NovaDesk — premier jet **en mémoire**.
+//! Service comptes / authentification NovaDesk.
 //!
 //! Opérations : `register(email, password)` (mot de passe haché **Argon2id**,
 //! format PHC) et `login(email, password)` → jeton de session opaque (32 octets
-//! aléatoires, encodés en hexadécimal). Aucune base de données : tout vit dans
-//! un `Arc<Mutex<...>>`.
+//! aléatoires, encodés en hexadécimal).
+//!
+//! Persistance (module [`storage`]) : [`AccountStore::open`] attache le
+//! magasin à un fichier JSON (écriture atomique : fichier temporaire +
+//! `rename`) — comptes, secrets 2FA et liens OIDC survivent au redémarrage ;
+//! `register`, `enable_2fa` et `link_oidc` persistent avant de réussir
+//! (« durable ou rien »). Seuls les **hachages PHC Argon2id** sont écrits,
+//! jamais un mot de passe ; les sessions restent volatiles par conception.
+//! [`AccountStore::new`] garde le comportement purement en mémoire (tests).
 //!
 //! 2FA TOTP (RFC 6238, module [`totp`]) : `enable_2fa(email)` génère et stocke
 //! le secret ; un compte protégé doit passer par `login_2fa(email, password,
@@ -11,18 +18,26 @@
 //! quotas de sessions vivent dans le module [`licensing`] ; le journal d'audit
 //! (conformité, RGPD) et le registre des sessions actives dans le module
 //! [`audit`] — attacher un journal via [`AccountStore::with_audit`] consigne
-//! créations de compte, connexions et activations 2FA. OAuth2/OIDC, JWT et
-//! SSO viendront ensuite. Voir `../../plan-technique/11-backend-infrastructure.md`.
+//! créations de compte, connexions et activations 2FA.
+//!
+//! Fédération OIDC/OAuth2 (module [`oidc`]) : PKCE S256, URL d'autorisation et
+//! validation d'ID token JWT ; [`AccountStore::link_oidc`] rattache un sujet
+//! fédéré à un compte local, [`AccountStore::login_oidc`] ouvre une session
+//! pour un sujet déjà lié (l'authentification — y compris MFA — a eu lieu chez
+//! le fournisseur d'identité : la 2FA locale ne s'applique pas à ce chemin).
+//! Voir `../../plan-technique/11-backend-infrastructure.md`.
 //!
 //! Serveur TCP optionnel (std pur, un thread par connexion) au même format que
 //! `nd-signaling` : trames à préfixe de longueur `u32` BE.
 //!
-//! Usage : `nd-accounts [adresse:port]` (défaut `0.0.0.0:9200`).
+//! Usage : `nd-accounts [adresse:port] [fichier_comptes.json]`
+//! (défaut `0.0.0.0:9200`, en mémoire si aucun fichier n'est donné).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
@@ -31,6 +46,8 @@ use argon2::Argon2;
 
 pub mod audit;
 pub mod licensing;
+pub mod oidc;
+pub mod storage;
 pub mod totp;
 
 /// Adresse d'écoute par défaut (9000 = rendez-vous, 9100 = relais).
@@ -55,8 +72,14 @@ pub enum AccountError {
     DeuxFacteursNonActives,
     /// Code TOTP malformé, expiré ou incorrect.
     CodeTotpInvalide,
-    /// Compte inconnu (activation 2FA sur un e-mail non enregistré).
+    /// Compte inconnu (activation 2FA sur un e-mail non enregistré, sujet
+    /// OIDC jamais lié, etc.).
     CompteInconnu,
+    /// Le sujet OIDC est déjà lié à un **autre** compte local.
+    SujetOidcDejaLie,
+    /// Erreur du stockage persistant (chargement ou sauvegarde du fichier de
+    /// comptes) : la mutation demandée n'a **pas** été appliquée.
+    Stockage(String),
     /// Erreur interne (hachage, etc.).
     Interne(String),
 }
@@ -73,6 +96,10 @@ impl fmt::Display for AccountError {
             }
             AccountError::CodeTotpInvalide => write!(f, "code de vérification invalide"),
             AccountError::CompteInconnu => write!(f, "compte inconnu"),
+            AccountError::SujetOidcDejaLie => {
+                write!(f, "ce sujet OIDC est déjà lié à un autre compte")
+            }
+            AccountError::Stockage(msg) => write!(f, "erreur de stockage : {msg}"),
             AccountError::Interne(msg) => write!(f, "erreur interne : {msg}"),
         }
     }
@@ -85,24 +112,65 @@ impl std::error::Error for AccountError {}
 // ---------------------------------------------------------------------------
 
 /// État interne : e-mail → hachage PHC, jeton de session → e-mail,
-/// et e-mail → secret TOTP pour les comptes ayant activé la 2FA.
+/// e-mail → secret TOTP pour les comptes ayant activé la 2FA, et sujet OIDC
+/// (`iss|sub`) → e-mail pour les identités fédérées liées.
 #[derive(Default)]
 struct Etat {
     comptes: HashMap<String, String>,
     sessions: HashMap<String, String>,
     secrets_2fa: HashMap<String, Vec<u8>>,
+    liens_oidc: HashMap<String, String>,
+}
+
+impl Etat {
+    /// Reconstruit l'état durable depuis le fichier de comptes. Les sessions
+    /// repartent vides (volatiles par conception).
+    fn depuis_donnees(donnees: storage::DonneesPersistees) -> Result<Self, AccountError> {
+        let mut secrets_2fa = HashMap::with_capacity(donnees.secrets_2fa.len());
+        for (email, hex) in donnees.secrets_2fa {
+            let secret = storage::hex_vers_octets(&hex).ok_or_else(|| {
+                AccountError::Stockage(format!("secret TOTP corrompu pour {email}"))
+            })?;
+            secrets_2fa.insert(email, secret);
+        }
+        Ok(Self {
+            comptes: donnees.comptes,
+            sessions: HashMap::new(),
+            secrets_2fa,
+            liens_oidc: donnees.liens_oidc,
+        })
+    }
+
+    /// Instantané durable de l'état (hachages PHC, secrets TOTP en
+    /// hexadécimal, liens OIDC — jamais les sessions ni un mot de passe).
+    fn instantane(&self) -> storage::DonneesPersistees {
+        storage::DonneesPersistees {
+            version: storage::VERSION_FORMAT,
+            comptes: self.comptes.clone(),
+            secrets_2fa: self
+                .secrets_2fa
+                .iter()
+                .map(|(email, secret)| (email.clone(), storage::octets_vers_hex(secret)))
+                .collect(),
+            liens_oidc: self.liens_oidc.clone(),
+        }
+    }
 }
 
 /// État partagé entre threads de connexion.
 type EtatPartage = Arc<Mutex<Etat>>;
 
-/// Magasin de comptes en mémoire (thread-safe, clonable).
+/// Magasin de comptes (thread-safe, clonable), en mémoire ou adossé à un
+/// fichier (voir [`Self::open`]).
 #[derive(Clone)]
 pub struct AccountStore {
     etat: EtatPartage,
     argon: Argon2<'static>,
     /// Journal d'audit optionnel (voir [`Self::with_audit`]).
     audit: Option<audit::AuditLog>,
+    /// Stockage persistant optionnel (voir [`Self::open`]) ; `None` = magasin
+    /// purement en mémoire, volatil.
+    stockage: Option<storage::StockageFichier>,
 }
 
 impl Default for AccountStore {
@@ -125,7 +193,45 @@ impl AccountStore {
             etat: EtatPartage::default(),
             argon,
             audit: None,
+            stockage: None,
         }
+    }
+
+    /// Magasin **persistant** : charge le fichier de comptes s'il existe
+    /// (comptes, secrets 2FA, liens OIDC), puis persiste chaque mutation
+    /// durable (`register`, `enable_2fa`, `link_oidc`) par écriture atomique.
+    /// Les sessions ne sont pas persistées. Paramètres Argon2id par défaut.
+    ///
+    /// # Errors
+    /// `Stockage` si le fichier existe mais est illisible (JSON corrompu,
+    /// version de format plus récente que le service, secret TOTP corrompu).
+    pub fn open<P: AsRef<Path>>(chemin: P) -> Result<Self, AccountError> {
+        Self::open_with_argon2(chemin, Argon2::default())
+    }
+
+    /// Comme [`Self::open`], avec une configuration Argon2 personnalisée
+    /// (tests : paramètres légers).
+    ///
+    /// # Errors
+    /// Voir [`Self::open`].
+    pub fn open_with_argon2<P: AsRef<Path>>(
+        chemin: P,
+        argon: Argon2<'static>,
+    ) -> Result<Self, AccountError> {
+        let stockage = storage::StockageFichier::new(chemin.as_ref());
+        let etat = match stockage
+            .charger()
+            .map_err(|e| AccountError::Stockage(e.to_string()))?
+        {
+            Some(donnees) => Etat::depuis_donnees(donnees)?,
+            None => Etat::default(),
+        };
+        Ok(Self {
+            etat: Arc::new(Mutex::new(etat)),
+            argon,
+            audit: None,
+            stockage: Some(stockage),
+        })
     }
 
     /// Attache un journal d'audit : créations de compte, connexions (réussies
@@ -145,11 +251,28 @@ impl AccountStore {
         }
     }
 
-    /// Crée un compte : le mot de passe est haché en **Argon2id** (sel aléatoire).
+    /// Persiste l'état durable si un stockage est attaché. À appeler **sous**
+    /// le verrou d'état : l'instantané est cohérent et les écritures
+    /// concurrentes des clones sont sérialisées. Les mutations sont rares
+    /// (inscription, activation 2FA, lien OIDC) : l'E/S sous verrou est un
+    /// compromis assumé et documenté.
+    fn persister(&self, etat: &Etat) -> Result<(), AccountError> {
+        let Some(stockage) = &self.stockage else {
+            return Ok(());
+        };
+        stockage
+            .sauvegarder(&etat.instantane())
+            .map_err(|e| AccountError::Stockage(e.to_string()))
+    }
+
+    /// Crée un compte : le mot de passe est haché en **Argon2id** (sel
+    /// aléatoire). Sur un magasin persistant, le compte est écrit sur disque
+    /// avant que l'appel réussisse (« durable ou rien »).
     ///
     /// # Errors
     /// `EntreeInvalide` si e-mail/mot de passe vide, `EmailDejaUtilise` si le
-    /// compte existe, `Interne` si le hachage échoue.
+    /// compte existe, `Stockage` si la persistance échoue (le compte n'est
+    /// alors pas créé), `Interne` si le hachage échoue.
     pub fn register(&self, email: &str, password: &str) -> Result<(), AccountError> {
         if email.trim().is_empty() || password.is_empty() {
             return Err(AccountError::EntreeInvalide);
@@ -166,6 +289,10 @@ impl AccountStore {
             return Err(AccountError::EmailDejaUtilise);
         }
         etat.comptes.insert(email.to_string(), phc);
+        if let Err(e) = self.persister(&etat) {
+            etat.comptes.remove(email); // durable ou rien
+            return Err(e);
+        }
         drop(etat); // audit hors verrou
         self.auditer(audit::AuditEvent::AccountCreated {
             email: email.to_string(),
@@ -242,16 +369,28 @@ impl AccountStore {
     /// Active la 2FA TOTP sur un compte : génère un secret de 20 octets, le
     /// stocke et le renvoie (à présenter une seule fois à l'utilisateur, p. ex.
     /// sous forme d'URI `otpauth://` en QR code). Réactiver régénère le secret.
+    /// Sur un magasin persistant, le secret est écrit sur disque avant que
+    /// l'appel réussisse (en clair pour l'instant — voir la doc de [`storage`] :
+    /// le chiffrement au repos par clé serveur viendra).
     ///
     /// # Errors
-    /// `CompteInconnu` si l'e-mail n'est pas enregistré.
+    /// `CompteInconnu` si l'e-mail n'est pas enregistré, `Stockage` si la
+    /// persistance échoue (l'ancien état 2FA est alors conservé).
     pub fn enable_2fa(&self, email: &str) -> Result<Vec<u8>, AccountError> {
         let mut etat = self.etat.lock().unwrap();
         if !etat.comptes.contains_key(email) {
             return Err(AccountError::CompteInconnu);
         }
         let secret = totp::generate_totp_secret();
-        etat.secrets_2fa.insert(email.to_string(), secret.clone());
+        let precedent = etat.secrets_2fa.insert(email.to_string(), secret.clone());
+        if let Err(e) = self.persister(&etat) {
+            // Durable ou rien : on restaure l'état 2FA antérieur.
+            match precedent {
+                Some(ancien) => etat.secrets_2fa.insert(email.to_string(), ancien),
+                None => etat.secrets_2fa.remove(email),
+            };
+            return Err(e);
+        }
         drop(etat); // audit hors verrou
         self.auditer(audit::AuditEvent::TwoFactorEnabled {
             email: email.to_string(),
@@ -299,6 +438,69 @@ impl AccountStore {
     #[must_use]
     pub fn verify_token(&self, jeton: &str) -> Option<String> {
         self.etat.lock().unwrap().sessions.get(jeton).cloned()
+    }
+
+    // -- Fédération OIDC (module [`oidc`]) ----------------------------------
+
+    /// Lie une identité fédérée à un compte local : `subject` est
+    /// l'identifiant stable de l'utilisateur chez le fournisseur — utiliser
+    /// une clé globalement unique, p. ex. `"{iss}|{sub}"` d'un ID token validé
+    /// par [`oidc::validate_id_token`] (l'e-mail vient typiquement du claim
+    /// `email`). Relier le même sujet au même compte est idempotent. Sur un
+    /// magasin persistant, le lien est écrit sur disque avant de réussir.
+    ///
+    /// # Errors
+    /// `EntreeInvalide` si un champ est vide, `CompteInconnu` si l'e-mail
+    /// n'est pas enregistré, `SujetOidcDejaLie` si le sujet pointe déjà un
+    /// autre compte, `Stockage` si la persistance échoue (le lien n'est alors
+    /// pas créé).
+    pub fn link_oidc(&self, email: &str, subject: &str) -> Result<(), AccountError> {
+        if email.trim().is_empty() || subject.trim().is_empty() {
+            return Err(AccountError::EntreeInvalide);
+        }
+        let mut etat = self.etat.lock().unwrap();
+        if !etat.comptes.contains_key(email) {
+            return Err(AccountError::CompteInconnu);
+        }
+        match etat.liens_oidc.get(subject) {
+            Some(existant) if existant == email => return Ok(()), // idempotent
+            Some(_) => return Err(AccountError::SujetOidcDejaLie),
+            None => {}
+        }
+        etat.liens_oidc
+            .insert(subject.to_string(), email.to_string());
+        if let Err(e) = self.persister(&etat) {
+            etat.liens_oidc.remove(subject); // durable ou rien
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// E-mail du compte local lié à un sujet OIDC (None si jamais lié).
+    #[must_use]
+    pub fn oidc_account(&self, subject: &str) -> Option<String> {
+        self.etat.lock().unwrap().liens_oidc.get(subject).cloned()
+    }
+
+    /// Ouvre une session pour un sujet OIDC déjà lié ([`Self::link_oidc`]).
+    /// À n'appeler qu'après validation de l'ID token
+    /// ([`oidc::validate_id_token`]) : l'authentification — y compris MFA — a
+    /// eu lieu chez le fournisseur, la 2FA locale ne s'applique pas ici.
+    ///
+    /// # Errors
+    /// `CompteInconnu` si le sujet n'est lié à aucun compte.
+    pub fn login_oidc(&self, subject: &str) -> Result<String, AccountError> {
+        let email = self
+            .etat
+            .lock()
+            .unwrap()
+            .liens_oidc
+            .get(subject)
+            .cloned()
+            .ok_or(AccountError::CompteInconnu)?;
+        let jeton = self.ouvrir_session(&email);
+        self.auditer(audit::AuditEvent::LoginSuccess { email });
+        Ok(jeton)
     }
 }
 
@@ -494,13 +696,22 @@ fn main() -> std::io::Result<()> {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| ADRESSE_DEFAUT.to_string());
+    // Second argument optionnel : chemin du fichier de comptes (persistance).
+    let chemin = std::env::args().nth(2);
+    let (store, mode) = match &chemin {
+        Some(chemin) => {
+            let store = AccountStore::open(chemin).map_err(std::io::Error::other)?;
+            (store, format!("comptes persistés dans {chemin}"))
+        }
+        None => (AccountStore::new(), "comptes en mémoire".to_string()),
+    };
     let listener = TcpListener::bind(&addr)?;
     println!(
-        "nd-accounts (NovaDesk protocole v{}) en écoute sur {} — comptes en mémoire",
+        "nd-accounts (NovaDesk protocole v{}) en écoute sur {} — {mode}",
         nd_proto::ProtocolVersion::CURRENT,
         listener.local_addr()?
     );
-    serve(listener, AccountStore::new())
+    serve(listener, store)
 }
 
 // ---------------------------------------------------------------------------
@@ -510,12 +721,23 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::test_util::FichierTemp;
     use argon2::{Algorithm, Params, Version};
 
-    /// Magasin avec des paramètres Argon2id légers (tests rapides en debug).
-    fn store_test() -> AccountStore {
+    /// Paramètres Argon2id légers (tests rapides en debug).
+    fn argon2_leger() -> Argon2<'static> {
         let params = Params::new(Params::MIN_M_COST, 1, 1, None).expect("params argon2");
-        AccountStore::with_argon2(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    }
+
+    /// Magasin en mémoire avec des paramètres Argon2id légers.
+    fn store_test() -> AccountStore {
+        AccountStore::with_argon2(argon2_leger())
+    }
+
+    /// Magasin persistant (fichier donné) avec des paramètres légers.
+    fn store_persistant(chemin: &Path) -> AccountStore {
+        AccountStore::open_with_argon2(chemin, argon2_leger()).expect("ouverture du magasin")
     }
 
     #[test]
@@ -745,6 +967,211 @@ mod tests {
             Err(AccountError::IdentifiantsInvalides)
         );
         assert_eq!(journal.for_account("inconnu@example.com").len(), 1);
+    }
+
+    // -- Persistance (module `storage`) --------------------------------------
+
+    #[test]
+    fn persistance_register_puis_reouverture() {
+        let tmp = FichierTemp::nouveau("reouverture");
+        {
+            let store = store_persistant(tmp.chemin());
+            store
+                .register("alice@example.com", "s3cret!")
+                .expect("register");
+        } // le magasin est refermé : seul le fichier survit
+
+        let store = store_persistant(tmp.chemin());
+        let jeton = store
+            .login("alice@example.com", "s3cret!")
+            .expect("login après réouverture");
+        assert_eq!(
+            store.verify_token(&jeton).as_deref(),
+            Some("alice@example.com")
+        );
+        // Mauvais mot de passe : refusé sur le magasin rechargé.
+        assert_eq!(
+            store.login("alice@example.com", "mauvais"),
+            Err(AccountError::IdentifiantsInvalides)
+        );
+        // L'unicité d'e-mail est elle aussi rechargée.
+        assert_eq!(
+            store.register("alice@example.com", "autre"),
+            Err(AccountError::EmailDejaUtilise)
+        );
+
+        // Une inscription après réouverture est persistée à son tour.
+        store.register("bob@example.com", "mdp2").expect("register");
+        let store = store_persistant(tmp.chemin());
+        assert!(store.login("bob@example.com", "mdp2").is_ok());
+    }
+
+    #[test]
+    fn persistance_2fa_survit_a_la_reouverture() {
+        let tmp = FichierTemp::nouveau("2fa");
+        let secret = {
+            let store = store_persistant(tmp.chemin());
+            store.register("gina@example.com", "mdp").expect("register");
+            store.enable_2fa("gina@example.com").expect("enable_2fa")
+        };
+
+        let store = store_persistant(tmp.chemin());
+        // La 2FA est toujours exigée après redémarrage...
+        assert_eq!(
+            store.login("gina@example.com", "mdp"),
+            Err(AccountError::DeuxFacteursRequis)
+        );
+        // ... et le secret rechargé accepte les codes TOTP courants.
+        let code = totp::totp_at(&secret, unix_maintenant());
+        let jeton = store
+            .login_2fa("gina@example.com", "mdp", &code)
+            .expect("login_2fa après réouverture");
+        assert_eq!(
+            store.verify_token(&jeton).as_deref(),
+            Some("gina@example.com")
+        );
+    }
+
+    #[test]
+    fn persistance_sessions_volatiles() {
+        let tmp = FichierTemp::nouveau("sessions");
+        let jeton = {
+            let store = store_persistant(tmp.chemin());
+            store.register("carl@example.com", "mdp").expect("register");
+            store.login("carl@example.com", "mdp").expect("login")
+        };
+        // Un redémarrage invalide les sessions ouvertes (par conception).
+        let store = store_persistant(tmp.chemin());
+        assert_eq!(store.verify_token(&jeton), None);
+    }
+
+    #[test]
+    fn persistance_fichier_sans_mot_de_passe_en_clair() {
+        let tmp = FichierTemp::nouveau("sans-mdp");
+        let store = store_persistant(tmp.chemin());
+        store
+            .register("dan@example.com", "MotDePasseTresSecret123")
+            .expect("register");
+
+        let contenu = std::fs::read_to_string(tmp.chemin()).expect("fichier écrit");
+        assert!(
+            !contenu.contains("MotDePasseTresSecret123"),
+            "le mot de passe en clair ne doit jamais toucher le disque"
+        );
+        assert!(
+            contenu.contains("$argon2id$"),
+            "seul le hachage PHC Argon2id est persisté"
+        );
+    }
+
+    // -- Fédération OIDC (`link_oidc` / `login_oidc`) -------------------------
+
+    #[test]
+    fn link_oidc_regles_de_liaison() {
+        let store = store_test(); // fonctionne aussi sans stockage attaché
+        assert_eq!(
+            store.link_oidc("x@example.com", "https://idp|sub-1"),
+            Err(AccountError::CompteInconnu)
+        );
+
+        store.register("x@example.com", "mdp").expect("register");
+        store.register("y@example.com", "mdp").expect("register");
+        store
+            .link_oidc("x@example.com", "https://idp|sub-1")
+            .expect("premier lien");
+        // Relier le même sujet au même compte : idempotent.
+        store
+            .link_oidc("x@example.com", "https://idp|sub-1")
+            .expect("lien idempotent");
+        // Le même sujet ne peut pas pointer un autre compte.
+        assert_eq!(
+            store.link_oidc("y@example.com", "https://idp|sub-1"),
+            Err(AccountError::SujetOidcDejaLie)
+        );
+        // Entrées vides refusées.
+        assert_eq!(
+            store.link_oidc("", "https://idp|sub-2"),
+            Err(AccountError::EntreeInvalide)
+        );
+        assert_eq!(
+            store.link_oidc("x@example.com", "  "),
+            Err(AccountError::EntreeInvalide)
+        );
+
+        assert_eq!(
+            store.oidc_account("https://idp|sub-1").as_deref(),
+            Some("x@example.com")
+        );
+        assert_eq!(store.oidc_account("https://idp|inconnu"), None);
+    }
+
+    #[test]
+    fn login_oidc_ouvre_une_session_pour_un_sujet_lie() {
+        let journal = audit::AuditLog::new();
+        let store = store_test().with_audit(journal.clone());
+        store.register("zoe@example.com", "mdp").expect("register");
+        store
+            .link_oidc("zoe@example.com", "https://idp|sub-zoe")
+            .expect("lien");
+
+        let jeton = store.login_oidc("https://idp|sub-zoe").expect("login_oidc");
+        assert_eq!(
+            store.verify_token(&jeton).as_deref(),
+            Some("zoe@example.com")
+        );
+        // La connexion fédérée est consignée comme une connexion réussie.
+        assert!(matches!(
+            journal
+                .for_account("zoe@example.com")
+                .last()
+                .expect("évt")
+                .event,
+            audit::AuditEvent::LoginSuccess { .. }
+        ));
+
+        // Sujet jamais lié : refus.
+        assert_eq!(
+            store.login_oidc("https://idp|autre"),
+            Err(AccountError::CompteInconnu)
+        );
+    }
+
+    #[test]
+    fn persistance_liens_oidc_survivent_a_la_reouverture() {
+        let tmp = FichierTemp::nouveau("oidc");
+        {
+            let store = store_persistant(tmp.chemin());
+            store
+                .register("carol@example.com", "mdp")
+                .expect("register");
+            store
+                .link_oidc("carol@example.com", "https://idp.example|sub-42")
+                .expect("lien");
+        }
+
+        let store = store_persistant(tmp.chemin());
+        assert_eq!(
+            store.oidc_account("https://idp.example|sub-42").as_deref(),
+            Some("carol@example.com")
+        );
+        let jeton = store
+            .login_oidc("https://idp.example|sub-42")
+            .expect("login_oidc après réouverture");
+        assert_eq!(
+            store.verify_token(&jeton).as_deref(),
+            Some("carol@example.com")
+        );
+    }
+
+    #[test]
+    fn ouverture_fichier_corrompu_refusee() {
+        let tmp = FichierTemp::nouveau("ouverture-corrompue");
+        std::fs::write(tmp.chemin(), b"{ pas du json ]").expect("écriture");
+        let resultat = AccountStore::open_with_argon2(tmp.chemin(), argon2_leger());
+        assert!(
+            matches!(resultat, Err(AccountError::Stockage(_))),
+            "erreur Stockage attendue sur un fichier corrompu"
+        );
     }
 
     #[test]

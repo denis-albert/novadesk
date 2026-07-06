@@ -8,6 +8,10 @@ pub mod codec;
 pub mod convert;
 pub mod jitter;
 pub mod level;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 pub mod mixing;
 #[cfg(windows)]
 mod win;
@@ -16,13 +20,17 @@ mod winmic;
 #[cfg(windows)]
 mod winplay;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 use nd_proto::NdError;
 use nd_proto::Result;
 
 pub use codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus, TRAME_MS};
 pub use jitter::{JitterBuffer, SortieJitter, StatsJitter};
 pub use level::{dbfs, est_silence, peak, rms, LevelMeter, DBFS_PLANCHER};
+#[cfg(target_os = "linux")]
+pub use linux::{PulseLoopbackCapturer, PulseMicCapturer, PulsePlayer};
+#[cfg(target_os = "macos")]
+pub use macos::CoreAudioPlayer;
 pub use mixing::{mix, mix_into, soft_clip, Mixer, SEUIL_SOFT_CLIP};
 #[cfg(windows)]
 pub use win::WasapiLoopbackCapturer;
@@ -77,11 +85,33 @@ pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
     Ok(Box::new(win::WasapiLoopbackCapturer::new()?))
 }
 
-/// Crée un capteur de l'audio système (loopback). Non implémenté sur cet OS.
-#[cfg(not(windows))]
+/// Crée un capteur de l'audio système (loopback).
+///
+/// Linux : capture PulseAudio de la source *monitor* de la sortie par défaut
+/// (`@DEFAULT_MONITOR@`), demandée directement en 48 kHz stéréo et encodée en
+/// Opus (trames de 20 ms). Fonctionne aussi sous PipeWire via `pipewire-pulse`.
+#[cfg(target_os = "linux")]
+pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Ok(Box::new(linux::PulseLoopbackCapturer::new()?))
+}
+
+/// Crée un capteur de l'audio système (loopback). Pas d'API publique de
+/// loopback sur macOS avant ScreenCaptureKit (macOS ≥ 13) — limite documentée
+/// en tête de `src/macos.rs` ; l'intégration ScreenCaptureKit viendra avec la
+/// capture d'écran (plans 02/08).
+#[cfg(target_os = "macos")]
 pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
     Err(NdError::NotImplemented(
-        "nd-audio::create_system_capturer (CoreAudio/PipeWire à venir, voir plan 08/16)",
+        "nd-audio::create_system_capturer — macOS : loopback via ScreenCaptureKit (≥ 13) à venir ; \
+         avant macOS 13 seul un périphérique virtuel tiers (BlackHole) le permet (voir src/macos.rs)",
+    ))
+}
+
+/// Crée un capteur de l'audio système (loopback). Non implémenté sur cet OS.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Err(NdError::NotImplemented(
+        "nd-audio::create_system_capturer (OS non pris en charge, voir plan 08/16)",
     ))
 }
 
@@ -95,11 +125,31 @@ pub fn create_microphone_capturer() -> Result<Box<dyn AudioCapturer>> {
     Ok(Box::new(winmic::WasapiMicCapturer::new()?))
 }
 
-/// Crée un capteur du microphone. Non implémenté sur cet OS.
-#[cfg(not(windows))]
+/// Crée un capteur du **microphone** (voix bidirectionnelle, plan 08).
+///
+/// Linux : capture PulseAudio de la source d'entrée par défaut, demandée
+/// directement en 48 kHz mono et encodée en Opus profil voix (trames de
+/// 20 ms, ~28 kbps, DTX). Fonctionne aussi sous PipeWire via `pipewire-pulse`.
+#[cfg(target_os = "linux")]
+pub fn create_microphone_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Ok(Box::new(linux::PulseMicCapturer::new()?))
+}
+
+/// Crée un capteur du microphone. À venir sur macOS : AUHAL en direction
+/// entrée (`kAudioOutputUnitProperty_EnableIO`) + consentement micro TCC —
+/// voir `src/macos.rs` et plan 08 §macOS.
+#[cfg(target_os = "macos")]
 pub fn create_microphone_capturer() -> Result<Box<dyn AudioCapturer>> {
     Err(NdError::NotImplemented(
-        "nd-audio::create_microphone_capturer (CoreAudio/PipeWire à venir, voir plan 08/16)",
+        "nd-audio::create_microphone_capturer — macOS : capture AUHAL (entrée) à venir, voir src/macos.rs",
+    ))
+}
+
+/// Crée un capteur du microphone. Non implémenté sur cet OS.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn create_microphone_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Err(NdError::NotImplemented(
+        "nd-audio::create_microphone_capturer (OS non pris en charge, voir plan 08/16)",
     ))
 }
 
@@ -113,10 +163,33 @@ pub fn create_system_player() -> Result<Box<dyn AudioPlayer>> {
     Ok(Box::new(winplay::WasapiPlayer::new()?))
 }
 
+/// Crée un lecteur audio système (restitution côté viewer).
+///
+/// Linux : flux de lecture PulseAudio sur la sortie par défaut, alimenté en
+/// 48 kHz stéréo `f32` (le serveur convertit vers le format matériel) ; chaque
+/// paquet Opus est décodé puis écrit dans le flux (écriture bloquante, cadence
+/// alignée sur l'horloge du périphérique). Le lissage réseau revient au
+/// [`JitterBuffer`] amont.
+#[cfg(target_os = "linux")]
+pub fn create_system_player() -> Result<Box<dyn AudioPlayer>> {
+    Ok(Box::new(linux::PulsePlayer::new()?))
+}
+
+/// Crée un lecteur audio système (restitution côté viewer).
+///
+/// macOS : AudioUnit « default output » (CoreAudio) tirant une file de PCM
+/// alimentée par les paquets Opus décodés ; l'AUHAL convertit du format de
+/// session (48 kHz stéréo `f32`) vers le format matériel. Le lissage réseau
+/// revient au [`JitterBuffer`] amont.
+#[cfg(target_os = "macos")]
+pub fn create_system_player() -> Result<Box<dyn AudioPlayer>> {
+    Ok(Box::new(macos::CoreAudioPlayer::new()?))
+}
+
 /// Crée un lecteur audio système. Non implémenté sur cet OS.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn create_system_player() -> Result<Box<dyn AudioPlayer>> {
     Err(NdError::NotImplemented(
-        "nd-audio::create_system_player (CoreAudio/PipeWire à venir, voir plan 08/16)",
+        "nd-audio::create_system_player (OS non pris en charge, voir plan 08/16)",
     ))
 }

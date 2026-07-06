@@ -1,0 +1,37 @@
+# NovaDesk — interface client Flutter (plan 10).
+# L'UI est « mince » : toute la logique réseau/crypto/média vit dans le cœur Rust
+# (workspace ../, façade `crates/nd-ffi`), relié via flutter_rust_bridge.
+name: novadesk_ui
+description: Interface Flutter de NovaDesk — bureau à distance piloté par un cœur Rust.
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+  flutter: '>=3.27.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Localisations Material/Cupertino (l'UI v1 est en français ; catalogues ARB à venir).
+  flutter_localizations:
+    sdk: flutter
+  # Gestion d'état : providers composables, `family`/`autoDispose` calqués sur le
+  # cycle de vie d'une session (choix argumenté au plan 10 §10.2.3).
+  flutter_riverpod: ^2.6.1
+  # Pont Dart <-> Rust : runtime du binding généré depuis `crates/nd-ffi`
+  # (voir lib/bridge/README.md pour la génération).
+  flutter_rust_bridge: ^2.9.0
+  # NOTE : `window_manager` (fenêtrage desktop) a été retiré car son build natif
+  # exige le mode développeur Windows (liens symboliques), indisponible sans
+  # droits admin. Il est remplacé par la façade locale `lib/platform/window_shim.dart`.
+  # Pour restaurer le contrôle de fenêtre : rajouter `window_manager: ^0.4.3` ici
+  # et réimporter le paquet à la place du shim.
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

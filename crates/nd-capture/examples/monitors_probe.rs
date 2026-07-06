@@ -1,13 +1,13 @@
 //! Sonde multi-écran (plan 13) : énumère les moniteurs attachés au bureau puis
 //! capture une frame de CHACUN via [`nd_capture::create_capturer`], preuve que le
-//! capteur DXGI fonctionne avec un `MonitorId` quelconque (pas seulement 0).
+//! capteur de la plateforme (DXGI, CoreGraphics ou X11) fonctionne avec un
+//! `MonitorId` quelconque (pas seulement 0).
 //!
 //! Lancer : `cargo run --example monitors_probe -p nd-capture`
 
-#[cfg(windows)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use nd_capture::{create_capturer, enumerate_monitors, CaptureConfig, FrameImage};
+use nd_capture::{create_capturer, enumerate_monitors, CaptureConfig, FrameImage};
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitors = enumerate_monitors()?;
     println!("{} moniteur(s) détecté(s) :", monitors.len());
     for m in &monitors {
@@ -61,11 +61,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn main() {
-    eprintln!(
-        "monitors_probe : exemple Windows uniquement (impl macOS/Linux à venir, voir plan 02/16)."
-    );
 }

@@ -212,27 +212,42 @@ impl StunClient {
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
         };
         let socket = UdpSocket::bind(locale)?;
-        socket.set_read_timeout(Some(self.timeout))?;
-
-        let transaction_id = nouveau_transaction_id();
-        let requete = construire_binding_request(&transaction_id);
-        let mut tampon = [0u8; 1500];
-        let mut derniere = erreur("aucune réponse du serveur STUN");
-        for _ in 0..self.tentatives {
-            socket.send_to(&requete, self.server)?;
-            match socket.recv_from(&mut tampon) {
-                Ok((n, _)) => match analyser_binding_response(&tampon[..n], &transaction_id) {
-                    Ok(adresse) => return Ok(adresse),
-                    // Datagramme parasite ou réponse invalide : on retente.
-                    Err(e) => derniere = e,
-                },
-                // Timeout (ou ICMP « port unreachable » remonté par Windows) :
-                // on retransmet, conformément à l'esprit de RFC 5389 §7.2.1.
-                Err(e) => derniere = e.into(),
-            }
-        }
-        Err(derniere)
+        decouvrir_par_socket(&socket, self.server, self.timeout, self.tentatives)
     }
+}
+
+/// Transaction Binding complète sur une socket **fournie** : envoi de la
+/// requête, retransmissions, extraction du XOR-MAPPED-ADDRESS.
+///
+/// Utilisé par [`StunClient::discover`] (socket éphémère) et par la détection
+/// du type de NAT ([`crate::nat`]), qui doit interroger **deux** serveurs
+/// depuis la **même** socket pour comparer les mappings. Laisse le timeout de
+/// lecture de la socket positionné à `timeout`.
+pub(crate) fn decouvrir_par_socket(
+    socket: &UdpSocket,
+    serveur: SocketAddr,
+    timeout: Duration,
+    tentatives: u32,
+) -> Result<SocketAddr> {
+    socket.set_read_timeout(Some(timeout))?;
+    let transaction_id = nouveau_transaction_id();
+    let requete = construire_binding_request(&transaction_id);
+    let mut tampon = [0u8; 1500];
+    let mut derniere = erreur("aucune réponse du serveur STUN");
+    for _ in 0..tentatives {
+        socket.send_to(&requete, serveur)?;
+        match socket.recv_from(&mut tampon) {
+            Ok((n, _)) => match analyser_binding_response(&tampon[..n], &transaction_id) {
+                Ok(adresse) => return Ok(adresse),
+                // Datagramme parasite ou réponse invalide : on retente.
+                Err(e) => derniere = e,
+            },
+            // Timeout (ou ICMP « port unreachable » remonté par Windows) :
+            // on retransmet, conformément à l'esprit de RFC 5389 §7.2.1.
+            Err(e) => derniere = e.into(),
+        }
+    }
+    Err(derniere)
 }
 
 /// Découvre l'adresse réflexive publique via le serveur STUN donné.

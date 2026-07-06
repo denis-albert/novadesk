@@ -23,5 +23,18 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Implémentation macOS : capture CoreGraphics (CGDisplayCreateImage) + énumération
+# des écrans (CGGetActiveDisplayList). Le passage à ScreenCaptureKit (flux poussé,
+# zéro-copie) est prévu dans un jet ultérieur — voir plan 02 §macOS.
+# (`core-foundation` arrive transitivement ; pas besoin d'une dépendance directe.)
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+
+# Implémentation Linux : capture X11 (GetImage) + énumération RandR via x11rb
+# (Rust pur, sans bibliothèque C). Wayland (PipeWire + portail) : jet ultérieur,
+# voir plan 02 §Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["randr"] }
+
 [lints]
 workspace = true

@@ -1,0 +1,8 @@
+# Analyse statique du code Dart de NovaDesk UI.
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    prefer_single_quotes: true
+    unawaited_futures: true
+    directives_ordering: true

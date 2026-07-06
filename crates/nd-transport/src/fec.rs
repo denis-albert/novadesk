@@ -22,7 +22,10 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 pub const MAX_SHARDS: usize = 256;
 
 /// Taille du préfixe mémorisant la longueur d'origine (u32 petit-boutiste).
-const LEN_PREFIX: usize = 4;
+///
+/// Public car il entre dans le dimensionnement des fragments côté transport : la
+/// taille d'un fragment vaut `⌈(LEN_PREFIX + longueur de la charge) / k⌉`.
+pub const LEN_PREFIX: usize = 4;
 
 /// Taux de perte au-delà duquel on cesse d'augmenter la parité : à plus de 50 % de
 /// pertes le lien est de toute façon inutilisable, inonder de parité n'aiderait pas.

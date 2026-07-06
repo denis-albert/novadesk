@@ -22,5 +22,20 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
 ] }
 
+# Implémentation Linux : PulseAudio « simple API » (flux synchrones bloquants),
+# la plus directe pour un premier jet. Le loopback système passe par la source
+# *monitor* du périphérique de sortie par défaut (`@DEFAULT_MONITOR@`) ; les
+# distributions PipeWire exposent la même API via pipewire-pulse — voir plan 08
+# §Linux. Nécessite libpulse côté système (paquet libpulse-dev à la compilation).
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.30"
+libpulse-simple-binding = "2.29"
+
+# Implémentation macOS : rendu CoreAudio (AudioUnit « default output » +
+# rappel de rendu) via coreaudio-rs. La capture de l'audio système n'a pas
+# d'API publique avant macOS 13 (ScreenCaptureKit) — voir src/macos.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.12"
+
 [lints]
 workspace = true

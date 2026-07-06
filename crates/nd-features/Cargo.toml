@@ -7,6 +7,8 @@ description = "Permissions de session et fonctionnalités avancées (voir plan 1
 
 [dependencies]
 nd-proto = { workspace = true }
+# Hachage d'intégrité des enregistrements de session (voir `recording.rs`).
+blake3 = "1"
 
 [lints]
 workspace = true

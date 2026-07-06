@@ -10,11 +10,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::groups::GroupStore;
 use crate::rbac::Role;
 
 /// Bénéficiaire d'un partage : compte individuel ou groupe entier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// L'ordre dérivé (`Ord`) n'a pas de sens métier : il sert uniquement au tri
+/// déterministe des instantanés persistés (voir [`SharingStore::snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Beneficiaire {
     /// Compte nommé (partage direct).
     Compte(String),
@@ -24,6 +29,10 @@ pub enum Beneficiaire {
 
 /// Table interne : id d'appareil → (bénéficiaire → rôle accordé).
 type PartageMap = HashMap<u64, HashMap<Beneficiaire, Role>>;
+
+/// Entrée d'instantané de partage : (appareil, bénéficiaire, rôle accordé).
+/// (Forme dépliée, sérialisable — voir `storage`.)
+pub type PartageInstantane = (u64, Beneficiaire, Role);
 
 /// Magasin de partages, en mémoire (thread-safe, clonable).
 ///
@@ -94,6 +103,41 @@ impl SharingStore {
             .collect();
         resultat.sort_by_key(|(device_id, _)| *device_id);
         resultat
+    }
+
+    /// Instantané complet des partages, trié (appareil, bénéficiaire) pour un
+    /// fichier persisté stable (voir `storage`).
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<PartageInstantane> {
+        let partages = self.partages.lock().unwrap();
+        let mut entrees: Vec<PartageInstantane> = partages
+            .iter()
+            .flat_map(|(appareil, par_beneficiaire)| {
+                let appareil = *appareil;
+                par_beneficiaire
+                    .iter()
+                    .map(move |(beneficiaire, role)| (appareil, beneficiaire.clone(), *role))
+            })
+            .collect();
+        entrees.sort();
+        entrees
+    }
+
+    /// Reconstruit un magasin depuis un instantané persisté, branché sur le
+    /// [`GroupStore`] fourni (l'appartenance reste résolue à la requête).
+    #[must_use]
+    pub fn from_snapshot(groupes: GroupStore, entrees: Vec<PartageInstantane>) -> Self {
+        let store = Self::new(groupes);
+        {
+            let mut partages = store.partages.lock().unwrap();
+            for (appareil, beneficiaire, role) in entrees {
+                partages
+                    .entry(appareil)
+                    .or_default()
+                    .insert(beneficiaire, role);
+            }
+        }
+        store
     }
 
     /// Rôle le plus élevé accordé à `compte` parmi les bénéficiaires d'un

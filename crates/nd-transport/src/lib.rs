@@ -1,12 +1,14 @@
 //! `nd-transport` — abstraction du transport temps réel au-dessus de QUIC.
 //!
 //! Multiplexe des canaux logiques (vidéo/audio/input/fichiers/contrôle) sur une seule
-//! connexion QUIC, avec datagrammes non fiables + FEC pour le média et flux fiables
-//! pour l'input/contrôle/fichiers. Congestion, format de trames et FEC :
-//! `../../plan-technique/04-transport-reseau.md`.
+//! connexion QUIC (`quinn`), avec datagrammes non fiables + FEC pour le média
+//! ([`nd_proto::Reliability::UnreliableFec`], modules [`fec`] et `datagram`) et flux
+//! fiable ordonné pour l'input/contrôle/fichiers. Congestion, format de trames et
+//! FEC : `../../plan-technique/04-transport-reseau.md`.
 //!
-//! Note : le squelette utilise `Vec<u8>` ; l'implémentation passera à `bytes::Bytes`
-//! (zéro-copie) et à `quinn` pour QUIC.
+//! Note : l'API du trait reste en `Vec<u8>` ; le passage à `bytes::Bytes` de bout en
+//! bout (zéro-copie) viendra quand `nd-codec` produira ses trames dans des tampons
+//! partagés.
 
 use nd_proto::{ChannelKind, Reliability, Result};
 
@@ -15,10 +17,17 @@ use nd_proto::{ChannelKind, Reliability, Result};
 pub struct ChannelHandle(pub u32);
 
 /// Statistiques de chemin réseau, alimentant l'ABR du codec (voir plan 03/04).
+///
+/// Renseignées depuis les statistiques de la connexion quinn : voir
+/// [`Transport::path_estimate`] du transport QUIC.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PathEstimate {
+    /// RTT lissé du chemin, en microsecondes.
     pub rtt_us: u64,
+    /// Taux de perte de paquets, fenêtré puis lissé, dans [0, 1]. Sert aussi à
+    /// dimensionner la parité FEC ([`fec::FecParams::adapt`]).
     pub loss_ratio: f32,
+    /// Débit plafond estimé (fenêtre de congestion / RTT), en kbit/s.
     pub estimated_bandwidth_kbps: u32,
 }
 
@@ -34,6 +43,7 @@ pub trait Transport: Send {
     fn path_estimate(&self) -> PathEstimate;
 }
 
+mod datagram;
 pub mod fec;
 mod quic;
-pub use quic::{bind, connect, Listener, QuicTransport};
+pub use quic::{bind, connect, connect_quic, Listener, QuicTransport};
