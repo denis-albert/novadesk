@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use nd_capture::{CaptureConfig, CapturedFrame, ScreenCapturer};
 use nd_codec::{CodecKind, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder};
-use nd_crypto::SecureSession;
+use nd_crypto::{HandshakeRole, NoiseHandshake, NoiseSession, PeerFingerprint, SecureSession};
 use nd_features::Permissions;
 use nd_input::{InputInjector, MouseButton};
 use nd_proto::{
     ChannelKind, InputEvent, MonitorId, NdError, NovaId, ProtocolVersion, Reliability, Result,
 };
-use nd_transport::{ChannelHandle, Transport};
+use nd_transport::{ChannelHandle, PathEstimate, Transport};
 
 /// Rôle du poste local dans la session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +284,131 @@ impl ViewerPipeline {
             }
         }
         Ok((self.decoded, self.last_dimensions))
+    }
+}
+
+/// Longueur maximale de clair par message Noise (marge sous 65535 − tag AEAD).
+const NOISE_MAX_PLAINTEXT: usize = 60_000;
+
+/// Transport **chiffré de bout en bout** : enveloppe un [`Transport`] et chiffre toutes
+/// les charges via une session Noise (voir plan 06). Le transport/relais sous-jacent ne
+/// voit que du ciphertext — connaissance nulle côté serveur.
+pub struct EncryptedTransport {
+    inner: Box<dyn Transport>,
+    session: NoiseSession,
+}
+
+impl EncryptedTransport {
+    /// Empreinte de la clé statique locale (à afficher/comparer, voir plan 06 §SAS).
+    #[must_use]
+    pub fn local_fingerprint(&self) -> PeerFingerprint {
+        self.session.local_fingerprint()
+    }
+
+    /// Empreinte de la clé statique du pair distant (après handshake).
+    #[must_use]
+    pub fn remote_fingerprint(&self) -> Option<PeerFingerprint> {
+        self.session.remote_fingerprint()
+    }
+}
+
+/// Établit une session chiffrée de bout en bout par-dessus un transport, en réalisant
+/// le handshake Noise XX sur le canal de contrôle. Voir plan 06.
+pub fn establish(
+    mut inner: Box<dyn Transport>,
+    role: HandshakeRole,
+    static_private_key: &[u8],
+) -> Result<EncryptedTransport> {
+    let mut handshake = NoiseHandshake::new(role, static_private_key)?;
+    let control = inner.open_channel(ChannelKind::Control);
+    // XX : l'initiateur écrit le premier message, puis on alterne écriture/lecture.
+    let mut my_turn_to_write = matches!(role, HandshakeRole::Initiator);
+    while !handshake.is_finished() {
+        if my_turn_to_write {
+            let msg = handshake.write_message(&[])?;
+            inner.send(control, msg, Reliability::Reliable)?;
+        } else {
+            let msg = recv_blocking(inner.as_mut())?;
+            handshake.read_message(&msg)?;
+        }
+        my_turn_to_write = !my_turn_to_write;
+    }
+    let session = handshake.into_session()?;
+    Ok(EncryptedTransport { inner, session })
+}
+
+/// Attend (avec délai de garde) le prochain message reçu du transport.
+fn recv_blocking(inner: &mut dyn Transport) -> Result<Vec<u8>> {
+    for _ in 0..3000 {
+        if let Some((_handle, data)) = inner.poll_recv()? {
+            return Ok(data);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Err(NdError::Crypto("délai de handshake Noise dépassé".into()))
+}
+
+fn read_be_u32(d: &[u8], p: &mut usize) -> Result<u32> {
+    let bytes = d
+        .get(*p..*p + 4)
+        .ok_or_else(|| NdError::Crypto("cadre chiffré tronqué".into()))?;
+    *p += 4;
+    Ok(u32::from_be_bytes(
+        bytes.try_into().expect("tranche de 4 octets"),
+    ))
+}
+
+impl Transport for EncryptedTransport {
+    fn open_channel(&mut self, kind: ChannelKind) -> ChannelHandle {
+        self.inner.open_channel(kind)
+    }
+
+    fn send(&mut self, ch: ChannelHandle, data: Vec<u8>, reliability: Reliability) -> Result<()> {
+        // Découpe le clair en morceaux ≤ NOISE_MAX_PLAINTEXT, chiffre chacun, et encadre :
+        // [u32 n][ (u32 len, ciphertext) × n ]. Ordre préservé (flux fiable ordonné) → les
+        // compteurs de nonce Noise restent synchronisés entre les deux pairs.
+        let mut framed = Vec::with_capacity(data.len() + 32);
+        if data.is_empty() {
+            framed.extend_from_slice(&1u32.to_be_bytes());
+            let ct = self.session.encrypt(&[])?;
+            framed.extend_from_slice(&(ct.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&ct);
+        } else {
+            let count = data.len().div_ceil(NOISE_MAX_PLAINTEXT) as u32;
+            framed.extend_from_slice(&count.to_be_bytes());
+            for chunk in data.chunks(NOISE_MAX_PLAINTEXT) {
+                let ct = self.session.encrypt(chunk)?;
+                framed.extend_from_slice(&(ct.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&ct);
+            }
+        }
+        self.inner.send(ch, framed, reliability)
+    }
+
+    fn poll_recv(&mut self) -> Result<Option<(ChannelHandle, Vec<u8>)>> {
+        let Some((handle, framed)) = self.inner.poll_recv()? else {
+            return Ok(None);
+        };
+        let mut pos = 0usize;
+        let count = read_be_u32(&framed, &mut pos)? as usize;
+        let mut plaintext = Vec::new();
+        for _ in 0..count {
+            let clen = read_be_u32(&framed, &mut pos)? as usize;
+            let end = pos
+                .checked_add(clen)
+                .ok_or_else(|| NdError::Crypto("cadre chiffré invalide".into()))?;
+            let ciphertext = framed
+                .get(pos..end)
+                .ok_or_else(|| NdError::Crypto("cadre chiffré tronqué".into()))?;
+            pos = end;
+            let pt = self.session.decrypt(ciphertext)?;
+            plaintext.extend_from_slice(&pt);
+        }
+        Ok(Some((handle, plaintext)))
+    }
+
+    fn path_estimate(&self) -> PathEstimate {
+        self.inner.path_estimate()
     }
 }
 
