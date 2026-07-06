@@ -14,6 +14,8 @@ use nd_proto::{MonitorId, Result};
 
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_cursor;
 
 /// Description d'un moniteur physique attaché au bureau.
 ///
@@ -91,6 +93,55 @@ pub struct CursorState {
     pub visible: bool,
 }
 
+/// Forme (bitmap) du curseur système, capturée à la demande.
+///
+/// API autonome (plan 02 §curseur), indépendante du flux de frames : le viewer
+/// dessine un curseur fidèle à partir de [`CursorState`] (position, embarquée dans
+/// [`CapturedFrame`]) et de cette forme — sans réencoder la vidéo à chaque mouvement.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CursorShape {
+    pub width: u32,
+    pub height: u32,
+    /// Abscisse du point actif (pointe du curseur), relative au coin haut-gauche.
+    pub hotspot_x: i32,
+    /// Ordonnée du point actif, relative au coin haut-gauche.
+    pub hotspot_y: i32,
+    /// Pixels RGBA 8 bits, ligne 0 en haut — `width * height * 4` octets.
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for CursorShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // On n'imprime pas les octets — juste la taille du buffer.
+        f.debug_struct("CursorShape")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("hotspot_x", &self.hotspot_x)
+            .field("hotspot_y", &self.hotspot_y)
+            .field("rgba_len", &self.rgba.len())
+            .finish()
+    }
+}
+
+/// Capture la forme (bitmap RGBA) du curseur actuellement affiché.
+///
+/// Renvoie `Ok(None)` si aucun curseur n'est visible. Windows : approche GDI
+/// autonome, **sans duplication d'écran** (`GetCursorInfo` → `GetIconInfo` →
+/// `GetDIBits`), gérant les curseurs couleur (avec ou sans canal alpha) et
+/// monochromes (masques AND/XOR). Autres OS : à venir (Phases 4+, voir plan 16).
+pub fn capture_cursor_shape() -> Result<Option<CursorShape>> {
+    #[cfg(windows)]
+    {
+        win_cursor::capture_cursor_shape()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(nd_proto::NdError::NotImplemented(
+            "nd-capture::capture_cursor_shape (impl macOS/Linux à venir, voir plan 02/16)",
+        ))
+    }
+}
+
 /// Données image d'une frame.
 ///
 /// Le squelette expose la variante CPU (pixels lus en mémoire). La variante GPU
@@ -166,5 +217,30 @@ pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
         Err(nd_proto::NdError::NotImplemented(
             "nd-capture::create_capturer (impl macOS/Linux à venir, voir plan 02/16)",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `capture_cursor_shape` ne panique jamais et, quand une forme est renvoyée,
+    /// ses dimensions et la taille de son buffer RGBA (`w*h*4`) sont cohérentes.
+    #[test]
+    fn capture_forme_curseur_ne_panique_pas() {
+        match capture_cursor_shape() {
+            Ok(Some(shape)) => {
+                assert!(shape.width > 0 && shape.height > 0, "dimensions nulles");
+                assert_eq!(
+                    shape.rgba.len(),
+                    shape.width as usize * shape.height as usize * 4,
+                    "taille du buffer RGBA incohérente : {shape:?}"
+                );
+            }
+            // Aucun curseur affiché : acceptable (session sans souris).
+            Ok(None) => {}
+            // Hors Windows (NotImplemented) ou session sans bureau interactif : acceptable.
+            Err(_) => {}
+        }
     }
 }

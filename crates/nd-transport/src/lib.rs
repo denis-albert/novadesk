@@ -34,5 +34,6 @@ pub trait Transport: Send {
     fn path_estimate(&self) -> PathEstimate;
 }
 
+pub mod fec;
 mod quic;
 pub use quic::{bind, connect, Listener, QuicTransport};

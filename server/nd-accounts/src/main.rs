@@ -8,7 +8,10 @@
 //! 2FA TOTP (RFC 6238, module [`totp`]) : `enable_2fa(email)` génère et stocke
 //! le secret ; un compte protégé doit passer par `login_2fa(email, password,
 //! code)` — `login` seul renvoie alors `DeuxFacteursRequis`. Les licences et
-//! quotas de sessions vivent dans le module [`licensing`]. OAuth2/OIDC, JWT et
+//! quotas de sessions vivent dans le module [`licensing`] ; le journal d'audit
+//! (conformité, RGPD) et le registre des sessions actives dans le module
+//! [`audit`] — attacher un journal via [`AccountStore::with_audit`] consigne
+//! créations de compte, connexions et activations 2FA. OAuth2/OIDC, JWT et
 //! SSO viendront ensuite. Voir `../../plan-technique/11-backend-infrastructure.md`.
 //!
 //! Serveur TCP optionnel (std pur, un thread par connexion) au même format que
@@ -26,6 +29,7 @@ use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 
+pub mod audit;
 pub mod licensing;
 pub mod totp;
 
@@ -97,6 +101,8 @@ type EtatPartage = Arc<Mutex<Etat>>;
 pub struct AccountStore {
     etat: EtatPartage,
     argon: Argon2<'static>,
+    /// Journal d'audit optionnel (voir [`Self::with_audit`]).
+    audit: Option<audit::AuditLog>,
 }
 
 impl Default for AccountStore {
@@ -118,6 +124,24 @@ impl AccountStore {
         Self {
             etat: EtatPartage::default(),
             argon,
+            audit: None,
+        }
+    }
+
+    /// Attache un journal d'audit : créations de compte, connexions (réussies
+    /// ou refusées) et activations 2FA y sont consignées. Les signatures
+    /// existantes ne changent pas ; les clones du magasin partagent le journal.
+    #[must_use]
+    pub fn with_audit(mut self, journal: audit::AuditLog) -> Self {
+        self.audit = Some(journal);
+        self
+    }
+
+    /// Consigne un événement dans le journal d'audit, s'il y en a un.
+    /// À appeler **hors** du verrou d'état (le journal a son propre Mutex).
+    fn auditer(&self, evenement: audit::AuditEvent) {
+        if let Some(journal) = &self.audit {
+            journal.record(evenement);
         }
     }
 
@@ -142,6 +166,10 @@ impl AccountStore {
             return Err(AccountError::EmailDejaUtilise);
         }
         etat.comptes.insert(email.to_string(), phc);
+        drop(etat); // audit hors verrou
+        self.auditer(audit::AuditEvent::AccountCreated {
+            email: email.to_string(),
+        });
         Ok(())
     }
 
@@ -181,12 +209,34 @@ impl AccountStore {
     /// `DeuxFacteursRequis` si le compte a la 2FA activée (passer par
     /// [`Self::login_2fa`]).
     pub fn login(&self, email: &str, password: &str) -> Result<String, AccountError> {
-        self.verifier_identifiants(email, password)?;
-        // Un compte protégé par 2FA exige le second facteur.
+        self.verifier_identifiants_auditees(email, password)?;
+        // Un compte protégé par 2FA exige le second facteur : ce n'est pas un
+        // échec de connexion, rien n'est consigné.
         if self.etat.lock().unwrap().secrets_2fa.contains_key(email) {
             return Err(AccountError::DeuxFacteursRequis);
         }
-        Ok(self.ouvrir_session(email))
+        let jeton = self.ouvrir_session(email);
+        self.auditer(audit::AuditEvent::LoginSuccess {
+            email: email.to_string(),
+        });
+        Ok(jeton)
+    }
+
+    /// Comme [`Self::verifier_identifiants`], mais consigne un
+    /// `LoginFailure` si les identifiants sont invalides (pas pour une
+    /// erreur interne, qui ne dit rien sur la tentative).
+    fn verifier_identifiants_auditees(
+        &self,
+        email: &str,
+        password: &str,
+    ) -> Result<(), AccountError> {
+        let resultat = self.verifier_identifiants(email, password);
+        if resultat == Err(AccountError::IdentifiantsInvalides) {
+            self.auditer(audit::AuditEvent::LoginFailure {
+                email: email.to_string(),
+            });
+        }
+        resultat
     }
 
     /// Active la 2FA TOTP sur un compte : génère un secret de 20 octets, le
@@ -202,6 +252,10 @@ impl AccountStore {
         }
         let secret = totp::generate_totp_secret();
         etat.secrets_2fa.insert(email.to_string(), secret.clone());
+        drop(etat); // audit hors verrou
+        self.auditer(audit::AuditEvent::TwoFactorEnabled {
+            email: email.to_string(),
+        });
         Ok(secret)
     }
 
@@ -218,7 +272,7 @@ impl AccountStore {
         password: &str,
         code: &str,
     ) -> Result<String, AccountError> {
-        self.verifier_identifiants(email, password)?;
+        self.verifier_identifiants_auditees(email, password)?;
         let secret = self
             .etat
             .lock()
@@ -228,9 +282,17 @@ impl AccountStore {
             .cloned()
             .ok_or(AccountError::DeuxFacteursNonActives)?;
         if !totp::verify_totp(&secret, code, unix_maintenant()) {
+            // Second facteur incorrect : c'est un échec de connexion.
+            self.auditer(audit::AuditEvent::LoginFailure {
+                email: email.to_string(),
+            });
             return Err(AccountError::CodeTotpInvalide);
         }
-        Ok(self.ouvrir_session(email))
+        let jeton = self.ouvrir_session(email);
+        self.auditer(audit::AuditEvent::LoginSuccess {
+            email: email.to_string(),
+        });
+        Ok(jeton)
     }
 
     /// Résout un jeton de session en e-mail de compte (None si inconnu).
@@ -241,7 +303,7 @@ impl AccountStore {
 }
 
 /// Temps Unix courant en secondes (0 si l'horloge est antérieure à l'époque).
-fn unix_maintenant() -> u64 {
+pub(crate) fn unix_maintenant() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -626,6 +688,63 @@ mod tests {
         // même si l'horloge franchit un pas pendant le test).
         let code = totp::totp_at(&secret, unix_maintenant() + totp::PERIODE_S);
         assert!(store.login_2fa("jean@example.com", "mdp", &code).is_ok());
+    }
+
+    #[test]
+    fn audit_consigne_les_evenements_de_compte() {
+        let journal = audit::AuditLog::new();
+        let store = store_test().with_audit(journal.clone());
+
+        store.register("kim@example.com", "mdp").expect("register");
+        store.login("kim@example.com", "mdp").expect("login");
+        assert_eq!(
+            store.login("kim@example.com", "mauvais"),
+            Err(AccountError::IdentifiantsInvalides)
+        );
+        let secret = store.enable_2fa("kim@example.com").expect("enable_2fa");
+
+        // Compte 2FA : `login` seul demande le second facteur — ce n'est pas
+        // un échec, rien de plus n'est consigné.
+        assert_eq!(
+            store.login("kim@example.com", "mdp"),
+            Err(AccountError::DeuxFacteursRequis)
+        );
+
+        let code = totp::totp_at(&secret, unix_maintenant());
+        store
+            .login_2fa("kim@example.com", "mdp", &code)
+            .expect("login_2fa");
+
+        let evts = journal.for_account("kim@example.com");
+        assert_eq!(evts.len(), 5, "création, succès, échec, 2FA, succès 2FA");
+        assert!(matches!(
+            evts[0].event,
+            audit::AuditEvent::AccountCreated { .. }
+        ));
+        assert!(matches!(
+            evts[1].event,
+            audit::AuditEvent::LoginSuccess { .. }
+        ));
+        assert!(matches!(
+            evts[2].event,
+            audit::AuditEvent::LoginFailure { .. }
+        ));
+        assert!(matches!(
+            evts[3].event,
+            audit::AuditEvent::TwoFactorEnabled { .. }
+        ));
+        assert!(matches!(
+            evts[4].event,
+            audit::AuditEvent::LoginSuccess { .. }
+        ));
+        assert_eq!(journal.count(), 5);
+
+        // E-mail inconnu : l'échec est tout de même consigné (journal d'accès).
+        assert_eq!(
+            store.login("inconnu@example.com", "mdp"),
+            Err(AccountError::IdentifiantsInvalides)
+        );
+        assert_eq!(journal.for_account("inconnu@example.com").len(), 1);
     }
 
     #[test]

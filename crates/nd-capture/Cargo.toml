@@ -8,7 +8,7 @@ description = "Capture d'écran : trait ScreenCapturer et implémentations par O
 [dependencies]
 nd-proto = { workspace = true }
 
-# Implémentation Windows : DXGI Desktop Duplication via windows-rs.
+# Implémentation Windows : DXGI Desktop Duplication + forme du curseur (GDI) via windows-rs.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -16,8 +16,11 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
-    # Requis par DXGI_OUTPUT_DESC (HMONITOR) pour l'énumération des moniteurs.
+    # Requis par DXGI_OUTPUT_DESC (HMONITOR) pour l'énumération des moniteurs,
+    # et par la capture de la forme du curseur (GetDIBits/BITMAPINFO, voir win_cursor).
     "Win32_Graphics_Gdi",
+    # Requis par la capture de la forme du curseur (GetCursorInfo/GetIconInfo).
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [lints]

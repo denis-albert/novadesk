@@ -8,6 +8,8 @@ description = "Pont entre le cœur Rust et l'UI Flutter via flutter_rust_bridge 
 [dependencies]
 nd-proto = { workspace = true }
 nd-core = { workspace = true }
+# Nécessaire à la façade UI : `SessionConfig` embarque `nd_features::Permissions`.
+nd-features = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,6 +4,13 @@
 //! les événements de session) sera ajoutée ici. Voir
 //! `../../plan-technique/10-interface-client.md`. Pour l'instant, une API Rust simple
 //! et testable tient lieu de contrat.
+//!
+//! La façade orientée UI (types plats « DTO » + fonctions synchrones renvoyant
+//! `Result<_, String>`) vit dans le module [`api`], ré-exporté à la racine.
+
+pub mod api;
+
+pub use api::*;
 
 /// Version du moteur, exposée à l'UI (ex. écran « À propos »).
 #[must_use]

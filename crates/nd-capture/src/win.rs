@@ -33,8 +33,8 @@ use crate::{
     Rect, ScreenCapturer,
 };
 
-/// Convertit une erreur `windows` en `NdError::Capture`.
-fn cap(e: windows::core::Error) -> NdError {
+/// Convertit une erreur `windows` en `NdError::Capture` (partagé avec [`crate::win_cursor`]).
+pub(crate) fn cap(e: windows::core::Error) -> NdError {
     NdError::Capture(e.to_string())
 }
 

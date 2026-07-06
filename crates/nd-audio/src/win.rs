@@ -1,15 +1,19 @@
-//! Capture de l'audio **système** sous Windows par boucle de retour (loopback)
-//! WASAPI, encodée en Opus. Voir plan 08 §Windows.
+//! Capture audio WASAPI sous Windows : moteur commun de capture en mode
+//! partagé et capteur de l'audio **système** par boucle de retour (loopback).
+//! Voir plan 08 §Windows.
 //!
-//! Séquence : COM (MTA) → `IMMDeviceEnumerator` → périphérique de **rendu**
-//! par défaut → `IAudioClient` initialisé avec `AUDCLNT_STREAMFLAGS_LOOPBACK`
-//! → lecture PCM via `IAudioCaptureClient` → conversion 48 kHz stéréo `f32`
-//! ([`crate::convert`]) → trames Opus de 20 ms ([`crate::codec`]).
+//! Séquence : COM (MTA) → `IMMDeviceEnumerator` → point de terminaison par
+//! défaut (rendu pour le loopback, capture pour le micro) → `IAudioClient` en
+//! mode partagé (le loopback n'est qu'un indicateur de flux de plus :
+//! `AUDCLNT_STREAMFLAGS_LOOPBACK`) → lecture PCM via `IAudioCaptureClient` →
+//! conversion 48 kHz `f32` ([`crate::convert`]) → trames Opus de 20 ms
+//! ([`crate::codec`]).
 //!
 //! Ce module concentre le `unsafe` FFI de la capture audio Windows ; il est
 //! isolé derrière le trait [`AudioCapturer`] pour que le reste du moteur reste
-//! sûr. Les aides communes (init COM, lecture du format de mixage) sont
-//! partagées avec la restitution ([`crate::winplay`]).
+//! sûr. Le cœur commun ([`MoteurCapture`]) est partagé avec la capture micro
+//! ([`crate::winmic`]) ; les aides (init COM, lecture du format de mixage)
+//! le sont aussi avec la restitution ([`crate::winplay`]).
 //!
 //! Note honnête : en l'absence de tout flux de rendu actif, WASAPI ne délivre
 //! aucune donnée de loopback. Le capteur complète alors avec du silence pour
@@ -21,8 +25,8 @@ use std::time::{Duration, Instant};
 use nd_proto::{NdError, Result};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    eConsole, eRender, EDataFlow, ERole, IAudioCaptureClient, IAudioClient, IMMDevice,
+    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
 };
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
@@ -32,7 +36,9 @@ use windows::Win32::System::Com::{
 };
 
 use crate::codec::{EncodeurOpus, TRAME_MS};
-use crate::convert::{octets_vers_f32, vers_stereo, FormatEchantillon, Reechantillonneur};
+use crate::convert::{
+    depuis_stereo, octets_vers_f32, vers_stereo, FormatEchantillon, Reechantillonneur,
+};
 use crate::{AudioCapturer, AudioFormat, AudioPacket};
 
 /// Taille du tampon WASAPI demandé, en unités de 100 ns (ici 200 ms).
@@ -57,28 +63,6 @@ pub(crate) struct FormatMix {
     /// Octets par frame toutes voies confondues (`nBlockAlign`).
     pub(crate) octets_par_frame: usize,
 }
-
-/// Capteur de l'audio système Windows : loopback WASAPI + encodage Opus.
-pub struct WasapiLoopbackCapturer {
-    client: IAudioClient,
-    capture: IAudioCaptureClient,
-    mix: FormatMix,
-    reechantillonneur: Reechantillonneur,
-    encodeur: EncodeurOpus,
-    /// PCM 48 kHz stéréo entrelacé en attente d'encodage.
-    en_attente: Vec<f32>,
-    /// Échantillons (par canal) déjà émis — horloge média pour l'horodatage.
-    echantillons_emis: u64,
-    format: AudioFormat,
-}
-
-// SAFETY : les interfaces WASAPI (`IAudioClient`, `IAudioCaptureClient`) sont
-// documentées par Microsoft comme *free-threaded* (méthodes thread-safe, non
-// liées à un apartment) et sont créées ici après une initialisation COM en MTA.
-// `windows` 0.58 ne génère pas le marqueur `Send` pour ces interfaces alors
-// qu'il le fait pour D3D11 ; on l'affirme donc manuellement. Les autres champs
-// (encodeur Opus, tampons) sont `Send` par eux-mêmes.
-unsafe impl Send for WasapiLoopbackCapturer {}
 
 /// Initialise COM en MTA pour le thread courant.
 ///
@@ -152,20 +136,58 @@ pub(crate) unsafe fn lire_format_mix(ptr: *const WAVEFORMATEX) -> Result<FormatM
     })
 }
 
-impl WasapiLoopbackCapturer {
-    /// Ouvre le périphérique de rendu par défaut en mode loopback et démarre
-    /// le flux de capture (pipeline conversion → 48 kHz stéréo → Opus).
-    pub fn new() -> Result<Self> {
+/// Moteur commun de capture WASAPI en mode partagé : point de terminaison par
+/// défaut → PCM natif → 48 kHz `f32` → trames Opus de 20 ms horodatées.
+///
+/// Le loopback système ([`WasapiLoopbackCapturer`]) et le micro
+/// ([`crate::winmic::WasapiMicCapturer`]) n'en diffèrent que par la direction
+/// et le rôle du point de terminaison (`eRender`/`eCapture`), les indicateurs
+/// de flux (le loopback n'est qu'un indicateur de plus) et le profil de
+/// l'encodeur Opus fourni.
+pub(crate) struct MoteurCapture {
+    client: IAudioClient,
+    capture: IAudioCaptureClient,
+    mix: FormatMix,
+    reechantillonneur: Reechantillonneur,
+    encodeur: EncodeurOpus,
+    /// PCM 48 kHz **stéréo** entrelacé en attente d'encodage (le passage au
+    /// nombre de canaux du format cible se fait au moment d'encoder).
+    en_attente: Vec<f32>,
+    /// Échantillons (par canal) déjà émis — horloge média pour l'horodatage.
+    echantillons_emis: u64,
+    format: AudioFormat,
+}
+
+// SAFETY : les interfaces WASAPI (`IAudioClient`, `IAudioCaptureClient`) sont
+// documentées par Microsoft comme *free-threaded* (méthodes thread-safe, non
+// liées à un apartment) et sont créées ici après une initialisation COM en MTA.
+// `windows` 0.58 ne génère pas le marqueur `Send` pour ces interfaces alors
+// qu'il le fait pour D3D11 ; on l'affirme donc manuellement. Les autres champs
+// (encodeur Opus, tampons) sont `Send` par eux-mêmes.
+unsafe impl Send for MoteurCapture {}
+
+impl MoteurCapture {
+    /// Ouvre le point de terminaison audio par défaut (`direction`, `role`) en
+    /// mode partagé avec les `indicateurs` de flux donnés (0 pour le micro,
+    /// `AUDCLNT_STREAMFLAGS_LOOPBACK` pour le loopback) et démarre la capture.
+    ///
+    /// Le format de session (fréquence, canaux) est celui de `encodeur`.
+    pub(crate) fn ouvrir(
+        direction: EDataFlow,
+        role: ERole,
+        indicateurs: u32,
+        encodeur: EncodeurOpus,
+    ) -> Result<Self> {
         initialiser_com()?;
 
-        // Énumérateur de périphériques → périphérique de rendu par défaut.
+        // Énumérateur de périphériques → point de terminaison par défaut.
         // SAFETY : appels COM standards après initialisation ; les types de
         // sortie sont gérés par windows-rs.
         let enumerateur: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(wasapi)?;
-        // SAFETY : énumérateur valide ; on demande la sortie de rendu console.
+        // SAFETY : énumérateur valide ; direction et rôle contrôlés par l'appelant.
         let peripherique: IMMDevice =
-            unsafe { enumerateur.GetDefaultAudioEndpoint(eRender, eConsole) }.map_err(wasapi)?;
+            unsafe { enumerateur.GetDefaultAudioEndpoint(direction, role) }.map_err(wasapi)?;
         // SAFETY : activation COM de l'interface client audio sur le périphérique.
         let client: IAudioClient =
             unsafe { peripherique.Activate(CLSCTX_ALL, None) }.map_err(wasapi)?;
@@ -180,12 +202,12 @@ impl WasapiLoopbackCapturer {
         }
         // SAFETY : pointeur non nul renvoyé par GetMixFormat, structure valide.
         let mix = unsafe { lire_format_mix(ptr_format) };
-        // Initialisation en mode partagé + loopback sur le format de mixage.
+        // Initialisation en mode partagé sur le format de mixage.
         // SAFETY : `ptr_format` reste valide pendant l'appel ; tampon de 200 ms.
         let initialisation = unsafe {
             client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                indicateurs,
                 DUREE_TAMPON_HNS,
                 0,
                 ptr_format,
@@ -202,10 +224,10 @@ impl WasapiLoopbackCapturer {
         // SAFETY : démarre le flux ; arrêté dans Drop.
         unsafe { client.Start() }.map_err(wasapi)?;
 
-        let format = AudioFormat::default();
-        Ok(WasapiLoopbackCapturer {
+        let format = encodeur.format();
+        Ok(MoteurCapture {
             reechantillonneur: Reechantillonneur::new(mix.frequence, format.sample_rate),
-            encodeur: EncodeurOpus::new(format)?,
+            encodeur,
             en_attente: Vec::new(),
             echantillons_emis: 0,
             client,
@@ -213,6 +235,11 @@ impl WasapiLoopbackCapturer {
             mix,
             format,
         })
+    }
+
+    /// Format de session (celui des paquets produits, pas celui du mix).
+    pub(crate) fn format(&self) -> AudioFormat {
+        self.format
     }
 
     /// Draine les paquets WASAPI disponibles vers `en_attente` (48 kHz stéréo
@@ -260,46 +287,77 @@ impl WasapiLoopbackCapturer {
             unsafe { self.capture.ReleaseBuffer(frames) }.map_err(wasapi)?;
         }
     }
-}
 
-impl AudioCapturer for WasapiLoopbackCapturer {
-    fn format(&self) -> AudioFormat {
-        self.format
-    }
-
-    fn next_packet(&mut self) -> Result<AudioPacket> {
-        let valeurs_trame = self.encodeur.valeurs_par_trame();
+    /// Prochaine trame Opus de 20 ms (cœur commun des `next_packet`).
+    pub(crate) fn prochaine_trame(&mut self) -> Result<AudioPacket> {
+        // Frames (échantillons par canal) d'une trame ; le tampon d'attente
+        // est stéréo quel que soit le format de session.
+        let frames_trame = self.encodeur.valeurs_par_trame() / usize::from(self.format.channels);
+        let besoin_stereo = frames_trame * 2;
         let debut = Instant::now();
 
         // Accumule le PCM converti jusqu'à une trame complète de 20 ms.
-        while self.en_attente.len() < valeurs_trame {
+        while self.en_attente.len() < besoin_stereo {
             if !self.drainer_wasapi()? {
-                // Loopback muet quand rien n'est rendu : au-delà d'une durée
-                // de trame d'attente, on complète avec du silence pour garder
-                // une cadence régulière de paquets.
+                // Flux muet (loopback sans rendu actif, micro qui ne délivre
+                // rien) : au-delà d'une durée de trame d'attente, on complète
+                // avec du silence pour garder une cadence régulière de paquets.
                 if debut.elapsed() >= Duration::from_millis(u64::from(TRAME_MS)) {
-                    self.en_attente.resize(valeurs_trame, 0.0);
+                    self.en_attente.resize(besoin_stereo, 0.0);
                     break;
                 }
                 std::thread::sleep(PAUSE_SONDAGE);
             }
         }
 
-        let pcm: Vec<f32> = self.en_attente.drain(..valeurs_trame).collect();
+        let stereo: Vec<f32> = self.en_attente.drain(..besoin_stereo).collect();
+        // Stéréo → canaux du format de session (copie telle quelle en stéréo,
+        // moyenne gauche/droite en mono pour le micro).
+        let pcm = depuis_stereo(&stereo, usize::from(self.format.channels));
         let data = self.encodeur.encoder(&pcm)?;
 
         // Horloge média : position en échantillons convertie en microsecondes,
         // monotone et sans dérive vis-à-vis du flux (synchro A/V, plan 08).
         let timestamp_us = self.echantillons_emis * 1_000_000 / u64::from(self.format.sample_rate);
-        self.echantillons_emis += (valeurs_trame / usize::from(self.format.channels)) as u64;
+        self.echantillons_emis += frames_trame as u64;
 
         Ok(AudioPacket { data, timestamp_us })
     }
 }
 
-impl Drop for WasapiLoopbackCapturer {
+impl Drop for MoteurCapture {
     fn drop(&mut self) {
         // SAFETY : arrêt best-effort du flux ; un échec est sans conséquence.
         let _ = unsafe { self.client.Stop() };
+    }
+}
+
+/// Capteur de l'audio système Windows : loopback WASAPI + encodage Opus.
+pub struct WasapiLoopbackCapturer {
+    moteur: MoteurCapture,
+}
+
+impl WasapiLoopbackCapturer {
+    /// Ouvre le périphérique de rendu par défaut en mode loopback et démarre
+    /// le flux de capture (pipeline conversion → 48 kHz stéréo → Opus).
+    pub fn new() -> Result<Self> {
+        Ok(WasapiLoopbackCapturer {
+            moteur: MoteurCapture::ouvrir(
+                eRender,
+                eConsole,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                EncodeurOpus::new(AudioFormat::default())?,
+            )?,
+        })
+    }
+}
+
+impl AudioCapturer for WasapiLoopbackCapturer {
+    fn format(&self) -> AudioFormat {
+        self.moteur.format()
+    }
+
+    fn next_packet(&mut self) -> Result<AudioPacket> {
+        self.moteur.prochaine_trame()
     }
 }

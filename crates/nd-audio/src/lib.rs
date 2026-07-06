@@ -10,6 +10,8 @@ pub mod jitter;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
+mod winmic;
+#[cfg(windows)]
 mod winplay;
 
 #[cfg(not(windows))]
@@ -20,6 +22,8 @@ pub use codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus, TRAME_MS};
 pub use jitter::{JitterBuffer, SortieJitter, StatsJitter};
 #[cfg(windows)]
 pub use win::WasapiLoopbackCapturer;
+#[cfg(windows)]
+pub use winmic::WasapiMicCapturer;
 #[cfg(windows)]
 pub use winplay::WasapiPlayer;
 
@@ -74,6 +78,24 @@ pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
 pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
     Err(NdError::NotImplemented(
         "nd-audio::create_system_capturer (CoreAudio/PipeWire à venir, voir plan 08/16)",
+    ))
+}
+
+/// Crée un capteur du **microphone** (voix bidirectionnelle, plan 08).
+///
+/// Windows : capture WASAPI du périphérique de capture par défaut (rôle
+/// communications), convertie en 48 kHz mono et encodée en Opus profil voix
+/// (trames de 20 ms, ~28 kbps, DTX).
+#[cfg(windows)]
+pub fn create_microphone_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Ok(Box::new(winmic::WasapiMicCapturer::new()?))
+}
+
+/// Crée un capteur du microphone. Non implémenté sur cet OS.
+#[cfg(not(windows))]
+pub fn create_microphone_capturer() -> Result<Box<dyn AudioCapturer>> {
+    Err(NdError::NotImplemented(
+        "nd-audio::create_microphone_capturer (CoreAudio/PipeWire à venir, voir plan 08/16)",
     ))
 }
 

@@ -26,6 +26,9 @@ const PAQUET_MAX: usize = 4000;
 /// Durée maximale d'une trame Opus admise au décodage (millisecondes).
 const TRAME_DECODAGE_MAX_MS: usize = 120;
 
+/// Débit cible du profil voix (micro), en bits/s — plan 08 : ~24-32 kbps.
+const DEBIT_VOIX_BPS: c_int = 28_000;
+
 /// Nombre d'échantillons PCM **par canal** dans une trame de 20 ms.
 #[must_use]
 pub fn echantillons_par_trame(format: AudioFormat) -> usize {
@@ -76,17 +79,45 @@ unsafe impl Send for EncodeurOpus {}
 
 impl EncodeurOpus {
     /// Crée un encodeur pour le format donné (48 kHz recommandé, natif Opus).
+    ///
+    /// Profil « audio » générique, adapté au loopback système (musique, sons).
     pub fn new(format: AudioFormat) -> Result<Self> {
+        Self::creer(format, libopus_sys::OPUS_APPLICATION_AUDIO)
+    }
+
+    /// Crée un encodeur réglé pour la **voix** (micro, plan 08) : application
+    /// VoIP, signal voix, débit cible ~28 kbps et DTX activé (les trames de
+    /// silence deviennent quasi gratuites sur le réseau tout en restant des
+    /// paquets Opus valides côté décodeur).
+    pub fn new_voix(format: AudioFormat) -> Result<Self> {
+        let mut encodeur = Self::creer(format, libopus_sys::OPUS_APPLICATION_VOIP)?;
+        encodeur.regler(
+            libopus_sys::OPUS_SET_BITRATE_REQUEST,
+            DEBIT_VOIX_BPS,
+            "réglage du débit voix",
+        )?;
+        encodeur.regler(
+            libopus_sys::OPUS_SET_SIGNAL_REQUEST,
+            libopus_sys::OPUS_SIGNAL_VOICE as c_int,
+            "réglage du type de signal",
+        )?;
+        encodeur.regler(libopus_sys::OPUS_SET_DTX_REQUEST, 1, "activation du DTX")?;
+        Ok(encodeur)
+    }
+
+    /// Fabrique commune des deux profils ([`Self::new`], [`Self::new_voix`]).
+    fn creer(format: AudioFormat, application: u32) -> Result<Self> {
         let nb_canaux = canaux(format)?;
         let mut code: c_int = 0;
-        // SAFETY : paramètres validés (canaux 1-2, fréquence contrôlée par
-        // libopus qui signale toute valeur invalide via `code`) ; `code` est
-        // un pointeur de sortie valide le temps de l'appel.
+        // SAFETY : paramètres validés (canaux 1-2, application issue des
+        // constantes libopus, fréquence contrôlée par libopus qui signale
+        // toute valeur invalide via `code`) ; `code` est un pointeur de
+        // sortie valide le temps de l'appel.
         let etat = unsafe {
             libopus_sys::opus_encoder_create(
                 format.sample_rate as i32,
                 nb_canaux,
-                libopus_sys::OPUS_APPLICATION_AUDIO as c_int,
+                application as c_int,
                 &mut code,
             )
         };
@@ -98,6 +129,24 @@ impl EncodeurOpus {
             format,
             echantillons_trame: echantillons_par_trame(format),
         })
+    }
+
+    /// Applique un réglage entier (`OPUS_SET_*`) via `opus_encoder_ctl`.
+    fn regler(&mut self, requete: u32, valeur: c_int, contexte: &str) -> Result<()> {
+        // SAFETY : les requêtes OPUS_SET_* utilisées ici consomment exactement
+        // un `opus_int32` passé en variadique (`c_int` sur nos cibles) ;
+        // `etat` est valide (créé dans `creer`, détruit dans `Drop`).
+        let code = unsafe { libopus_sys::opus_encoder_ctl(self.etat, requete as c_int, valeur) };
+        if code != libopus_sys::OPUS_OK as c_int {
+            return Err(codec(contexte, code));
+        }
+        Ok(())
+    }
+
+    /// Format PCM d'entrée de l'encodeur.
+    #[must_use]
+    pub fn format(&self) -> AudioFormat {
+        self.format
     }
 
     /// Nombre de valeurs `f32` attendues par appel (échantillons × canaux).
@@ -239,6 +288,26 @@ mod tests {
         let decode = dec.decoder(&paquet).expect("décodage");
         // Une trame de 20 ms doit ressortir intacte en nombre d'échantillons.
         assert_eq!(decode.len(), pcm.len());
+    }
+
+    #[test]
+    fn profil_voix_mono_aller_retour() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let mut enc = EncodeurOpus::new_voix(format).expect("création encodeur voix");
+        let mut dec = DecodeurOpus::new(format).expect("création décodeur");
+
+        let pcm = trame_sinus(format);
+        let paquet = enc.encoder(&pcm).expect("encodage voix");
+        // Débit voix ~28 kbps → ~70 octets pour 20 ms ; marge large pour le VBR.
+        assert!(
+            !paquet.is_empty() && paquet.len() <= 200,
+            "paquet voix inattendu : {} octets",
+            paquet.len()
+        );
+        assert_eq!(dec.decoder(&paquet).expect("décodage").len(), pcm.len());
     }
 
     #[test]
