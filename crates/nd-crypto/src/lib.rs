@@ -7,6 +7,11 @@
 //! comparaison d'un SAS (short authentication string) dérivé des empreintes des clés
 //! publiques statiques. Modèle de menace et détails :
 //! `../../plan-technique/06-securite-chiffrement.md`.
+//!
+//! Pour l'accès non surveillé (reconnexion à une machine dont la clé publique est
+//! déjà épinglée, sans interaction), voir le motif IK dans le module [`ik`]. Pour la
+//! rotation des clés de session en cours de route (PFS continue), voir
+//! [`NoiseSession::rekey`].
 
 use nd_proto::{NdError, Result};
 use snow::params::{DHChoice, HashChoice, NoiseParams};
@@ -14,9 +19,11 @@ use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, TransportState};
 
 pub mod identity;
+pub mod ik;
 pub mod pinning;
 
 pub use identity::IdentityStore;
+pub use ik::{NoiseHandshakeIk, NOISE_PATTERN_IK};
 pub use pinning::{KnownPeers, PinResult};
 
 /// Motif Noise retenu pour la première connexion (plan 06) : XX échange les identités
@@ -236,6 +243,29 @@ pub struct NoiseSession {
     empreinte_distante: Option<PeerFingerprint>,
 }
 
+impl NoiseSession {
+    /// Fait tourner les clés symétriques de la session (rotation « rekey »,
+    /// confidentialité persistante continue — plan 06 §rotation de clés).
+    ///
+    /// Applique la fonction `REKEY` de la spécification Noise (§4.2) aux DEUX
+    /// directions (émission et réception, via `rekey_outgoing`/`rekey_incoming` de
+    /// `snow`) : chaque clé courante est remplacée par une dérivation à sens unique
+    /// d'elle-même et les compteurs de nonce repartent tels quels. La compromission
+    /// d'une clé APRÈS rotation ne permet donc pas de déchiffrer le trafic capturé
+    /// AVANT la rotation.
+    ///
+    /// COORDINATION OBLIGATOIRE (spécification Noise §11.3) : la rotation n'échange
+    /// aucun message sur le réseau, les deux pairs doivent donc appeler `rekey()` au
+    /// même point du flux — par exemple tous les N messages ou toutes les T minutes,
+    /// annoncé par un message applicatif dédié — après avoir déchiffré tout message
+    /// encore en transit. Un pair qui rekeye seul ne peut plus déchiffrer l'autre ni
+    /// être déchiffré par lui (voir les tests `rekey_*`).
+    pub fn rekey(&mut self) {
+        self.transport.rekey_outgoing();
+        self.transport.rekey_incoming();
+    }
+}
+
 impl SecureSession for NoiseSession {
     fn local_fingerprint(&self) -> PeerFingerprint {
         self.empreinte_locale
@@ -411,5 +441,88 @@ mod tests {
             NoiseHandshake::new(HandshakeRole::Initiator, &[0u8; 16]),
             Err(NdError::Crypto(_))
         ));
+    }
+
+    #[test]
+    fn rekey_coordonne_le_chiffrement_continue_dans_les_deux_sens() {
+        let (mut session_init, mut session_rep, _, _) = etablit_sessions();
+
+        // Trafic avant rotation, pour ancrer l'état des nonces.
+        let avant = session_init
+            .encrypt(b"avant rotation")
+            .expect("chiffrement");
+        assert_eq!(
+            session_rep.decrypt(&avant).expect("déchiffrement"),
+            b"avant rotation"
+        );
+
+        // Rotation COORDONNÉE : les deux pairs rekeyent au même point du flux.
+        session_init.rekey();
+        session_rep.rekey();
+
+        // Le chiffrement continue de fonctionner dans les deux sens.
+        let aller = session_init
+            .encrypt(b"apres rotation, aller")
+            .expect("chiffrement aller");
+        assert_eq!(
+            session_rep.decrypt(&aller).expect("déchiffrement aller"),
+            b"apres rotation, aller"
+        );
+        let retour = session_rep
+            .encrypt(b"apres rotation, retour")
+            .expect("chiffrement retour");
+        assert_eq!(
+            session_init.decrypt(&retour).expect("déchiffrement retour"),
+            b"apres rotation, retour"
+        );
+    }
+
+    #[test]
+    fn rekey_non_coordonne_casse_le_dechiffrement() {
+        let (mut session_init, mut session_rep, _, _) = etablit_sessions();
+
+        // Seul l'initiateur rekeye : le répondeur garde les anciennes clés.
+        session_init.rekey();
+
+        // Le répondeur ne peut plus déchiffrer ce que l'initiateur émet...
+        let chiffre = session_init.encrypt(b"perdu").expect("chiffrement");
+        assert!(matches!(
+            session_rep.decrypt(&chiffre),
+            Err(NdError::Crypto(_))
+        ));
+
+        // ... et réciproquement, l'initiateur ne déchiffre plus le répondeur.
+        let chiffre_retour = session_rep.encrypt(b"perdu aussi").expect("chiffrement");
+        assert!(matches!(
+            session_init.decrypt(&chiffre_retour),
+            Err(NdError::Crypto(_))
+        ));
+    }
+
+    #[test]
+    fn rekey_fonctionne_aussi_sur_une_session_ik() {
+        // La rotation est indépendante du motif de handshake : vérification rapide
+        // sur une session issue d'un handshake IK (accès non surveillé).
+        let cles_init = generate_static_keypair().expect("clés initiateur");
+        let cles_rep = generate_static_keypair().expect("clés répondeur");
+        let mut initiateur = NoiseHandshakeIk::new_initiator(&cles_init.private, &cles_rep.public)
+            .expect("initiateur IK");
+        let mut repondeur =
+            NoiseHandshakeIk::new_responder(&cles_rep.private).expect("répondeur IK");
+        let m1 = initiateur.write_message(&[]).expect("m1");
+        repondeur.read_message(&m1).expect("lecture m1");
+        let m2 = repondeur.write_message(&[]).expect("m2");
+        initiateur.read_message(&m2).expect("lecture m2");
+        let mut session_init = initiateur.into_session().expect("session initiateur");
+        let mut session_rep = repondeur.into_session().expect("session répondeur");
+
+        session_init.rekey();
+        session_rep.rekey();
+
+        let chiffre = session_init.encrypt(b"IK + rekey").expect("chiffrement");
+        assert_eq!(
+            session_rep.decrypt(&chiffre).expect("déchiffrement"),
+            b"IK + rekey"
+        );
     }
 }

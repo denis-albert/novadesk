@@ -5,10 +5,16 @@
 //! Règle transverse : les permissions sont **toujours appliquées côté machine
 //! contrôlée** (défense en profondeur), jamais seulement dans l'UI du contrôleur.
 
+pub mod annotation;
+pub mod invite;
+pub mod privacy;
 pub mod recording;
 pub mod tunnel;
 pub mod wol;
 
+pub use annotation::{AnnotationLayer, Stroke};
+pub use invite::{generate_invite, InviteStore, RedeemResult, SessionInvite};
+pub use privacy::{PrivacyAction, PrivacyState};
 pub use recording::{RecordedFrame, SessionReader, SessionRecorder};
 pub use tunnel::{pipe_bidirectional, LocalForwarder};
 pub use wol::{magic_packet, wake_on_lan};

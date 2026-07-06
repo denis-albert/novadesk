@@ -31,7 +31,7 @@ pub struct CodecCaps {
 }
 
 /// Configuration d'un encodeur.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
     pub kind: CodecKind,
     pub width: u32,
@@ -89,6 +89,13 @@ mod software;
 /// Backend plateforme Windows : H.264 via Media Foundation (MFT). Voir plan 03.
 #[cfg(windows)]
 mod mediafoundation;
+
+/// Négociation de codec entre pairs et échelle de débit adaptatif (ABR). Voir plan 03.
+mod negotiation;
+
+pub use negotiation::{
+    available_encoders, negotiate, BitrateLadder, ContentProfile, NetworkEstimate,
+};
 
 /// Crée l'encodeur pour le codec demandé.
 ///

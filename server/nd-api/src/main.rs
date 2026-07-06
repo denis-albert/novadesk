@@ -11,6 +11,16 @@
 //!
 //! Usage : `nd-api [adresse:port]` (défaut `0.0.0.0:9300`).
 
+// Équipes, rôles et partage d'appareils (plan 11) : logique en mémoire,
+// exercée par les tests ; le branchement sur le protocole TCP viendra dans un
+// jet ultérieur (d'où l'`allow(dead_code)` hors tests).
+#[cfg_attr(not(test), allow(dead_code))]
+mod groups;
+#[cfg_attr(not(test), allow(dead_code))]
+mod rbac;
+#[cfg_attr(not(test), allow(dead_code))]
+mod sharing;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
