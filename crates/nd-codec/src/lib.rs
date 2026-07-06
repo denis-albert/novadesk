@@ -93,6 +93,11 @@ mod mediafoundation;
 /// Négociation de codec entre pairs et échelle de débit adaptatif (ABR). Voir plan 03.
 mod negotiation;
 
+/// Mesure de qualité pour le banc de test (PSNR/MSE/SSIM, export Y4M). Voir plan 14.
+/// 100 % portable : aucune FFI, aucune dépendance plateforme.
+mod metrics;
+
+pub use metrics::{mse_rgba, psnr_luma, psnr_par_canal_rgba, psnr_rgba, ssim_luma, write_y4m};
 pub use negotiation::{
     available_encoders, negotiate, BitrateLadder, ContentProfile, NetworkEstimate,
 };

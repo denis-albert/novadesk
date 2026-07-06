@@ -6,16 +6,22 @@
 //! contrôlée** (défense en profondeur), jamais seulement dans l'UI du contrôleur.
 
 pub mod annotation;
+pub mod hotkeys;
 pub mod invite;
 pub mod privacy;
+pub mod reconnect;
 pub mod recording;
+pub mod settings;
 pub mod tunnel;
 pub mod wol;
 
 pub use annotation::{AnnotationLayer, Stroke};
+pub use hotkeys::{ActionCodec, HostAction, Hotkey, HotkeyMap};
 pub use invite::{generate_invite, InviteStore, RedeemResult, SessionInvite};
 pub use privacy::{PrivacyAction, PrivacyState};
+pub use reconnect::{ReconnectPolicy, ReconnectState};
 pub use recording::{RecordedFrame, SessionReader, SessionRecorder};
+pub use settings::{QualityParams, QualityPreset, SessionSettings};
 pub use tunnel::{pipe_bidirectional, LocalForwarder};
 pub use wol::{magic_packet, wake_on_lan};
 
