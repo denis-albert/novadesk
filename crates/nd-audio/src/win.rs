@@ -6,8 +6,10 @@
 //! → lecture PCM via `IAudioCaptureClient` → conversion 48 kHz stéréo `f32`
 //! ([`crate::convert`]) → trames Opus de 20 ms ([`crate::codec`]).
 //!
-//! Ce module concentre tout le `unsafe` FFI de l'audio Windows ; il est isolé
-//! derrière le trait [`AudioCapturer`] pour que le reste du moteur reste sûr.
+//! Ce module concentre le `unsafe` FFI de la capture audio Windows ; il est
+//! isolé derrière le trait [`AudioCapturer`] pour que le reste du moteur reste
+//! sûr. Les aides communes (init COM, lecture du format de mixage) sont
+//! partagées avec la restitution ([`crate::winplay`]).
 //!
 //! Note honnête : en l'absence de tout flux de rendu actif, WASAPI ne délivre
 //! aucune donnée de loopback. Le capteur complète alors avec du silence pour
@@ -34,26 +36,26 @@ use crate::convert::{octets_vers_f32, vers_stereo, FormatEchantillon, Reechantil
 use crate::{AudioCapturer, AudioFormat, AudioPacket};
 
 /// Taille du tampon WASAPI demandé, en unités de 100 ns (ici 200 ms).
-const DUREE_TAMPON_HNS: i64 = 200 * 10_000;
+pub(crate) const DUREE_TAMPON_HNS: i64 = 200 * 10_000;
 
 /// Pause entre deux sondages quand aucune donnée n'est disponible.
-const PAUSE_SONDAGE: Duration = Duration::from_millis(2);
+pub(crate) const PAUSE_SONDAGE: Duration = Duration::from_millis(2);
 
 /// Convertit une erreur `windows` en `NdError::Capture`.
-fn wasapi(e: windows::core::Error) -> NdError {
+pub(crate) fn wasapi(e: windows::core::Error) -> NdError {
     NdError::Capture(format!("wasapi : {e}"))
 }
 
-/// Format de mixage natif du moteur de rendu (côté source du pipeline).
-struct FormatMix {
+/// Format de mixage natif du moteur de rendu (partagé capture/restitution).
+pub(crate) struct FormatMix {
     /// Fréquence d'échantillonnage du mix (Hz).
-    frequence: u32,
+    pub(crate) frequence: u32,
     /// Nombre de voies entrelacées du mix.
-    canaux: u16,
+    pub(crate) canaux: u16,
     /// Format d'un échantillon.
-    echantillon: FormatEchantillon,
+    pub(crate) echantillon: FormatEchantillon,
     /// Octets par frame toutes voies confondues (`nBlockAlign`).
-    octets_par_frame: usize,
+    pub(crate) octets_par_frame: usize,
 }
 
 /// Capteur de l'audio système Windows : loopback WASAPI + encodage Opus.
@@ -84,7 +86,7 @@ unsafe impl Send for WasapiLoopbackCapturer {}
 /// déjà en STA) est toléré car COM reste utilisable. L'initialisation n'est
 /// volontairement jamais défaite : durée de vie applicative (même choix que
 /// les capteurs vidéo).
-fn initialiser_com() -> Result<()> {
+pub(crate) fn initialiser_com() -> Result<()> {
     // SAFETY : appel d'initialisation COM standard, paramètre réservé nul.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_ok() || hr == RPC_E_CHANGED_MODE {
@@ -102,7 +104,7 @@ fn initialiser_com() -> Result<()> {
 ///
 /// `ptr` doit pointer vers un `WAVEFORMATEX` valide, suivi de son extension
 /// (`WAVEFORMATEXTENSIBLE`) si `wFormatTag == WAVE_FORMAT_EXTENSIBLE`.
-unsafe fn lire_format_mix(ptr: *const WAVEFORMATEX) -> Result<FormatMix> {
+pub(crate) unsafe fn lire_format_mix(ptr: *const WAVEFORMATEX) -> Result<FormatMix> {
     // Copie locale : la structure est `packed`, on n'en garde aucune référence.
     let base = *ptr;
     let tag = u32::from(base.wFormatTag);

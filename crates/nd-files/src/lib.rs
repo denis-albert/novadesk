@@ -13,6 +13,10 @@ mod win;
 #[cfg(windows)]
 pub use win::WindowsClipboard;
 
+/// Protocole de transfert message par message (Start/Chunk/End) bâti sur le
+/// découpage en chunks ci-dessous. Voir la documentation du module.
+pub mod transfer;
+
 /// Entrée d'un listing de système de fichiers distant.
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {

@@ -13,6 +13,12 @@ use snow::params::{DHChoice, HashChoice, NoiseParams};
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, TransportState};
 
+pub mod identity;
+pub mod pinning;
+
+pub use identity::IdentityStore;
+pub use pinning::{KnownPeers, PinResult};
+
 /// Motif Noise retenu pour la première connexion (plan 06) : XX échange les identités
 /// statiques pendant le handshake, X25519 pour le Diffie-Hellman, ChaCha20-Poly1305
 /// pour l'AEAD et BLAKE2s pour le hachage.

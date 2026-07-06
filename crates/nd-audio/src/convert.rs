@@ -1,9 +1,12 @@
 //! Conversions PCM 100 % sûres : décodage des échantillons natifs vers `f32`,
 //! mixage vers stéréo et rééchantillonnage linéaire vers la fréquence cible
-//! (48 kHz pour Opus, voir plan 08).
+//! (48 kHz pour Opus, voir plan 08) — et le chemin inverse pour la
+//! restitution : stéréo → N voies ([`depuis_stereo`]) et `f32` → octets natifs
+//! ([`f32_vers_octets`]).
 //!
 //! Ce module est indépendant de l'OS : il est testé partout, y compris hors
-//! Windows, alors que la capture WASAPI elle-même est cantonnée à [`crate::win`].
+//! Windows, alors que la capture et la lecture WASAPI elles-mêmes sont
+//! cantonnées aux modules Windows.
 
 /// Format d'un échantillon PCM natif tel que fourni par le moteur audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +66,60 @@ pub fn vers_stereo(echantillons: &[f32], canaux: usize) -> Vec<f32> {
             .flat_map(|frame| [frame[0], frame[1]])
             .collect(),
     }
+}
+
+/// Déploie un flux **stéréo entrelacé** vers `canaux` voies entrelacées
+/// (chemin de restitution, inverse de [`vers_stereo`]).
+///
+/// Mono → moyenne gauche/droite ; plus de deux voies → gauche/droite sur les
+/// deux premières (ordre WAVE), silence sur les autres. Une frame stéréo
+/// incomplète en fin de bloc est ignorée.
+#[must_use]
+pub fn depuis_stereo(echantillons: &[f32], canaux: usize) -> Vec<f32> {
+    match canaux {
+        0 => Vec::new(),
+        1 => echantillons
+            .chunks_exact(2)
+            .map(|f| (f[0] + f[1]) * 0.5)
+            .collect(),
+        2 => echantillons.to_vec(),
+        n => {
+            let frames = echantillons.len() / 2;
+            let mut sortie = vec![0.0; frames * n];
+            for (i, f) in echantillons.chunks_exact(2).enumerate() {
+                sortie[i * n] = f[0];
+                sortie[i * n + 1] = f[1];
+            }
+            sortie
+        }
+    }
+}
+
+/// Encode des `f32` (attendus dans `[-1, 1]`, saturés sinon) vers des octets
+/// PCM petit-boutistes du format natif demandé (inverse de [`octets_vers_f32`]).
+#[must_use]
+pub fn f32_vers_octets(echantillons: &[f32], format: FormatEchantillon) -> Vec<u8> {
+    let mut octets = Vec::with_capacity(echantillons.len() * format.octets());
+    match format {
+        FormatEchantillon::F32 => {
+            for &v in echantillons {
+                octets.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        FormatEchantillon::I16 => {
+            for &v in echantillons {
+                let q = (f64::from(v.clamp(-1.0, 1.0)) * 32_767.0).round() as i16;
+                octets.extend_from_slice(&q.to_le_bytes());
+            }
+        }
+        FormatEchantillon::I32 => {
+            for &v in echantillons {
+                let q = (f64::from(v.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32;
+                octets.extend_from_slice(&q.to_le_bytes());
+            }
+        }
+    }
+    octets
 }
 
 /// Rééchantillonneur linéaire pour flux **stéréo entrelacé**, avec continuité
@@ -186,6 +243,58 @@ mod tests {
         // 5.1 tronqué : seules les deux premières voies sont conservées.
         let quad = [1.0, 2.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0];
         assert_eq!(vers_stereo(&quad, 4), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn deploiement_stereo_vers_mono_moyenne() {
+        let s = depuis_stereo(&[0.2, 0.4, -1.0, 1.0], 1);
+        assert_eq!(s.len(), 2);
+        assert!((s[0] - 0.3).abs() < 1e-6);
+        assert!(s[1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn deploiement_stereo_identite() {
+        let bloc = [0.1f32, -0.2, 0.3, -0.4];
+        assert_eq!(depuis_stereo(&bloc, 2), bloc.to_vec());
+    }
+
+    #[test]
+    fn deploiement_stereo_vers_six_voies() {
+        // 5.1 : gauche/droite sur les deux premières voies, silence ailleurs.
+        let s = depuis_stereo(&[0.1, 0.2, 0.3, 0.4], 6);
+        assert_eq!(
+            s,
+            vec![0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.3, 0.4, 0.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn encode_f32_aller_retour() {
+        let valeurs = [0.5f32, -0.25, 1.0, 0.0];
+        let octets = f32_vers_octets(&valeurs, FormatEchantillon::F32);
+        assert_eq!(octets_vers_f32(&octets, FormatEchantillon::F32), valeurs);
+    }
+
+    #[test]
+    fn encode_i16_extremes_et_saturation() {
+        // -1 → -32767, +1 → +32767, 0 → 0 ; hors gamme → saturé.
+        let octets = f32_vers_octets(&[-1.0, 1.0, 0.0, 2.0, -2.0], FormatEchantillon::I16);
+        let attendu: Vec<u8> = [-32_767i16, 32_767, 0, 32_767, -32_767]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(octets, attendu);
+    }
+
+    #[test]
+    fn encode_i32_aller_retour_approche() {
+        let valeurs = [0.5f32, -0.5, 0.0];
+        let octets = f32_vers_octets(&valeurs, FormatEchantillon::I32);
+        let relu = octets_vers_f32(&octets, FormatEchantillon::I32);
+        for (a, b) in valeurs.iter().zip(&relu) {
+            assert!((a - b).abs() < 1e-6, "aller-retour i32 : {a} vs {b}");
+        }
     }
 
     #[test]

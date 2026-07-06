@@ -6,16 +6,22 @@
 
 pub mod codec;
 pub mod convert;
+pub mod jitter;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod winplay;
 
 #[cfg(not(windows))]
 use nd_proto::NdError;
 use nd_proto::Result;
 
 pub use codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus, TRAME_MS};
+pub use jitter::{JitterBuffer, SortieJitter, StatsJitter};
 #[cfg(windows)]
 pub use win::WasapiLoopbackCapturer;
+#[cfg(windows)]
+pub use winplay::WasapiPlayer;
 
 /// Format audio PCM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,5 +74,23 @@ pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
 pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
     Err(NdError::NotImplemented(
         "nd-audio::create_system_capturer (CoreAudio/PipeWire à venir, voir plan 08/16)",
+    ))
+}
+
+/// Crée un lecteur audio système (restitution côté viewer).
+///
+/// Windows : rendu WASAPI en mode partagé sur le périphérique de sortie par
+/// défaut ; chaque paquet Opus est décodé puis converti au format de mixage.
+/// Le lissage réseau (gigue, ordre, trous) revient au [`JitterBuffer`] amont.
+#[cfg(windows)]
+pub fn create_system_player() -> Result<Box<dyn AudioPlayer>> {
+    Ok(Box::new(winplay::WasapiPlayer::new()?))
+}
+
+/// Crée un lecteur audio système. Non implémenté sur cet OS.
+#[cfg(not(windows))]
+pub fn create_system_player() -> Result<Box<dyn AudioPlayer>> {
+    Err(NdError::NotImplemented(
+        "nd-audio::create_system_player (CoreAudio/PipeWire à venir, voir plan 08/16)",
     ))
 }

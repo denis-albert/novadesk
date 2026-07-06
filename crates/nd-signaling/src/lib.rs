@@ -3,8 +3,9 @@
 //! Le serveur associe un ID à l'adresse (UDP/QUIC) et au certificat auto-signé du pair
 //! contrôlé ; un pair contrôleur résout l'ID puis établit la connexion QUIC directe
 //! (voir `nd-transport`). Ce premier jet fait de la **mise en relation directe**
-//! (loopback/LAN) ; le NAT traversal (STUN, hole punching) et le relais viendront
-//! ensuite. Voir `../../plan-technique/05-connectivite-nat.md`.
+//! (loopback/LAN) ; la découverte d'adresse publique est fournie par le module
+//! [`stun`] (client RFC 5389), le hole punching et le relais viendront ensuite.
+//! Voir `../../plan-technique/05-connectivite-nat.md`.
 //!
 //! Implémentation std pure (TCP bloquant, un thread par connexion). Le serveur de
 //! production sera asynchrone et à l'échelle (voir plan 11).
@@ -15,6 +16,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use nd_proto::{NdError, NovaId, Result};
+
+/// Client STUN (RFC 5389) : découverte de l'adresse réflexive publique.
+pub mod stun;
 
 /// Enregistrement d'un pair résolu par son ID.
 #[derive(Debug, Clone)]

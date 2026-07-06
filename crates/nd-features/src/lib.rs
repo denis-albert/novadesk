@@ -5,6 +5,14 @@
 //! Règle transverse : les permissions sont **toujours appliquées côté machine
 //! contrôlée** (défense en profondeur), jamais seulement dans l'UI du contrôleur.
 
+pub mod recording;
+pub mod tunnel;
+pub mod wol;
+
+pub use recording::{RecordedFrame, SessionReader, SessionRecorder};
+pub use tunnel::{pipe_bidirectional, LocalForwarder};
+pub use wol::{magic_packet, wake_on_lan};
+
 /// Permissions accordées à une session par le poste contrôlé.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Permissions {
