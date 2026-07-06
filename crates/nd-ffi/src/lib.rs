@@ -8,6 +8,12 @@
 //! La façade orientée UI (types plats « DTO » + fonctions synchrones renvoyant
 //! `Result<_, String>`) vit dans le module [`api`], ré-exporté à la racine.
 
+// Binding généré par `flutter_rust_bridge_codegen generate` (config dans
+// `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit
+// à la main ; ne pas éditer (régénéré à chaque `generate`).
+#[allow(unsafe_code)]
+mod frb_generated;
+
 pub mod api;
 
 pub use api::*;

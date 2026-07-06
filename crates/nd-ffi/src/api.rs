@@ -198,12 +198,20 @@ pub struct PermissionsDto {
 
 impl PermissionsDto {
     /// Contrôle complet (clavier, souris, presse-papiers, fichiers, audio).
+    ///
+    /// `frb(ignore)` : non exposé au binding — l'UI construit le DTO par champs,
+    /// et un constructeur `full()` bridgé n'apporte rien.
+    #[flutter_rust_bridge::frb(ignore)]
     #[must_use]
     pub fn full() -> Self {
         Permissions::full().into()
     }
 
     /// Observation seule : rien n'est injecté ni transféré.
+    ///
+    /// `frb(ignore)` **nécessaire** : sans cela FRB génère une méthode statique
+    /// `viewOnly()` qui entre en conflit avec le champ `view_only` (→ `viewOnly`).
+    #[flutter_rust_bridge::frb(ignore)]
     #[must_use]
     pub fn view_only() -> Self {
         Permissions::view_only().into()

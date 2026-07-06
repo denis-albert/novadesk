@@ -5,11 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Pont entre le cœur Rust et l'UI Flutter via flutter_rust_bridge (voir plan 10)."
 
+# `cdylib` : bibliothèque dynamique (nd_ffi.dll / .so / .dylib) chargée par
+# l'app Flutter via `RustLib.init()`. `lib` (rlib) : conserve nd-ffi utilisable
+# comme dépendance normale du workspace et pour ses tests.
+[lib]
+crate-type = ["cdylib", "lib"]
+
 [dependencies]
 nd-proto = { workspace = true }
 nd-core = { workspace = true }
 # Nécessaire à la façade UI : `SessionConfig` embarque `nd_features::Permissions`.
 nd-features = { workspace = true }
+# Pont Dart <-> Rust. Version alignée sur le paquet Dart `flutter_rust_bridge`
+# résolu dans ui/pubspec.lock (2.12.0) : codegen, crate runtime et paquet Dart
+# doivent partager la même version.
+flutter_rust_bridge = "=2.12.0"
 
 [lints]
 workspace = true
