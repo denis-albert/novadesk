@@ -10,6 +10,9 @@ nd-proto = { workspace = true }
 # Hachage de mots de passe Argon2id (format PHC). La feature `std` active
 # `rand_core/getrandom`, nécessaire à `OsRng` (sels et jetons aléatoires).
 argon2 = { version = "0.5", features = ["std"] }
+# 2FA TOTP (RFC 6238) : HMAC-SHA1 pur Rust, dépendances légères (src/totp.rs).
+hmac = "0.12"
+sha1 = "0.10"
 
 [lints]
 workspace = true

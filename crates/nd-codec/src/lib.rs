@@ -86,6 +86,10 @@ pub trait VideoDecoder: Send {
 /// Backend logiciel H.264 (openh264). Voir plan 03.
 mod software;
 
+/// Backend plateforme Windows : H.264 via Media Foundation (MFT). Voir plan 03.
+#[cfg(windows)]
+mod mediafoundation;
+
 /// Crée l'encodeur pour le codec demandé.
 ///
 /// H.264 : backend **logiciel** openh264 (le matériel — NVENC / Media Foundation —
@@ -97,6 +101,26 @@ pub fn create_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
             "nd-codec::create_encoder : seul H.264 (logiciel) est implémenté, voir plan 03/16",
         )),
     }
+}
+
+/// Crée l'encodeur **plateforme/matériel** pour le codec demandé (plan 03
+/// « matériel d'abord »).
+///
+/// Windows + H.264 → encodeur Media Foundation (MFT — voir `mediafoundation` pour
+/// le choix « MFT logiciel synchrone d'abord, MFT matériel asynchrone ensuite »).
+/// Autres plateformes ou codecs : `NdError::NotImplemented`. Ce chemin s'ajoute à
+/// [`create_encoder`] (repli logiciel openh264) sans le remplacer : l'appelant
+/// tente d'abord le matériel puis se replie (plan 03/16).
+pub fn create_hardware_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
+    #[cfg(windows)]
+    if kind == CodecKind::H264 {
+        return Ok(Box::new(mediafoundation::MediaFoundationEncoder::new()?));
+    }
+    #[cfg(not(windows))]
+    let _ = kind;
+    Err(NdError::NotImplemented(
+        "nd-codec::create_hardware_encoder : H.264 Media Foundation sur Windows uniquement (plan 03/16)",
+    ))
 }
 
 /// Crée le décodeur pour le codec demandé (H.264 logiciel openh264).

@@ -43,6 +43,12 @@ pub trait InputInjector: Send + Sync {
 #[cfg(windows)]
 mod win;
 
+// Expose l'implémentation Windows concrète : injection tactile (`touch_down`/`_move`/
+// `_up`) et séquence d'attention sécurisée (Ctrl+Alt+Suppr), non couvertes par le
+// trait multiplateforme. Voir plan 07 §entrées avancées.
+#[cfg(windows)]
+pub use win::{send_secure_attention_sequence, SendInputInjector};
+
 /// Crée l'injecteur adapté à la plateforme courante.
 ///
 /// Windows : `SendInput`. Autres OS : à venir (Phase 4+, voir plan 07/16).

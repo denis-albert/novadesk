@@ -8,12 +8,15 @@ description = "Injection d'entrées clavier/souris/tactile par OS (voir plan 07)
 [dependencies]
 nd-proto = { workspace = true }
 
-# Implémentation Windows : injection clavier/souris via SendInput (windows-rs).
+# Implémentation Windows : injection clavier/souris via SendInput (windows-rs),
+# séquence d'attention sécurisée (SendSAS) et injection tactile (InjectTouchInput).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Security_Authentication_Identity",
 ] }
 
 [lints]

@@ -12,5 +12,15 @@ nd-capture = { workspace = true }
 # Foundation) ajoutés ultérieurement derrière le même trait VideoEncoder.
 openh264 = "0.6"
 
+# Backend Windows Media Foundation (plan 03 « matériel d'abord ») : MFT H.264 via
+# IMFTransform (voir src/mediafoundation.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+] }
+
 [lints]
 workspace = true

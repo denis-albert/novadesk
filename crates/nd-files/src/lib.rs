@@ -3,13 +3,17 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use nd_proto::{NdError, Result};
 
 #[cfg(windows)]
 mod win;
+/// Formats « riches » du presse-papiers Windows : images (`CF_DIB`) et listes
+/// de fichiers (`CF_HDROP`). Séparé de `win` (texte) pour cloisonner le FFI.
+#[cfg(windows)]
+mod win_riche;
 #[cfg(windows)]
 pub use win::WindowsClipboard;
 
@@ -33,10 +37,46 @@ pub trait RemoteFs: Send {
     fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>>;
 }
 
+/// Image bitmap échangée via le presse-papiers : pixels RGBA 8 bits par canal,
+/// rangés ligne par ligne **du haut vers le bas** (orientation « top-down »),
+/// soit exactement `width * height * 4` octets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRgba {
+    /// Largeur en pixels (> 0).
+    pub width: u32,
+    /// Hauteur en pixels (> 0).
+    pub height: u32,
+    /// Pixels RGBA, 4 octets par pixel, lignes du haut vers le bas.
+    pub rgba: Vec<u8>,
+}
+
 /// Presse-papiers partagé entre les deux machines.
+///
+/// Le texte est le format de base ; les images et les listes de fichiers
+/// (plan 09 « presse-papiers riche ») ont des implémentations par défaut
+/// « non implémenté » afin que chaque plateforme ne redéfinisse que ce
+/// qu'elle sait faire.
 pub trait Clipboard: Send {
     fn get_text(&self) -> Result<Option<String>>;
     fn set_text(&self, text: &str) -> Result<()>;
+
+    /// Image du presse-papiers convertie en RGBA, ou `None` s'il n'en
+    /// contient pas. Sous Windows : format `CF_DIB` (24/32 bits).
+    fn get_image(&self) -> Result<Option<ImageRgba>> {
+        Err(NdError::NotImplemented("Clipboard::get_image"))
+    }
+
+    /// Place `image` dans le presse-papiers (remplace le contenu courant).
+    /// Sous Windows : DIB 32 bits (`CF_DIB`).
+    fn set_image(&self, _image: &ImageRgba) -> Result<()> {
+        Err(NdError::NotImplemented("Clipboard::set_image"))
+    }
+
+    /// Chemins des fichiers copiés (« Copier » dans l'explorateur) ; liste
+    /// vide si le presse-papiers n'en contient pas. Sous Windows : `CF_HDROP`.
+    fn get_files(&self) -> Result<Vec<PathBuf>> {
+        Err(NdError::NotImplemented("Clipboard::get_files"))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,44 @@ use nd_proto::{MonitorId, Result};
 #[cfg(windows)]
 mod win;
 
+/// Description d'un moniteur physique attaché au bureau.
+///
+/// Multi-écran (plan 13) : [`MonitorInfo::id`] est directement utilisable comme
+/// [`CaptureConfig::monitor`] — l'index est celui de la sortie DXGI de l'adaptateur
+/// par défaut, le même que celui employé par le capteur Windows (`MonitorId(0)` =
+/// sortie 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorInfo {
+    pub id: MonitorId,
+    /// Nom système de l'écran (ex. `\\.\DISPLAY1` sous Windows).
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Abscisse du coin haut-gauche dans le bureau virtuel (peut être négative).
+    pub x: i32,
+    /// Ordonnée du coin haut-gauche dans le bureau virtuel (peut être négative).
+    pub y: i32,
+    /// Vrai pour le moniteur principal (origine du bureau virtuel).
+    pub is_primary: bool,
+}
+
+/// Énumère les moniteurs attachés au bureau, dans l'ordre des sorties DXGI.
+///
+/// Windows : DXGI (`IDXGIFactory1` → adaptateur par défaut → `EnumOutputs`).
+/// Autres OS : à venir (Phases 4+, voir plan 16).
+pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>> {
+    #[cfg(windows)]
+    {
+        win::enumerate_monitors()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(nd_proto::NdError::NotImplemented(
+            "nd-capture::enumerate_monitors (impl macOS/Linux à venir, voir plan 02/16)",
+        ))
+    }
+}
+
 /// Rectangle en pixels dans l'espace du moniteur capturé.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {

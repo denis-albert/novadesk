@@ -3,8 +3,13 @@
 //! Opérations : `register(email, password)` (mot de passe haché **Argon2id**,
 //! format PHC) et `login(email, password)` → jeton de session opaque (32 octets
 //! aléatoires, encodés en hexadécimal). Aucune base de données : tout vit dans
-//! un `Arc<Mutex<...>>`. OAuth2/OIDC, JWT, 2FA et SSO viendront ensuite.
-//! Voir `../../plan-technique/11-backend-infrastructure.md`.
+//! un `Arc<Mutex<...>>`.
+//!
+//! 2FA TOTP (RFC 6238, module [`totp`]) : `enable_2fa(email)` génère et stocke
+//! le secret ; un compte protégé doit passer par `login_2fa(email, password,
+//! code)` — `login` seul renvoie alors `DeuxFacteursRequis`. Les licences et
+//! quotas de sessions vivent dans le module [`licensing`]. OAuth2/OIDC, JWT et
+//! SSO viendront ensuite. Voir `../../plan-technique/11-backend-infrastructure.md`.
 //!
 //! Serveur TCP optionnel (std pur, un thread par connexion) au même format que
 //! `nd-signaling` : trames à préfixe de longueur `u32` BE.
@@ -20,6 +25,9 @@ use std::sync::{Arc, Mutex};
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+
+pub mod licensing;
+pub mod totp;
 
 /// Adresse d'écoute par défaut (9000 = rendez-vous, 9100 = relais).
 const ADRESSE_DEFAUT: &str = "0.0.0.0:9200";
@@ -37,6 +45,14 @@ pub enum AccountError {
     IdentifiantsInvalides,
     /// E-mail ou mot de passe vide/malformé.
     EntreeInvalide,
+    /// Le compte a la 2FA activée : passer par `login_2fa` avec un code TOTP.
+    DeuxFacteursRequis,
+    /// La 2FA n'est pas activée sur ce compte (`login_2fa` inutile).
+    DeuxFacteursNonActives,
+    /// Code TOTP malformé, expiré ou incorrect.
+    CodeTotpInvalide,
+    /// Compte inconnu (activation 2FA sur un e-mail non enregistré).
+    CompteInconnu,
     /// Erreur interne (hachage, etc.).
     Interne(String),
 }
@@ -47,6 +63,12 @@ impl fmt::Display for AccountError {
             AccountError::EmailDejaUtilise => write!(f, "e-mail déjà utilisé"),
             AccountError::IdentifiantsInvalides => write!(f, "identifiants invalides"),
             AccountError::EntreeInvalide => write!(f, "e-mail ou mot de passe invalide"),
+            AccountError::DeuxFacteursRequis => write!(f, "code de vérification (2FA) requis"),
+            AccountError::DeuxFacteursNonActives => {
+                write!(f, "la 2FA n'est pas activée sur ce compte")
+            }
+            AccountError::CodeTotpInvalide => write!(f, "code de vérification invalide"),
+            AccountError::CompteInconnu => write!(f, "compte inconnu"),
             AccountError::Interne(msg) => write!(f, "erreur interne : {msg}"),
         }
     }
@@ -58,11 +80,13 @@ impl std::error::Error for AccountError {}
 // Logique métier
 // ---------------------------------------------------------------------------
 
-/// État interne : e-mail → hachage PHC, et jeton de session → e-mail.
+/// État interne : e-mail → hachage PHC, jeton de session → e-mail,
+/// et e-mail → secret TOTP pour les comptes ayant activé la 2FA.
 #[derive(Default)]
 struct Etat {
     comptes: HashMap<String, String>,
     sessions: HashMap<String, String>,
+    secrets_2fa: HashMap<String, Vec<u8>>,
 }
 
 /// État partagé entre threads de connexion.
@@ -121,12 +145,8 @@ impl AccountStore {
         Ok(())
     }
 
-    /// Vérifie les identifiants et renvoie un jeton de session opaque.
-    ///
-    /// # Errors
-    /// `IdentifiantsInvalides` si l'e-mail est inconnu ou le mot de passe faux
-    /// (indistincts pour ne pas révéler l'existence d'un compte).
-    pub fn login(&self, email: &str, password: &str) -> Result<String, AccountError> {
+    /// Vérifie e-mail + mot de passe (Argon2id) sans ouvrir de session.
+    fn verifier_identifiants(&self, email: &str, password: &str) -> Result<(), AccountError> {
         let phc = self
             .etat
             .lock()
@@ -139,14 +159,78 @@ impl AccountStore {
         let hachage = PasswordHash::new(&phc).map_err(|e| AccountError::Interne(e.to_string()))?;
         self.argon
             .verify_password(password.as_bytes(), &hachage)
-            .map_err(|_| AccountError::IdentifiantsInvalides)?;
+            .map_err(|_| AccountError::IdentifiantsInvalides)
+    }
+
+    /// Ouvre une session : jeton opaque associé au compte.
+    fn ouvrir_session(&self, email: &str) -> String {
         let jeton = jeton_aleatoire();
         self.etat
             .lock()
             .unwrap()
             .sessions
             .insert(jeton.clone(), email.to_string());
-        Ok(jeton)
+        jeton
+    }
+
+    /// Vérifie les identifiants et renvoie un jeton de session opaque.
+    ///
+    /// # Errors
+    /// `IdentifiantsInvalides` si l'e-mail est inconnu ou le mot de passe faux
+    /// (indistincts pour ne pas révéler l'existence d'un compte) ;
+    /// `DeuxFacteursRequis` si le compte a la 2FA activée (passer par
+    /// [`Self::login_2fa`]).
+    pub fn login(&self, email: &str, password: &str) -> Result<String, AccountError> {
+        self.verifier_identifiants(email, password)?;
+        // Un compte protégé par 2FA exige le second facteur.
+        if self.etat.lock().unwrap().secrets_2fa.contains_key(email) {
+            return Err(AccountError::DeuxFacteursRequis);
+        }
+        Ok(self.ouvrir_session(email))
+    }
+
+    /// Active la 2FA TOTP sur un compte : génère un secret de 20 octets, le
+    /// stocke et le renvoie (à présenter une seule fois à l'utilisateur, p. ex.
+    /// sous forme d'URI `otpauth://` en QR code). Réactiver régénère le secret.
+    ///
+    /// # Errors
+    /// `CompteInconnu` si l'e-mail n'est pas enregistré.
+    pub fn enable_2fa(&self, email: &str) -> Result<Vec<u8>, AccountError> {
+        let mut etat = self.etat.lock().unwrap();
+        if !etat.comptes.contains_key(email) {
+            return Err(AccountError::CompteInconnu);
+        }
+        let secret = totp::generate_totp_secret();
+        etat.secrets_2fa.insert(email.to_string(), secret.clone());
+        Ok(secret)
+    }
+
+    /// Connexion avec second facteur : mot de passe **puis** code TOTP
+    /// (fenêtre de ±1 pas de 30 s autour de l'heure système).
+    ///
+    /// # Errors
+    /// `IdentifiantsInvalides` (mot de passe, vérifié en premier),
+    /// `DeuxFacteursNonActives` si le compte n'a pas de 2FA,
+    /// `CodeTotpInvalide` si le code est malformé ou hors fenêtre.
+    pub fn login_2fa(
+        &self,
+        email: &str,
+        password: &str,
+        code: &str,
+    ) -> Result<String, AccountError> {
+        self.verifier_identifiants(email, password)?;
+        let secret = self
+            .etat
+            .lock()
+            .unwrap()
+            .secrets_2fa
+            .get(email)
+            .cloned()
+            .ok_or(AccountError::DeuxFacteursNonActives)?;
+        if !totp::verify_totp(&secret, code, unix_maintenant()) {
+            return Err(AccountError::CodeTotpInvalide);
+        }
+        Ok(self.ouvrir_session(email))
     }
 
     /// Résout un jeton de session en e-mail de compte (None si inconnu).
@@ -154,6 +238,14 @@ impl AccountStore {
     pub fn verify_token(&self, jeton: &str) -> Option<String> {
         self.etat.lock().unwrap().sessions.get(jeton).cloned()
     }
+}
+
+/// Temps Unix courant en secondes (0 si l'horloge est antérieure à l'époque).
+fn unix_maintenant() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Jeton opaque : 32 octets d'aléa système, encodés en hexadécimal.
@@ -441,6 +533,99 @@ mod tests {
         let j1 = store.login("fred@example.com", "mdp").expect("login 1");
         let j2 = store.login("fred@example.com", "mdp").expect("login 2");
         assert_ne!(j1, j2, "chaque session reçoit un jeton distinct");
+    }
+
+    #[test]
+    fn enable_2fa_compte_inconnu_refuse() {
+        let store = store_test();
+        assert_eq!(
+            store.enable_2fa("personne@example.com"),
+            Err(AccountError::CompteInconnu)
+        );
+    }
+
+    #[test]
+    fn deux_facteurs_actives_login_exige_le_code() {
+        let store = store_test();
+        store.register("gina@example.com", "mdp").expect("register");
+
+        // Avant activation : login simple OK.
+        assert!(store.login("gina@example.com", "mdp").is_ok());
+
+        let secret = store.enable_2fa("gina@example.com").expect("enable_2fa");
+        assert_eq!(secret.len(), 20, "secret TOTP de 20 octets");
+
+        // Après activation : `login` seul est refusé, le mot de passe reste
+        // vérifié en premier (erreur indistincte si faux).
+        assert_eq!(
+            store.login("gina@example.com", "mdp"),
+            Err(AccountError::DeuxFacteursRequis)
+        );
+        assert_eq!(
+            store.login("gina@example.com", "mauvais"),
+            Err(AccountError::IdentifiantsInvalides)
+        );
+
+        // Bon mot de passe + code du pas courant : session ouverte.
+        let code = totp::totp_at(&secret, unix_maintenant());
+        let jeton = store
+            .login_2fa("gina@example.com", "mdp", &code)
+            .expect("login_2fa");
+        assert_eq!(
+            store.verify_token(&jeton).as_deref(),
+            Some("gina@example.com")
+        );
+    }
+
+    #[test]
+    fn login_2fa_mauvais_code_refuse() {
+        let store = store_test();
+        store.register("hugo@example.com", "mdp").expect("register");
+        let secret = store.enable_2fa("hugo@example.com").expect("enable_2fa");
+
+        // Code garanti hors fenêtre : différent des codes des pas -2..=+2
+        // (l'horloge peut avancer d'un pas pendant le test). Au plus 5 codes
+        // valides : parmi dix candidats, l'un est forcément faux.
+        let maintenant = unix_maintenant();
+        let valides: Vec<String> = (-2i64..=2)
+            .map(|k| {
+                let t = maintenant.saturating_add_signed(k * totp::PERIODE_S as i64);
+                totp::totp_at(&secret, t)
+            })
+            .collect();
+        let faux = (0..10u32)
+            .map(|n| format!("{n:06}"))
+            .find(|c| !valides.contains(c))
+            .expect("au moins un candidat hors fenêtre");
+        assert_eq!(
+            store.login_2fa("hugo@example.com", "mdp", &faux),
+            Err(AccountError::CodeTotpInvalide)
+        );
+
+        // Mauvais mot de passe : refusé avant même le contrôle TOTP.
+        let code = totp::totp_at(&secret, maintenant);
+        assert_eq!(
+            store.login_2fa("hugo@example.com", "mauvais", &code),
+            Err(AccountError::IdentifiantsInvalides)
+        );
+
+        // Compte sans 2FA : `login_2fa` le signale explicitement.
+        store.register("iris@example.com", "mdp").expect("register");
+        assert_eq!(
+            store.login_2fa("iris@example.com", "mdp", "123456"),
+            Err(AccountError::DeuxFacteursNonActives)
+        );
+    }
+
+    #[test]
+    fn login_2fa_fenetre_de_tolerance_acceptee() {
+        let store = store_test();
+        store.register("jean@example.com", "mdp").expect("register");
+        let secret = store.enable_2fa("jean@example.com").expect("enable_2fa");
+        // Code du pas *suivant* : accepté grâce à la fenêtre ±1 (et robuste
+        // même si l'horloge franchit un pas pendant le test).
+        let code = totp::totp_at(&secret, unix_maintenant() + totp::PERIODE_S);
+        assert!(store.login_2fa("jean@example.com", "mdp", &code).is_ok());
     }
 
     #[test]
