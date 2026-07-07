@@ -6,9 +6,11 @@
 use std::time::{Duration, Instant};
 
 use nd_ffi::{
-    collect_video_frames, new_session_config, send_input, session_last_error, session_listen_info,
-    session_stats, start_session, stop_session, wait_session_state, InputEventDto, PermissionsDto,
-    SessionEndpointDto, SessionRoleDto, SessionStateDto, SessionStatsDto, VideoFrameDto,
+    approve_incoming, collect_video_frames, new_session_config, send_input, session_last_error,
+    session_listen_info, session_stats, start_session, start_session_with_options,
+    start_unattended_host, stop_session, stop_unattended_host, unattended_stats,
+    wait_session_state, InputEventDto, PermissionsDto, SessionEndpointDto, SessionOptionsDto,
+    SessionRoleDto, SessionStateDto, SessionStatsDto, VideoFrameDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -95,6 +97,137 @@ fn session_inconnue_erreurs_lisibles() {
     ] {
         assert!(erreur.contains("inconnue"), "message peu utile : {erreur}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Statistiques enrichies et endpoint par rendez-vous (lot §2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conversion_stats_champs_enrichis() {
+    let stats = nd_core::SessionStats {
+        fps: 30.0_f32,
+        rtt_us: 1_200,
+        bytes_in: 10,
+        bytes_out: 20,
+        frames_decoded: 100,
+        inputs_applied: 5,
+        inputs_denied: 3,
+        target_bitrate_kbps: 4_500,
+        abr_level: 2,
+        frames_recorded: 90,
+        reconnects: 1,
+    };
+    let dto = SessionStatsDto::from(stats);
+    assert_eq!(dto.inputs_denied, 3);
+    assert_eq!(dto.target_bitrate_kbps, 4_500);
+    assert_eq!(dto.abr_level, 2);
+    assert_eq!(dto.frames_recorded, 90);
+    assert_eq!(dto.reconnects, 1);
+    // Le backend d'encodage n'est pas porté par SessionStats : renseigné à part
+    // par la façade (depuis la poignée), il vaut None dans la conversion pure.
+    assert_eq!(dto.encoder_backend, None);
+}
+
+#[test]
+fn start_session_refuse_un_rendezvous_illisible() {
+    let config = new_session_config(
+        SessionRoleDto::Controller,
+        111_111_111,
+        Some(222_222_222),
+        PermissionsDto::full(),
+    )
+    .expect("configuration valide");
+    let erreur = start_session(
+        config,
+        SessionEndpointDto::ByRendezvous {
+            server: "pas-une-adresse".to_owned(),
+            stun_servers: vec![],
+            relay: None,
+        },
+    )
+    .unwrap_err();
+    assert!(erreur.contains("invalide"), "message peu utile : {erreur}");
+    assert!(
+        erreur.contains("rendez-vous"),
+        "message peu utile : {erreur}"
+    );
+}
+
+#[test]
+fn start_session_refuse_un_serveur_stun_illisible() {
+    let config = new_session_config(
+        SessionRoleDto::Controller,
+        111_111_111,
+        Some(222_222_222),
+        PermissionsDto::full(),
+    )
+    .expect("configuration valide");
+    // Serveur de rendez-vous valide mais STUN illisible : l'erreur situe le STUN.
+    let erreur = start_session(
+        config,
+        SessionEndpointDto::ByRendezvous {
+            server: "127.0.0.1:9000".to_owned(),
+            stun_servers: vec!["pas-stun".to_owned()],
+            relay: None,
+        },
+    )
+    .unwrap_err();
+    assert!(erreur.contains("STUN"), "message peu utile : {erreur}");
+}
+
+#[test]
+fn start_session_with_options_refuse_une_adresse_illisible() {
+    let config = new_session_config(
+        SessionRoleDto::Controlled,
+        111_111_111,
+        None,
+        PermissionsDto::full(),
+    )
+    .expect("configuration valide");
+    let options = SessionOptionsDto {
+        permissions: PermissionsDto::full(),
+        recording_path: None,
+        delta_mode: false,
+    };
+    let erreur = start_session_with_options(
+        config,
+        SessionEndpointDto::Direct {
+            addr: "pas-une-adresse".to_owned(),
+            cert_der: vec![1, 2, 3],
+        },
+        options,
+    )
+    .unwrap_err();
+    assert!(erreur.contains("invalide"), "message peu utile : {erreur}");
+}
+
+// ---------------------------------------------------------------------------
+// Hôte « accès non surveillé » : erreurs lisibles de la façade
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hote_non_surveille_erreurs_sur_identifiant_inconnu() {
+    let host_id = 987_654_321;
+    for erreur in [
+        unattended_stats(host_id).unwrap_err(),
+        approve_incoming(host_id, 42, true).unwrap_err(),
+        stop_unattended_host(host_id).unwrap_err(),
+    ] {
+        assert!(erreur.contains("inconnu"), "message peu utile : {erreur}");
+    }
+}
+
+#[test]
+fn start_unattended_host_refuse_un_rendezvous_illisible() {
+    let erreur = start_unattended_host(
+        424_242_424,
+        "pas-une-adresse".to_owned(),
+        vec![],
+        PermissionsDto::view_only(),
+    )
+    .unwrap_err();
+    assert!(erreur.contains("invalide"), "message peu utile : {erreur}");
 }
 
 // ---------------------------------------------------------------------------

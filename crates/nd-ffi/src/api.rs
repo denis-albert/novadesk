@@ -20,9 +20,11 @@
 //! * Les conversions vers/depuis les types internes (`nd_core`, `nd_proto`,
 //!   `nd_features`) vivent ici : l'UI ne manipule jamais les types internes.
 
+use std::path::PathBuf;
+
 use nd_codec::DecodedFrame;
-use nd_core::{SessionConfig, SessionRole, SessionState, SessionStats};
-use nd_features::Permissions;
+use nd_core::{SessionConfig, SessionOptions, SessionRole, SessionState, SessionStats};
+use nd_features::{PermissionSet, Permissions};
 use nd_proto::{InputEvent, NovaId};
 
 use crate::frb_generated::StreamSink;
@@ -321,6 +323,39 @@ impl From<SessionConfig> for SessionConfigDto {
     }
 }
 
+/// Options avancées de démarrage d'une session, sous forme plate (miroir
+/// simplifié de [`nd_core::SessionOptions`]).
+///
+/// Complète [`SessionConfigDto`] : ce dernier porte le rôle, les ID et les
+/// permissions historiques ; celui-ci affine le comportement côté **contrôlé**
+/// (filtre de permissions granulaire, enregistrement local, encodage delta). Les
+/// axes non exposés ici (profil ABR, politique de reconnexion) prennent les
+/// valeurs par défaut du moteur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOptionsDto {
+    /// Permissions granulaires appliquées avant chaque injection d'entrée
+    /// (contrôlé). Fait autorité sur les permissions de [`SessionConfigDto`].
+    pub permissions: PermissionsDto,
+    /// Chemin du MP4 à écrire pour l'enregistrement local (hôte) ; `None` =
+    /// pas d'enregistrement.
+    pub recording_path: Option<String>,
+    /// Encodage delta **opt-in** : à n'activer que si la capture renseigne
+    /// fidèlement les régions modifiées (voir [`nd_core::SessionOptions::delta_mode`]).
+    pub delta_mode: bool,
+}
+
+impl From<SessionOptionsDto> for SessionOptions {
+    fn from(dto: SessionOptionsDto) -> Self {
+        SessionOptions {
+            permissions: Some(PermissionSet::from(Permissions::from(dto.permissions))),
+            recording: dto.recording_path.map(PathBuf::from),
+            delta_mode: dto.delta_mode,
+            // Profil ABR et politique de reconnexion : défauts du moteur.
+            ..SessionOptions::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Événements d'entrée
 // ---------------------------------------------------------------------------
@@ -427,7 +462,11 @@ impl From<DecodedFrame> for VideoFrameDto {
 
 /// Instantané des statistiques d'une session (miroir plat de
 /// [`nd_core::SessionStats`], rafraîchies en continu par le moteur).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Les cinq premiers champs sont historiques (lot 03) ; les suivants exposent
+/// les statistiques enrichies du moteur (lot §2 : permissions, ABR,
+/// enregistrement, reconnexion) et le backend d'encodage réellement à l'œuvre.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionStatsDto {
     /// Images décodées par seconde, fenêtre glissante d'une seconde (contrôleur).
     pub fps: f64,
@@ -439,6 +478,19 @@ pub struct SessionStatsDto {
     pub bytes_out: u64,
     /// Frames décodées livrées depuis le début de la session (contrôleur).
     pub frames: u64,
+    /// Entrées reçues mais **refusées par les permissions** (contrôlé).
+    pub inputs_denied: u64,
+    /// Débit cible actuellement appliqué à l'encodeur par l'ABR (hôte), kbit/s.
+    pub target_bitrate_kbps: u32,
+    /// Palier ABR courant (hôte) : 0 = plein régime, croît en dégradant.
+    pub abr_level: u32,
+    /// Images écrites dans l'enregistrement local (hôte), toutes époques confondues.
+    pub frames_recorded: u64,
+    /// Reconnexions **réussies** depuis le début de la session.
+    pub reconnects: u32,
+    /// Nom du backend d'encodage réellement à l'œuvre côté hôte (NVENC, repli
+    /// logiciel…) ; `None` tant que l'encodeur n'est pas créé ou côté contrôleur.
+    pub encoder_backend: Option<String>,
 }
 
 impl From<SessionStats> for SessionStatsDto {
@@ -450,6 +502,14 @@ impl From<SessionStats> for SessionStatsDto {
             bytes_in: stats.bytes_in,
             bytes_out: stats.bytes_out,
             frames: stats.frames_decoded,
+            inputs_denied: stats.inputs_denied,
+            target_bitrate_kbps: stats.target_bitrate_kbps,
+            abr_level: stats.abr_level,
+            frames_recorded: stats.frames_recorded,
+            reconnects: stats.reconnects,
+            // Renseigné à part par la façade (voir `flux`), la poignée exposant
+            // le backend hors de `SessionStats`.
+            encoder_backend: None,
         }
     }
 }
@@ -457,9 +517,11 @@ impl From<SessionStats> for SessionStatsDto {
 /// Point de contact réseau d'une session (miroir plat de
 /// [`nd_core::SessionEndpoint`]).
 ///
-/// Couvre la mise en relation testable dès maintenant (loopback/LAN). La résolution
-/// par ID via le serveur de rendez-vous (STUN, hole punching, relais — lot 05)
-/// s'ajoutera ici comme nouvelle variante sans casser les existantes.
+/// Couvre la mise en relation directe testable dès maintenant (loopback/LAN) **et**
+/// la connexion par ID via le serveur de rendez-vous ([`SessionEndpointDto::ByRendezvous`] :
+/// STUN, hole punching, relais optionnel). Les adresses y sont fournies en texte
+/// (« ip:port ») et analysées par la façade, avec un message d'erreur français clair
+/// en cas de saisie invalide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEndpointDto {
     /// La session lie un écouteur QUIC local (`127.0.0.1`, port éphémère) et
@@ -473,6 +535,19 @@ pub enum SessionEndpointDto {
         addr: String,
         /// Certificat DER du pair, épinglé à la connexion.
         cert_der: Vec<u8>,
+    },
+    /// La session se met en relation **par ID** via un serveur de rendez-vous :
+    /// STUN → hole punching → QUIC sur la socket percée, avec repli relais
+    /// optionnel. C'est le seul point de contact **reconnectable**. Toutes les
+    /// adresses sont en texte (« ip:port »).
+    ByRendezvous {
+        /// Adresse du serveur de rendez-vous (`nd-signaling`), ex. « 203.0.113.7:9000 ».
+        server: String,
+        /// Serveurs STUN interrogés pour le candidat réflexif. Liste vide =
+        /// candidats locaux seulement (LAN/boucle locale).
+        stun_servers: Vec<String>,
+        /// Relais de repli (`nd-relay`) quand le punch échoue ; `None` = pas de repli.
+        relay: Option<String>,
     },
 }
 
@@ -504,6 +579,20 @@ pub fn start_session(
     endpoint: SessionEndpointDto,
 ) -> Result<u64, String> {
     crate::flux::demarrer_session(config, endpoint)
+}
+
+/// Démarre une session comme [`start_session`], mais avec des options avancées
+/// ([`SessionOptionsDto`] : permissions granulaires, enregistrement local,
+/// encodage delta).
+///
+/// [`start_session`] équivaut à cet appel avec les options par défaut du moteur.
+/// L'identifiant renvoyé s'utilise avec les mêmes fonctions `session_*`.
+pub fn start_session_with_options(
+    config: SessionConfigDto,
+    endpoint: SessionEndpointDto,
+    options: SessionOptionsDto,
+) -> Result<u64, String> {
+    crate::flux::demarrer_session_avec_options(config, endpoint, options)
 }
 
 /// Adresse et certificat d'écoute d'une session démarrée en
@@ -577,4 +666,84 @@ pub fn send_input(id: u64, event: InputEventDto) -> Result<(), String> {
 /// puis attend la fin de ses threads (au plus ~5 s). L'identifiant devient invalide.
 pub fn stop_session(id: u64) -> Result<(), String> {
     crate::flux::arreter_session(id)
+}
+
+// ---------------------------------------------------------------------------
+// Hôte « accès non surveillé » : DTO
+// ---------------------------------------------------------------------------
+
+/// Demande d'accès entrante vers un hôte « accès non surveillé », poussée par
+/// [`unattended_incoming_stream`] pour chaque appelant à approuver.
+///
+/// L'UI présente la demande (dialogue d'acceptation) puis tranche via
+/// [`approve_incoming`] avec le même `peer_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingRequestDto {
+    /// ID NovaDesk brut de l'appelant (à repasser à [`approve_incoming`]).
+    pub peer_id: u64,
+    /// ID de l'appelant au format groupé (« 123 456 789 »), prêt à afficher.
+    pub peer_id_formate: String,
+}
+
+// ---------------------------------------------------------------------------
+// Hôte « accès non surveillé » : cycle de vie et approbation
+// ---------------------------------------------------------------------------
+
+/// Démarre un hôte « accès non surveillé » ([`nd_core::UnattendedHost`]) : publie
+/// `local_id` au serveur de `rendezvous` (adresse « ip:port »), génère une
+/// identité TLS et attend les appelants en continu. Renvoie un **identifiant
+/// opaque** d'hôte (distinct des identifiants de session).
+///
+/// Chaque appelant est soumis à **approbation pilotée par le Dart** : l'`accept`
+/// du moteur bloque jusqu'à ce que l'UI réponde via [`approve_incoming`], borné
+/// par un délai au-delà duquel l'appelant est **refusé par défaut** (jamais de
+/// blocage indéfini). Abonnez-vous à [`unattended_incoming_stream`] pour recevoir
+/// les demandes.
+///
+/// `stun_servers` (adresses « ip:port », liste éventuellement vide) alimente les
+/// candidats de hole punching. `permissions` s'applique aux entrées reçues
+/// (filtre côté contrôlé).
+pub fn start_unattended_host(
+    local_id: u64,
+    rendezvous: String,
+    stun_servers: Vec<String>,
+    permissions: PermissionsDto,
+) -> Result<u64, String> {
+    crate::flux::demarrer_hote_non_surveille(local_id, rendezvous, stun_servers, permissions)
+}
+
+/// Pousse chaque demande d'accès entrante de l'hôte `host_id` dans `sink`
+/// ([`IncomingRequestDto`]).
+///
+/// À brancher juste après [`start_unattended_host`] : une demande arrivée sans
+/// abonné n'est pas livrée et expirera (refus par défaut). Un seul abonnement à
+/// la fois (le dernier `sink` remplace le précédent).
+pub fn unattended_incoming_stream(
+    host_id: u64,
+    sink: StreamSink<IncomingRequestDto>,
+) -> Result<(), String> {
+    crate::flux::flux_demandes_entrantes(host_id, sink)
+}
+
+/// Tranche une demande d'accès entrante de l'hôte `host_id` : `accepter = true`
+/// débloque et sert la session, `false` la refuse.
+///
+/// `peer_id` est celui de la [`IncomingRequestDto`] reçue. Erreur si aucune
+/// demande n'attend pour ce pair (déjà tranchée, expirée, ou jamais reçue).
+pub fn approve_incoming(host_id: u64, peer_id: u64, accepter: bool) -> Result<(), String> {
+    crate::flux::approuver_entrant(host_id, peer_id, accepter)
+}
+
+/// Instantané des statistiques cumulées des sessions servies par l'hôte `host_id`
+/// (entrées appliquées/refusées, débit ABR, octets…). `encoder_backend` reste
+/// `None` : la poignée de l'hôte non surveillé ne l'expose pas.
+pub fn unattended_stats(host_id: u64) -> Result<SessionStatsDto, String> {
+    crate::flux::statistiques_hote(host_id)
+}
+
+/// Arrête l'hôte `host_id` et le retire de la table : réveille toute approbation
+/// en attente (refus), lève le signal d'arrêt puis attend la fin du thread de
+/// service (au plus ~5 s). L'identifiant devient invalide.
+pub fn stop_unattended_host(host_id: u64) -> Result<(), String> {
+    crate::flux::arreter_hote_non_surveille(host_id)
 }

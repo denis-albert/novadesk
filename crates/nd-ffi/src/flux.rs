@@ -23,17 +23,22 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nd_codec::DecodedFrame;
-use nd_core::{SessionEndpoint, SessionEngine, SessionHandle, SessionState};
-use nd_proto::InputEvent;
+use nd_core::{
+    SessionEndpoint, SessionEngine, SessionHandle, SessionOptions, SessionState, UnattendedHost,
+    UnattendedHostHandle,
+};
+use nd_features::{PermissionSet, Permissions};
+use nd_proto::{InputEvent, NovaId};
+use nd_transport::ServerIdentity;
 
 use crate::api::{
-    ListenInfoDto, SessionConfigDto, SessionEndpointDto, SessionStateDto, SessionStatsDto,
-    VideoFrameDto,
+    IncomingRequestDto, ListenInfoDto, PermissionsDto, SessionConfigDto, SessionEndpointDto,
+    SessionOptionsDto, SessionStateDto, SessionStatsDto, VideoFrameDto,
 };
 use crate::frb_generated::{SseEncode, StreamSink};
 
@@ -95,14 +100,34 @@ fn duree_bornee(timeout_ms: u64) -> Duration {
 // Cycle de vie
 // ---------------------------------------------------------------------------
 
-/// Démarre le moteur de session et enregistre la poignée dans la table.
-/// Renvoie l'identifiant opaque attribué.
+/// Démarre le moteur de session avec les options par défaut. Renvoie
+/// l'identifiant opaque attribué.
 pub(crate) fn demarrer_session(
     config: SessionConfigDto,
     endpoint: SessionEndpointDto,
 ) -> Result<u64, String> {
+    demarrer_session_interne(config, endpoint, SessionOptions::default())
+}
+
+/// Démarre le moteur de session avec des options avancées (miroir plat traduit
+/// en [`SessionOptions`]). Renvoie l'identifiant opaque attribué.
+pub(crate) fn demarrer_session_avec_options(
+    config: SessionConfigDto,
+    endpoint: SessionEndpointDto,
+    options: SessionOptionsDto,
+) -> Result<u64, String> {
+    demarrer_session_interne(config, endpoint, options.into())
+}
+
+/// Cœur commun : prépare l'endpoint, démarre le moteur avec `options` et
+/// enregistre la poignée dans la table.
+fn demarrer_session_interne(
+    config: SessionConfigDto,
+    endpoint: SessionEndpointDto,
+    options: SessionOptions,
+) -> Result<u64, String> {
     let (endpoint_moteur, ecoute) = preparer_endpoint(endpoint)?;
-    let mut poignee = SessionEngine::start(config.into(), endpoint_moteur)
+    let mut poignee = SessionEngine::start_with_options(config.into(), endpoint_moteur, options)
         .map_err(|e| format!("démarrage de la session impossible : {e}"))?;
 
     // Extrait les récepteurs de la poignée en les échangeant contre des canaux
@@ -143,9 +168,7 @@ fn preparer_endpoint(
             Ok((SessionEndpoint::Loopback { listener: ecouteur }, Some(info)))
         }
         SessionEndpointDto::Direct { addr, cert_der } => {
-            let adresse: SocketAddr = addr
-                .parse()
-                .map_err(|e| format!("adresse « {addr} » invalide : {e}"))?;
+            let adresse = parser_adresse("du pair", &addr)?;
             Ok((
                 SessionEndpoint::Direct {
                     addr: adresse,
@@ -154,7 +177,53 @@ fn preparer_endpoint(
                 None,
             ))
         }
+        SessionEndpointDto::ByRendezvous {
+            server,
+            stun_servers,
+            relay,
+        } => {
+            let serveur = parser_adresse("du serveur de rendez-vous", &server)?;
+            let stun = parser_adresses_stun(&stun_servers)?;
+            let relais = match relay {
+                Some(r) => Some(parser_adresse("du relais", &r)?),
+                None => None,
+            };
+            Ok((
+                SessionEndpoint::ByRendezvous {
+                    server: serveur,
+                    stun_servers: stun,
+                    relay: relais,
+                },
+                None,
+            ))
+        }
     }
+}
+
+/// Analyse une adresse « ip:port » avec un message d'erreur français explicite.
+/// `quoi` qualifie l'adresse dans le message (ex. « du serveur de rendez-vous »).
+fn parser_adresse(quoi: &str, texte: &str) -> Result<SocketAddr, String> {
+    texte
+        .trim()
+        .parse()
+        .map_err(|e| format!("adresse {quoi} « {texte} » invalide (attendu « ip:port ») : {e}"))
+}
+
+/// Analyse une liste de serveurs STUN (« ip:port ») ; le message d'erreur situe
+/// l'entrée fautive par son rang.
+fn parser_adresses_stun(entrees: &[String]) -> Result<Vec<SocketAddr>, String> {
+    entrees
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.trim().parse::<SocketAddr>().map_err(|e| {
+                format!(
+                    "serveur STUN n°{} « {s} » invalide (attendu « ip:port ») : {e}",
+                    i + 1
+                )
+            })
+        })
+        .collect()
 }
 
 /// Coordonnées d'écoute d'une session hôte `Loopback` (erreur sinon).
@@ -177,9 +246,15 @@ pub(crate) fn arreter_session(id: u64) -> Result<(), String> {
 // Statistiques et entrées
 // ---------------------------------------------------------------------------
 
-/// Instantané des statistiques du moteur, converti en DTO plat.
+/// Instantané des statistiques du moteur, converti en DTO plat. Le backend
+/// d'encodage, exposé hors de [`nd_core::SessionStats`], est renseigné ici depuis
+/// la poignée.
 pub(crate) fn statistiques(id: u64) -> Result<SessionStatsDto, String> {
-    avec_entree(id, |entree| entree.poignee.stats().into())
+    avec_entree(id, |entree| {
+        let mut dto = SessionStatsDto::from(entree.poignee.stats());
+        dto.encoder_backend = entree.poignee.encoder_backend();
+        dto
+    })
 }
 
 /// Dernière erreur d'exécution du moteur (voir [`SessionHandle::last_error`]).
@@ -308,5 +383,430 @@ pub(crate) fn collecter_frames(
 fn restituer(id: u64, rendre: impl FnOnce(&mut EntreeSession)) {
     if let Some(entree) = verrou().get_mut(&id) {
         rendre(entree);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hôtes « accès non surveillé » : table dédiée + file d'approbation
+// ---------------------------------------------------------------------------
+//
+// # Design de l'approbation entrante (bloquant + garde-fous)
+//
+// Le hook `accept` du moteur ([`nd_core::UnattendedHost`]) est **synchrone** : il
+// est consulté sur le thread de service, une connexion à la fois, avant tout octet
+// applicatif. On implémente donc une **file d'approbation bloquante** pilotée par
+// le Dart :
+//
+// * `accept(pair)` enregistre l'attente, pousse une [`IncomingRequestDto`] vers le
+//   Dart (best-effort via le sink), puis **bloque** sur une [`Condvar`] ;
+// * [`approuver_entrant`] (appel du Dart) dépose la décision et réveille l'attente ;
+// * garde-fous **anti-deadlock** : l'attente est bornée par [`DELAI_APPROBATION`]
+//   (au-delà = **refus par défaut**) et réveillée immédiatement par l'arrêt de
+//   l'hôte (`demander_arret`). Sans abonné au flux, la demande n'est pas livrée et
+//   expire donc en refus — jamais de blocage indéfini.
+
+/// Délai maximal d'attente d'une décision d'approbation entrante. Au-delà,
+/// l'appelant est refusé par défaut : borne l'`accept` bloquant du moteur.
+const DELAI_APPROBATION: Duration = Duration::from_secs(30);
+
+/// État partagé de la file d'approbation, protégé par un unique [`Mutex`].
+struct EtatApprobation {
+    /// Décision par ID de pair : `None` = en attente, `Some(bool)` = tranchée.
+    decisions: HashMap<u64, Option<bool>>,
+    /// Arrêt demandé : réveille et refuse toute attente en cours.
+    arret: bool,
+}
+
+/// File d'approbation d'un hôte : le hook `accept` du moteur y bloque, le Dart y
+/// répond. Partagée (`Arc`) entre le thread de service et la façade.
+struct ApprobationHote {
+    etat: Mutex<EtatApprobation>,
+    /// Réveille l'`accept` en attente dès qu'une décision ou l'arrêt arrive.
+    signal: Condvar,
+    /// Sink des demandes entrantes vers le Dart (`None` tant que non abonné).
+    sink: Mutex<Option<StreamSink<IncomingRequestDto>>>,
+}
+
+impl ApprobationHote {
+    fn new() -> Self {
+        ApprobationHote {
+            etat: Mutex::new(EtatApprobation {
+                decisions: HashMap::new(),
+                arret: false,
+            }),
+            signal: Condvar::new(),
+            sink: Mutex::new(None),
+        }
+    }
+
+    /// Hook `accept` du moteur : notifie le Dart puis bloque jusqu'à la décision,
+    /// l'arrêt, ou l'expiration ([`DELAI_APPROBATION`], défaut = refus).
+    fn attendre_approbation(&self, pair: NovaId) -> bool {
+        self.attendre_approbation_avec_delai(pair, DELAI_APPROBATION)
+    }
+
+    /// Cœur de l'attente d'approbation, le délai d'expiration étant paramétré
+    /// (les tests l'abrègent pour exercer le refus par défaut sans attendre).
+    fn attendre_approbation_avec_delai(&self, pair: NovaId, delai: Duration) -> bool {
+        let peer = pair.as_u64();
+        // 1. Enregistre l'attente AVANT de notifier : évite la course où une
+        //    réponse du Dart arriverait avant l'enregistrement de la demande.
+        {
+            let mut etat = self.etat.lock().unwrap_or_else(PoisonError::into_inner);
+            if etat.arret {
+                return false;
+            }
+            etat.decisions.insert(peer, None);
+        }
+        // 2. Notifie le Dart (best-effort : sans abonné, la demande expirera).
+        if let Some(sink) = self
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = sink.add(IncomingRequestDto {
+                peer_id: peer,
+                peer_id_formate: pair.to_string(),
+            });
+        }
+        // 3. Bloque jusqu'à décision / arrêt / expiration.
+        let echeance = Instant::now() + delai;
+        let mut etat = self.etat.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if etat.arret {
+                etat.decisions.remove(&peer);
+                return false;
+            }
+            if let Some(Some(decision)) = etat.decisions.get(&peer).copied() {
+                etat.decisions.remove(&peer);
+                return decision;
+            }
+            let restant = echeance.saturating_duration_since(Instant::now());
+            if restant.is_zero() {
+                etat.decisions.remove(&peer);
+                return false;
+            }
+            let (garde, _delai) = self
+                .signal
+                .wait_timeout(etat, restant)
+                .unwrap_or_else(PoisonError::into_inner);
+            etat = garde;
+        }
+    }
+
+    /// Tranche une demande en attente (appel du Dart). Erreur si aucune demande
+    /// n'attend pour ce pair (déjà tranchée, expirée, ou jamais reçue).
+    fn approuver(&self, peer: u64, accepter: bool) -> Result<(), String> {
+        {
+            let mut etat = self.etat.lock().unwrap_or_else(PoisonError::into_inner);
+            match etat.decisions.get_mut(&peer) {
+                Some(slot) => *slot = Some(accepter),
+                None => {
+                    return Err(format!(
+                        "aucune demande d'accès en attente pour le pair {} \
+                         (déjà tranchée, expirée, ou jamais reçue)",
+                        NovaId(peer)
+                    ))
+                }
+            }
+        }
+        self.signal.notify_all();
+        Ok(())
+    }
+
+    /// Enregistre (ou remplace) le sink des demandes entrantes.
+    fn abonner(&self, sink: StreamSink<IncomingRequestDto>) {
+        *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
+    /// Demande l'arrêt : refuse toute attente en cours et la réveille aussitôt.
+    fn demander_arret(&self) {
+        self.etat
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .arret = true;
+        self.signal.notify_all();
+    }
+}
+
+/// Une entrée de la table des hôtes non surveillés : la poignée du service et la
+/// file d'approbation partagée avec son hook `accept`.
+struct EntreeHote {
+    poignee: UnattendedHostHandle,
+    approbation: Arc<ApprobationHote>,
+}
+
+/// Table des hôtes non surveillés vivants, indexée par identifiant opaque.
+type TableHotes = Mutex<HashMap<u64, EntreeHote>>;
+
+/// Prochain identifiant d'hôte (compteur monotone, distinct des sessions).
+static PROCHAIN_ID_HOTE: AtomicU64 = AtomicU64::new(1);
+
+/// Table statique unique des hôtes non surveillés.
+static HOTES: OnceLock<TableHotes> = OnceLock::new();
+
+/// Verrouille la table des hôtes (empoisonnement absorbé, cf. [`verrou`]).
+fn verrou_hotes() -> MutexGuard<'static, HashMap<u64, EntreeHote>> {
+    HOTES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Exécute `action` sur l'hôte `host_id`, avec une erreur lisible s'il est inconnu.
+fn avec_hote<R>(host_id: u64, action: impl FnOnce(&mut EntreeHote) -> R) -> Result<R, String> {
+    let mut table = verrou_hotes();
+    let entree = table.get_mut(&host_id).ok_or_else(|| {
+        format!("hôte non surveillé {host_id} inconnu (jamais démarré ou déjà arrêté)")
+    })?;
+    Ok(action(entree))
+}
+
+/// Démarre un hôte « accès non surveillé » et l'enregistre dans la table.
+/// L'`accept` du moteur consulte la file d'approbation pilotée par le Dart.
+pub(crate) fn demarrer_hote_non_surveille(
+    local_id: u64,
+    rendezvous: String,
+    stun_servers: Vec<String>,
+    permissions: PermissionsDto,
+) -> Result<u64, String> {
+    let serveur = parser_adresse("du serveur de rendez-vous", &rendezvous)?;
+    let stun = parser_adresses_stun(&stun_servers)?;
+    let identite = ServerIdentity::generate()
+        .map_err(|e| format!("génération de l'identité TLS de l'hôte impossible : {e}"))?;
+    let permissions_moteur = PermissionSet::from(Permissions::from(permissions));
+
+    let approbation = Arc::new(ApprobationHote::new());
+    let approbation_accept = Arc::clone(&approbation);
+    let poignee = UnattendedHost::start(
+        NovaId(local_id),
+        serveur,
+        stun,
+        identite,
+        permissions_moteur,
+        move |pair| approbation_accept.attendre_approbation(pair),
+    )
+    .map_err(|e| format!("démarrage de l'hôte non surveillé impossible : {e}"))?;
+
+    let id = PROCHAIN_ID_HOTE.fetch_add(1, Ordering::Relaxed);
+    verrou_hotes().insert(
+        id,
+        EntreeHote {
+            poignee,
+            approbation,
+        },
+    );
+    Ok(id)
+}
+
+/// Abonne `sink` au flux des demandes d'accès entrantes de l'hôte `host_id`.
+pub(crate) fn flux_demandes_entrantes(
+    host_id: u64,
+    sink: StreamSink<IncomingRequestDto>,
+) -> Result<(), String> {
+    let approbation = avec_hote(host_id, |entree| Arc::clone(&entree.approbation))?;
+    approbation.abonner(sink);
+    Ok(())
+}
+
+/// Tranche une demande d'accès entrante de l'hôte `host_id` (débloque l'`accept`).
+pub(crate) fn approuver_entrant(host_id: u64, peer_id: u64, accepter: bool) -> Result<(), String> {
+    let approbation = avec_hote(host_id, |entree| Arc::clone(&entree.approbation))?;
+    approbation.approuver(peer_id, accepter)
+}
+
+/// Statistiques cumulées de l'hôte `host_id` (backend d'encodage non exposé
+/// par la poignée : reste `None`).
+pub(crate) fn statistiques_hote(host_id: u64) -> Result<SessionStatsDto, String> {
+    avec_hote(host_id, |entree| entree.poignee.stats().into())
+}
+
+/// Arrête l'hôte `host_id` et le retire de la table. `demander_arret` réveille
+/// d'abord une approbation éventuellement bloquée (refus), puis `stop()` — appelé
+/// **hors verrou** — attend la fin du thread de service (au plus ~5 s).
+pub(crate) fn arreter_hote_non_surveille(host_id: u64) -> Result<(), String> {
+    let entree = verrou_hotes().remove(&host_id).ok_or_else(|| {
+        format!("hôte non surveillé {host_id} inconnu (jamais démarré ou déjà arrêté)")
+    })?;
+    entree.approbation.demander_arret();
+    entree.poignee.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests unitaires : analyse d'adresses, mappage d'endpoint, file d'approbation
+// (aucune session réseau réelle).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Analyse d'adresses ------------------------------------------------
+
+    #[test]
+    fn parser_adresse_valide_et_invalide() {
+        assert_eq!(
+            parser_adresse("du test", "127.0.0.1:9000").expect("adresse valide"),
+            "127.0.0.1:9000".parse::<SocketAddr>().expect("littéral")
+        );
+        // Les espaces autour de l'adresse sont tolérés.
+        assert!(parser_adresse("du test", "  127.0.0.1:1  ").is_ok());
+        let err = parser_adresse("du serveur de rendez-vous", "pas-une-adresse").unwrap_err();
+        assert!(err.contains("invalide"), "message peu utile : {err}");
+        assert!(err.contains("rendez-vous"), "l'étiquette manque : {err}");
+    }
+
+    #[test]
+    fn parser_adresses_stun_valide_et_situe_l_erreur() {
+        assert!(parser_adresses_stun(&[]).expect("liste vide").is_empty());
+        let ok = parser_adresses_stun(&["1.2.3.4:5".to_owned(), "9.9.9.9:53".to_owned()])
+            .expect("adresses valides");
+        assert_eq!(ok.len(), 2);
+        // Le message situe l'entrée fautive par son rang (ici la 2e).
+        let err = parser_adresses_stun(&["1.2.3.4:5".to_owned(), "oups".to_owned()]).unwrap_err();
+        assert!(err.contains("n°2"), "rang manquant : {err}");
+    }
+
+    // -- Mappage de l'endpoint par rendez-vous -----------------------------
+
+    #[test]
+    fn preparer_endpoint_rendezvous_valide() {
+        let dto = SessionEndpointDto::ByRendezvous {
+            server: "127.0.0.1:9000".to_owned(),
+            stun_servers: vec!["127.0.0.1:3478".to_owned()],
+            relay: Some("127.0.0.1:5000".to_owned()),
+        };
+        let (endpoint, ecoute) = preparer_endpoint(dto).expect("endpoint valide");
+        assert!(
+            ecoute.is_none(),
+            "le rendez-vous ne publie pas d'écoute locale"
+        );
+        match endpoint {
+            SessionEndpoint::ByRendezvous {
+                server,
+                stun_servers,
+                relay,
+            } => {
+                assert_eq!(server, "127.0.0.1:9000".parse().expect("serveur"));
+                assert_eq!(stun_servers.len(), 1);
+                assert_eq!(relay, Some("127.0.0.1:5000".parse().expect("relais")));
+            }
+            _ => panic!("variante d'endpoint inattendue"),
+        }
+    }
+
+    #[test]
+    fn preparer_endpoint_rendezvous_invalide() {
+        let dto = SessionEndpointDto::ByRendezvous {
+            server: "xxx".to_owned(),
+            stun_servers: vec![],
+            relay: None,
+        };
+        // `SessionEndpoint` n'implémente pas `Debug` (il porte un `Listener`) :
+        // on filtre l'erreur par motif plutôt que via `unwrap_err`.
+        let Err(err) = preparer_endpoint(dto) else {
+            panic!("une adresse de rendez-vous illisible doit être refusée");
+        };
+        assert!(
+            err.contains("invalide") && err.contains("rendez-vous"),
+            "message peu utile : {err}"
+        );
+    }
+
+    // -- File d'approbation entrante (approve / deny / timeout / arrêt) -----
+
+    /// Attend que l'`accept` ait enregistré sa demande (évite la course avec la
+    /// réponse), puis rend la main.
+    fn attendre_enregistrement(appro: &ApprobationHote, peer: u64) {
+        let echeance = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < echeance {
+            if appro
+                .etat
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .decisions
+                .contains_key(&peer)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("la demande d'approbation n'a jamais été enregistrée");
+    }
+
+    /// Lance une attente d'approbation dans un thread et rend sa poignée.
+    fn lancer_attente(
+        appro: &Arc<ApprobationHote>,
+        pair: NovaId,
+        delai: Duration,
+    ) -> thread::JoinHandle<bool> {
+        let a = Arc::clone(appro);
+        thread::spawn(move || a.attendre_approbation_avec_delai(pair, delai))
+    }
+
+    #[test]
+    fn approbation_acceptee_par_approve() {
+        let appro = Arc::new(ApprobationHote::new());
+        let pair = NovaId(123_456_789);
+        let attente = lancer_attente(&appro, pair, Duration::from_secs(5));
+        attendre_enregistrement(&appro, pair.as_u64());
+        appro.approuver(pair.as_u64(), true).expect("approbation");
+        assert!(
+            attente.join().expect("thread"),
+            "l'appelant doit être accepté"
+        );
+    }
+
+    #[test]
+    fn approbation_refusee_par_deny() {
+        let appro = Arc::new(ApprobationHote::new());
+        let pair = NovaId(42);
+        let attente = lancer_attente(&appro, pair, Duration::from_secs(5));
+        attendre_enregistrement(&appro, pair.as_u64());
+        appro
+            .approuver(pair.as_u64(), false)
+            .expect("refus explicite");
+        assert!(
+            !attente.join().expect("thread"),
+            "l'appelant doit être refusé"
+        );
+    }
+
+    #[test]
+    fn approbation_expire_en_refus() {
+        let appro = ApprobationHote::new();
+        let debut = Instant::now();
+        // Délai bref, aucune réponse : refus par défaut, sans blocage.
+        let accepte = appro.attendre_approbation_avec_delai(NovaId(7), Duration::from_millis(80));
+        assert!(!accepte, "l'expiration doit refuser par défaut");
+        assert!(
+            debut.elapsed() < Duration::from_secs(5),
+            "l'attente ne doit pas se bloquer"
+        );
+    }
+
+    #[test]
+    fn approbation_arret_refuse_immediatement() {
+        let appro = Arc::new(ApprobationHote::new());
+        let pair = NovaId(99);
+        // Délai long : seul l'arrêt doit débloquer (pas l'expiration).
+        let attente = lancer_attente(&appro, pair, Duration::from_secs(30));
+        attendre_enregistrement(&appro, pair.as_u64());
+        let debut = Instant::now();
+        appro.demander_arret();
+        assert!(!attente.join().expect("thread"), "l'arrêt doit refuser");
+        assert!(
+            debut.elapsed() < Duration::from_secs(5),
+            "arrêt non immédiat"
+        );
+    }
+
+    #[test]
+    fn approuver_sans_demande_echoue() {
+        let appro = ApprobationHote::new();
+        let err = appro.approuver(555, true).unwrap_err();
+        assert!(err.contains("aucune demande"), "message peu utile : {err}");
     }
 }

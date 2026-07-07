@@ -19,19 +19,30 @@
 //!
 //! ```text
 //! # 1. Retirer l'échafaudage de compilation pré-régénération :
-//! #    supprimer crates/nd-ffi/src/pont_provisoire.rs
-//! #    et la ligne `mod pont_provisoire;` ci-dessous.
+//! #    supprimer crates/nd-ffi/src/pont_provisoire2.rs
+//! #    et la ligne `mod pont_provisoire2;` de lib.rs.
 //! #    (Oubli = conflit d'impl E0119 à la compilation, impossible à rater.)
 //! # 2. Depuis novadesk/ui (lit flutter_rust_bridge.yaml : rust_input crate::api) :
 //! flutter_rust_bridge_codegen generate
 //! ```
 //!
-//! Nouvelles fonctions que le binding Dart exposera après régénération :
-//! `start_session`, `session_listen_info`, `session_state_stream`
-//! (→ `Stream<SessionStateDto>`), `session_video_stream` (→ `Stream<VideoFrameDto>`),
-//! `wait_session_state`, `collect_video_frames`, `session_stats`,
-//! `session_last_error`, `send_input`, `stop_session` — et leurs DTO
-//! `VideoFrameDto`, `SessionStatsDto`, `SessionEndpointDto`, `ListenInfoDto`.
+//! **Stopgap `frb_generated.rs` (lot §2)** : l'enrichissement de `SessionStatsDto`
+//! (nouveaux champs) a cassé le seul `impl SseDecode` généré qui construisait la
+//! structure par littéral exhaustif (type de **sortie**, décodeur jamais appelé à
+//! l'exécution). Comme la régénération est impossible depuis ce poste, ce littéral
+//! a été complété sur place dans `frb_generated.rs` (marqué « lot §2 ») pour
+//! garder la crate compilable ; la régénération l'écrasera à l'identique.
+//!
+//! Fonctions exposées au Dart après régénération — **lot 03** : `start_session`,
+//! `session_listen_info`, `session_state_stream` (→ `Stream<SessionStateDto>`),
+//! `session_video_stream` (→ `Stream<VideoFrameDto>`), `wait_session_state`,
+//! `collect_video_frames`, `session_stats`, `session_last_error`, `send_input`,
+//! `stop_session`. **Lot §2 (nouvelles)** : `start_session_with_options`,
+//! `start_unattended_host`, `unattended_incoming_stream`
+//! (→ `Stream<IncomingRequestDto>`), `approve_incoming`, `unattended_stats`,
+//! `stop_unattended_host`. DTO : `VideoFrameDto`, `SessionStatsDto` (enrichi),
+//! `SessionEndpointDto` (variante `ByRendezvous`), `SessionOptionsDto`,
+//! `IncomingRequestDto`, `ListenInfoDto`.
 
 // Binding généré par `flutter_rust_bridge_codegen generate` (config dans
 // `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit
@@ -41,8 +52,9 @@ mod frb_generated;
 
 pub mod api;
 
-/// Gestion interne des sessions live (table statique + threads de drainage).
-/// Hors du périmètre scanné par le codegen (`rust_input: crate::api`).
+/// Gestion interne des sessions live et des hôtes non surveillés (tables
+/// statiques + threads de drainage + file d'approbation). Hors du périmètre
+/// scanné par le codegen (`rust_input: crate::api`).
 mod flux;
 
 pub use api::*;
