@@ -47,6 +47,26 @@ final appInfoProvider = FutureProvider<AppInfo>((ref) {
   return ref.watch(nativeApiProvider).appInfo();
 });
 
+// ---------------------------------------------------------------------------
+// Réglages du rendez-vous (connexion par ID / accès non surveillé)
+// ---------------------------------------------------------------------------
+
+/// Adresse du serveur de rendez-vous (`nd-signaling`, « ip:port ») utilisé pour
+/// la mise en relation **par ID** ([SessionEndpointByRendezvous]) et l'hôte
+/// « accès non surveillé ».
+///
+/// Défaut local raisonnable en l'absence de déploiement (plan 11) ; réglable
+/// dans l'écran des réglages une fois le service en ligne.
+final rendezvousProvider = StateProvider<String>((ref) => '127.0.0.1:9000');
+
+/// Serveurs STUN (« ip:port ») alimentant le hole punching. Liste vide acceptée
+/// (candidats locaux seulement — LAN / boucle locale).
+final stunServersProvider = StateProvider<List<String>>((ref) => const []);
+
+/// Relais de repli (`nd-relay`, « ip:port ») quand le punch échoue ; `null` =
+/// pas de repli.
+final relayProvider = StateProvider<String?>((ref) => null);
+
 /// Mot de passe éphémère du poste local, régénérable depuis l'accueil.
 ///
 /// FICTIF : la génération/rotation réelle appartiendra au cœur (plan 06).

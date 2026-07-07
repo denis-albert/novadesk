@@ -114,12 +114,24 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       final idFormate = await api.formatNovaId(id: idPair);
       final alias = correspondance?.alias ??
           carnet.where((e) => e.id == idPair).map((e) => e.alias).firstOrNull;
+      // Connexion **par ID** : mise en relation via le serveur de rendez-vous
+      // (STUN → hole punching → QUIC), adresses issues des réglages réseau.
+      final endpoint = SessionEndpointByRendezvous(
+        server: ref.read(rendezvousProvider),
+        stunServers: ref.read(stunServersProvider),
+        relay: ref.read(relayProvider),
+      );
+      // Les permissions du mode retenu deviennent les permissions granulaires
+      // de la session (démarrage via `start_session_with_options`).
+      final options = SessionOptionsDto(permissions: _mode.permissions);
       if (!mounted) return;
       await Navigator.of(context).pushNamed(
         SessionScreen.route,
         arguments: SessionScreenArgs(
           config: config,
           libellePair: alias ?? idFormate,
+          endpoint: endpoint,
+          options: options,
         ),
       );
     } on NovaApiException catch (e) {

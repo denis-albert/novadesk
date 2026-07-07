@@ -38,13 +38,27 @@ import '../widgets/session_state_badge.dart';
 
 /// Arguments de navigation vers la fenêtre de session.
 class SessionScreenArgs {
-  const SessionScreenArgs({required this.config, required this.libellePair});
+  const SessionScreenArgs({
+    required this.config,
+    required this.libellePair,
+    this.endpoint = const SessionEndpointLoopback(),
+    this.options,
+  });
 
   /// Configuration validée par `new_session_config` (façade `nd-ffi`).
   final SessionConfigDto config;
 
   /// Alias du pair s'il est au carnet, sinon son ID formaté.
   final String libellePair;
+
+  /// Point d'accès réseau de démarrage : [SessionEndpointByRendezvous] pour la
+  /// connexion **par ID**, [SessionEndpointLoopback] par défaut (démo mock /
+  /// hôte local).
+  final SessionEndpointDto endpoint;
+
+  /// Options avancées éventuelles : si non nul, la session démarre via
+  /// `start_session_with_options` (permissions granulaires, enregistrement…).
+  final SessionOptionsDto? options;
 }
 
 class SessionScreen extends ConsumerStatefulWidget {
@@ -194,13 +208,21 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   /// d'états et de trames vidéo. Remplace l'ancienne simulation par minuteries.
   Future<void> _demarrerSession() async {
     try {
-      // En l'absence du service de rendez-vous (plan 11), on démarre en
-      // Loopback ; le contrôleur réel passera un `SessionEndpointDirect`
-      // (adresse + certificat épinglé) fourni par le rendez-vous.
-      final id = await _api.startSession(
-        config: widget.args.config,
-        endpoint: const SessionEndpointLoopback(),
-      );
+      // L'endpoint vient de l'appelant : `ByRendezvous` pour la connexion par
+      // ID (mise en relation via le serveur de rendez-vous), `Loopback` par
+      // défaut (démo mock / hôte local). Avec des options avancées, on passe
+      // par `start_session_with_options`.
+      final options = widget.args.options;
+      final id = options == null
+          ? await _api.startSession(
+              config: widget.args.config,
+              endpoint: widget.args.endpoint,
+            )
+          : await _api.startSessionWithOptions(
+              config: widget.args.config,
+              endpoint: widget.args.endpoint,
+              options: options,
+            );
       if (!mounted) {
         unawaited(_api.stopSession(id));
         return;
@@ -579,6 +601,15 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
               if (stats != null) '${stats.fps.toStringAsFixed(0)} IPS',
               if (stats != null) '${(stats.rttUs / 1000).toStringAsFixed(0)} ms',
               if (stats != null) '↓ ${_formaterOctets(stats.bytesIn)}',
+              // Statistiques enrichies (lot §2b) — affichées seulement quand
+              // elles s'appliquent au poste local (libellés honnêtes).
+              if (stats?.encoderBackend != null) 'Encodeur : ${stats!.encoderBackend}',
+              if (stats != null && stats.targetBitrateKbps > 0)
+                'ABR N${stats.abrLevel} · ${_formaterDebit(stats.targetBitrateKbps)}',
+              if (stats != null && stats.reconnects > 0)
+                'Reconnexions : ${stats.reconnects}',
+              if (stats != null && stats.inputsDenied > 0)
+                'Entrées refusées : ${stats.inputsDenied}',
               'Entrées : $_evenementsEnvoyes',
             ].join(' · '),
             maxLines: 1,
@@ -600,6 +631,14 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
       return '${(octets / (1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Mo';
     }
     return '${(octets / (1024 * 1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Go';
+  }
+
+  /// Formate un débit cible ABR (kbit/s → « 6,0 Mb/s » au-delà de 1000).
+  String _formaterDebit(int kbps) {
+    if (kbps >= 1000) {
+      return '${(kbps / 1000).toStringAsFixed(1).replaceAll('.', ',')} Mb/s';
+    }
+    return '$kbps kb/s';
   }
 
   // ---------------------------------------------------------------------------

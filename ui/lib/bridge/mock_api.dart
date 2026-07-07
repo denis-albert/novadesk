@@ -11,8 +11,10 @@
 /// généré produit les octets attendus par le canal `Input`.
 library;
 
+import 'dart:async';
 import 'dart:math';
-import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 
 import 'native_api.dart';
 
@@ -245,6 +247,17 @@ class MockNativeApi implements NativeApi {
   }
 
   @override
+  Future<int> startSessionWithOptions({
+    required SessionConfigDto config,
+    required SessionEndpointDto endpoint,
+    required SessionOptionsDto options,
+  }) {
+    // Le mock ignore les options avancées : même comportement que
+    // [startSession] (mire animée, flux d'états de synthèse).
+    return startSession(config: config, endpoint: endpoint);
+  }
+
+  @override
   Future<ListenInfoDto> sessionListenInfo(int id) async {
     // Hôte fictif en écoute loopback : adresse plausible, certificat vide.
     return ListenInfoDto(addr: '127.0.0.1:53211', certDer: Uint8List(0));
@@ -309,14 +322,23 @@ class MockNativeApi implements NativeApi {
     final secondes = debut == null
         ? 0.0
         : DateTime.now().difference(debut).inMilliseconds / 1000.0;
+    final actif = secondes >= 0.5;
     // Valeurs plausibles avec un léger jitter, montant avec la durée.
-    final fps = secondes < 0.5 ? 0.0 : 29.0 + _alea.nextDouble() * 2.0;
+    final fps = actif ? 29.0 + _alea.nextDouble() * 2.0 : 0.0;
     return SessionStatsDto(
       fps: fps,
       rttUs: 9000 + _alea.nextInt(7000),
       bytesIn: (secondes * 2100000).round(),
       bytesOut: (secondes * 7600).round(),
       frames: (secondes * 30).round(),
+      // Statistiques enrichies de synthèse (démontrent le HUD du lot §2b).
+      inputsDenied: 0,
+      targetBitrateKbps: actif ? 6000 : 0,
+      // L'ABR dégrade brièvement toutes les ~20 s (démo du palier).
+      abrLevel: actif && (secondes % 20) > 17 ? 1 : 0,
+      framesRecorded: 0,
+      reconnects: secondes ~/ 45, // une reconnexion simulée toutes les ~45 s
+      encoderBackend: actif ? 'NVENC' : null,
     );
   }
 
@@ -331,6 +353,104 @@ class MockNativeApi implements NativeApi {
   @override
   Future<void> stopSession(int id) async {
     _debutSession.remove(id);
+  }
+
+  // -------------------------------------------------------------------------
+  // Hôte « accès non surveillé » — flux de synthèse (démontre le dialogue
+  // d'acceptation SANS le cœur natif)
+  // -------------------------------------------------------------------------
+
+  int _prochainIdHote = 1;
+  final Set<int> _hotesActifs = <int>{};
+
+  /// Journal **observable par les tests** des décisions transmises à
+  /// [approveIncoming] (le cœur réel, lui, débloque/refuse l'appelant).
+  final List<({int hostId, int peerId, bool accepter})> approbations =
+      <({int hostId, int peerId, bool accepter})>[];
+
+  /// Nombre d'appelants acceptés, pour faire croître les stats de synthèse.
+  int _servisParHote = 0;
+
+  @override
+  Future<int> startUnattendedHost({
+    required int localId,
+    required String rendezvous,
+    required List<String> stunServers,
+    required PermissionsDto permissions,
+  }) async {
+    final id = _prochainIdHote++;
+    _hotesActifs.add(id);
+    return id;
+  }
+
+  /// Émet une **demande entrante factice après ~2 s** (puis d'autres, espacées),
+  /// pour démontrer le dialogue d'acceptation. Le minuteur est annulé à la
+  /// résiliation de l'abonnement (aucun timer pendant après `dispose`).
+  @override
+  Stream<IncomingRequestDto> unattendedIncomingStream(int hostId) {
+    // Appelants factices cyclés (le 2ᵉ correspond à un appareil de confiance).
+    const idsFactices = <int>[555240173, 730118902, 190774025];
+    late final StreamController<IncomingRequestDto> controleur;
+    Timer? minuteur;
+    var i = 0;
+
+    void programmer(Duration delai) {
+      minuteur = Timer(delai, () {
+        if (!_hotesActifs.contains(hostId)) {
+          unawaited(controleur.close());
+          return;
+        }
+        final pair = idsFactices[i % idsFactices.length];
+        i++;
+        controleur.add(
+          IncomingRequestDto(peerId: pair, peerIdFormate: _formater(pair)),
+        );
+        programmer(const Duration(seconds: 12));
+      });
+    }
+
+    controleur = StreamController<IncomingRequestDto>(
+      onListen: () => programmer(const Duration(seconds: 2)),
+      onCancel: () => minuteur?.cancel(),
+    );
+    return controleur.stream;
+  }
+
+  @override
+  Future<void> approveIncoming({
+    required int hostId,
+    required int peerId,
+    required bool accepter,
+  }) async {
+    approbations.add((hostId: hostId, peerId: peerId, accepter: accepter));
+    if (accepter) _servisParHote++;
+    // « journalise » (le cœur réel sert ou refuse réellement l'appelant).
+    debugPrint('MockNativeApi.approveIncoming(hôte $hostId, pair '
+        '${_formater(peerId)}) = ${accepter ? 'accepté' : 'refusé'}');
+  }
+
+  @override
+  Future<SessionStatsDto> unattendedStats(int hostId) async {
+    // Stats cumulées plausibles, croissant avec les sessions servies. Côté
+    // hôte : pas de décodage local (fps/frames nuls), encodeur non exposé.
+    return SessionStatsDto(
+      fps: 0,
+      rttUs: 12000 + _alea.nextInt(6000),
+      bytesIn: _servisParHote * 4200 + _alea.nextInt(2000),
+      bytesOut: _servisParHote * 1850000 + _alea.nextInt(500000),
+      frames: 0,
+      inputsDenied: _servisParHote * 3,
+      targetBitrateKbps: _servisParHote > 0 ? 6000 : 0,
+      abrLevel: 0,
+      framesRecorded: 0,
+      reconnects: 0,
+      encoderBackend: null,
+    );
+  }
+
+  @override
+  Future<void> stopUnattendedHost(int hostId) async {
+    _hotesActifs.remove(hostId);
   }
 
   // Barres facon mire télé : blanc, jaune, cyan, vert, magenta, rouge, bleu, noir.

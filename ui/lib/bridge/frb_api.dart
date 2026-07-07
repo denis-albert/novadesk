@@ -134,6 +134,24 @@ class FrbNativeApi implements NativeApi {
   }
 
   @override
+  Future<int> startSessionWithOptions({
+    required SessionConfigDto config,
+    required SessionEndpointDto endpoint,
+    required SessionOptionsDto options,
+  }) async {
+    try {
+      final id = await frb.startSessionWithOptions(
+        config: _configVers(config),
+        endpoint: _endpointVers(endpoint),
+        options: _optionsVers(options),
+      );
+      return id.toInt();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
   Future<ListenInfoDto> sessionListenInfo(int id) async {
     try {
       final info = await frb.sessionListenInfo(id: BigInt.from(id));
@@ -180,13 +198,7 @@ class FrbNativeApi implements NativeApi {
   @override
   Future<SessionStatsDto> sessionStats(int id) async {
     final s = await frb.sessionStats(id: BigInt.from(id));
-    return SessionStatsDto(
-      fps: s.fps,
-      rttUs: s.rttUs.toInt(),
-      bytesIn: s.bytesIn.toInt(),
-      bytesOut: s.bytesOut.toInt(),
-      frames: s.frames.toInt(),
-    );
+    return _statsDepuis(s);
   }
 
   @override
@@ -199,6 +211,63 @@ class FrbNativeApi implements NativeApi {
 
   @override
   Future<void> stopSession(int id) => frb.stopSession(id: BigInt.from(id));
+
+  // ---------------------------------------------------------------------------
+  // Hôte « accès non surveillé » — délégation aux fonctions générées
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<int> startUnattendedHost({
+    required int localId,
+    required String rendezvous,
+    required List<String> stunServers,
+    required PermissionsDto permissions,
+  }) async {
+    try {
+      final id = await frb.startUnattendedHost(
+        localId: BigInt.from(localId),
+        rendezvous: rendezvous,
+        stunServers: stunServers,
+        permissions: _permsVers(permissions),
+      );
+      return id.toInt();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Stream<IncomingRequestDto> unattendedIncomingStream(int hostId) =>
+      frb
+          .unattendedIncomingStream(hostId: BigInt.from(hostId))
+          .map(_incomingDepuis);
+
+  @override
+  Future<void> approveIncoming({
+    required int hostId,
+    required int peerId,
+    required bool accepter,
+  }) async {
+    try {
+      await frb.approveIncoming(
+        hostId: BigInt.from(hostId),
+        peerId: BigInt.from(peerId),
+        accepter: accepter,
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<SessionStatsDto> unattendedStats(int hostId) async {
+    final s = await frb.unattendedStats(hostId: BigInt.from(hostId));
+    return _statsDepuis(s);
+  }
+
+  @override
+  Future<void> stopUnattendedHost(int hostId) =>
+      frb.stopUnattendedHost(hostId: BigInt.from(hostId));
 
   // ---------------------------------------------------------------------------
   // Conversions internes
@@ -275,7 +344,46 @@ class FrbNativeApi implements NativeApi {
         SessionEndpointLoopback() => const frb.SessionEndpointDto.loopback(),
         SessionEndpointDirect(:final addr, :final certDer) =>
           frb.SessionEndpointDto.direct(addr: addr, certDer: certDer),
+        SessionEndpointByRendezvous(
+          :final server,
+          :final stunServers,
+          :final relay
+        ) =>
+          frb.SessionEndpointDto.byRendezvous(
+            server: server,
+            stunServers: stunServers,
+            relay: relay,
+          ),
       };
+
+  static frb.SessionOptionsDto _optionsVers(SessionOptionsDto o) =>
+      frb.SessionOptionsDto(
+        permissions: _permsVers(o.permissions),
+        recordingPath: o.recordingPath,
+        deltaMode: o.deltaMode,
+      );
+
+  /// Conversion des statistiques (u64 ⇄ BigInt ; `targetBitrateKbps`,
+  /// `abrLevel` et `reconnects` sont déjà des `int` côté généré).
+  static SessionStatsDto _statsDepuis(frb.SessionStatsDto s) => SessionStatsDto(
+        fps: s.fps,
+        rttUs: s.rttUs.toInt(),
+        bytesIn: s.bytesIn.toInt(),
+        bytesOut: s.bytesOut.toInt(),
+        frames: s.frames.toInt(),
+        inputsDenied: s.inputsDenied.toInt(),
+        targetBitrateKbps: s.targetBitrateKbps,
+        abrLevel: s.abrLevel,
+        framesRecorded: s.framesRecorded.toInt(),
+        reconnects: s.reconnects,
+        encoderBackend: s.encoderBackend,
+      );
+
+  static IncomingRequestDto _incomingDepuis(frb.IncomingRequestDto r) =>
+      IncomingRequestDto(
+        peerId: r.peerId.toInt(),
+        peerIdFormate: r.peerIdFormate,
+      );
 
   static frb.InputEventDto _inputVers(InputEventDto e) => switch (e) {
         InputMouseMoveAbs(:final x, :final y, :final monitor) =>

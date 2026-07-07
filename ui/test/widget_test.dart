@@ -12,6 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:novadesk_ui/bridge/mock_api.dart';
 import 'package:novadesk_ui/bridge/native_api.dart';
 import 'package:novadesk_ui/main.dart';
+import 'package:novadesk_ui/state/providers.dart';
 
 void main() {
   testWidgets("l'accueil affiche l'ID local formaté par groupes de 3",
@@ -91,10 +92,10 @@ void main() {
     await tester.pump(const Duration(seconds: 5));
     await tester.pumpAndSettle();
 
-    // Écran « Accès non surveillé ».
+    // Écran « Accès non surveillé » : le bouton d'activation est présent.
     await tester.tap(find.text('Accès non surveillé'));
     await tester.pumpAndSettle();
-    expect(find.text("Autoriser l'accès non-surveillé"), findsOneWidget);
+    expect(find.text("Activer l'accès non surveillé"), findsOneWidget);
   });
 
   testWidgets('le flux vidéo du mock se décode en ui.Image (rendu pur Dart)',
@@ -136,5 +137,53 @@ void main() {
     });
 
     await api.stopSession(id);
+  });
+
+  testWidgets(
+      "l'hôte non surveillé mock ouvre le dialogue entrant et « Accepter » "
+      'appelle approveIncoming',
+      (tester) async {
+    // Mock injecté pour observer les décisions transmises à approve_incoming.
+    final mock = MockNativeApi();
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [nativeApiProvider.overrideWithValue(mock)],
+        child: const NovaDeskApp(),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Ouvre l'écran depuis la colonne « Ce poste » de l'accueil.
+    await tester.ensureVisible(find.text('Accès non surveillé'));
+    await tester.tap(find.text('Accès non surveillé'));
+    await tester.pumpAndSettle();
+
+    // Active l'hôte : start_unattended_host renvoie un id, abonnement au flux.
+    await tester.tap(find.text("Activer l'accès non surveillé"));
+    await tester.pump(); // lance _activerHote
+    await tester.pump(const Duration(milliseconds: 50)); // l'appel résout
+    expect(find.text('Actif'), findsOneWidget);
+
+    // La demande entrante factice arrive ~2 s après l'abonnement : le dialogue
+    // d'acceptation s'ouvre. (Pas de pumpAndSettle : le polling des stats
+    // reprogramme un frame toutes les 2 s tant que l'hôte est actif.)
+    await tester.pump(const Duration(milliseconds: 2200));
+    await tester.pump(); // livraison de l'événement + showDialog
+    await tester.pump(const Duration(milliseconds: 300)); // animation d'ouverture
+    expect(find.text('Accepter'), findsOneWidget);
+    expect(find.text('Refuser'), findsOneWidget);
+
+    // Accepter → approve_incoming(accepter: true) sur le bon pair.
+    await tester.tap(find.text('Accepter'));
+    await tester.pump(); // pop + microtâche approveIncoming
+    await tester.pump(const Duration(milliseconds: 300)); // fermeture du dialogue
+    expect(mock.approbations, isNotEmpty);
+    expect(mock.approbations.last.accepter, isTrue);
+    expect(mock.approbations.last.peerId, 555240173);
+
+    // Désactive proprement l'hôte (annule le flux mock → aucun timer pendant).
+    await tester.tap(find.text('Désactiver'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
   });
 }

@@ -391,6 +391,13 @@ class VideoFrameDto {
 
 /// Instantané des statistiques d'une session, rafraîchies en continu par le
 /// moteur (miroir de `nd_ffi::SessionStatsDto`).
+///
+/// Les cinq premiers champs sont historiques (lot 04) ; les suivants exposent
+/// les statistiques **enrichies** du moteur (lot §2 : permissions, ABR,
+/// enregistrement, reconnexion) et le backend d'encodage réellement à l'œuvre.
+/// Certains champs sont propres à un rôle (ex. `targetBitrateKbps`, `abrLevel`,
+/// `framesRecorded`, `encoderBackend` côté hôte) : ils valent `0`/`null` quand
+/// ils ne s'appliquent pas au poste local, et l'UI les masque alors.
 class SessionStatsDto {
   const SessionStatsDto({
     required this.fps,
@@ -398,6 +405,12 @@ class SessionStatsDto {
     required this.bytesIn,
     required this.bytesOut,
     required this.frames,
+    this.inputsDenied = 0,
+    this.targetBitrateKbps = 0,
+    this.abrLevel = 0,
+    this.framesRecorded = 0,
+    this.reconnects = 0,
+    this.encoderBackend,
   });
 
   /// Images décodées par seconde (fenêtre glissante d'une seconde).
@@ -415,6 +428,26 @@ class SessionStatsDto {
   /// Trames décodées livrées depuis le début de la session.
   final int frames;
 
+  /// Entrées reçues mais **refusées par les permissions** (côté contrôlé).
+  final int inputsDenied;
+
+  /// Débit cible actuellement appliqué à l'encodeur par l'ABR (hôte), kbit/s.
+  final int targetBitrateKbps;
+
+  /// Palier ABR courant (hôte) : 0 = plein régime, croît en dégradant.
+  final int abrLevel;
+
+  /// Images écrites dans l'enregistrement local (hôte), toutes époques confondues.
+  final int framesRecorded;
+
+  /// Reconnexions **réussies** depuis le début de la session.
+  final int reconnects;
+
+  /// Nom du backend d'encodage réellement à l'œuvre côté hôte (« NVENC »,
+  /// repli logiciel…) ; `null` tant que l'encodeur n'est pas créé ou côté
+  /// contrôleur.
+  final String? encoderBackend;
+
   @override
   bool operator ==(Object other) =>
       other is SessionStatsDto &&
@@ -422,15 +455,26 @@ class SessionStatsDto {
       other.rttUs == rttUs &&
       other.bytesIn == bytesIn &&
       other.bytesOut == bytesOut &&
-      other.frames == frames;
+      other.frames == frames &&
+      other.inputsDenied == inputsDenied &&
+      other.targetBitrateKbps == targetBitrateKbps &&
+      other.abrLevel == abrLevel &&
+      other.framesRecorded == framesRecorded &&
+      other.reconnects == reconnects &&
+      other.encoderBackend == encoderBackend;
 
   @override
-  int get hashCode => Object.hash(fps, rttUs, bytesIn, bytesOut, frames);
+  int get hashCode => Object.hash(fps, rttUs, bytesIn, bytesOut, frames,
+      inputsDenied, targetBitrateKbps, abrLevel, framesRecorded, reconnects,
+      encoderBackend);
 
   @override
   String toString() =>
       'SessionStatsDto(fps: $fps, rttUs: $rttUs, bytesIn: $bytesIn, '
-      'bytesOut: $bytesOut, frames: $frames)';
+      'bytesOut: $bytesOut, frames: $frames, inputsDenied: $inputsDenied, '
+      'targetBitrateKbps: $targetBitrateKbps, abrLevel: $abrLevel, '
+      'framesRecorded: $framesRecorded, reconnects: $reconnects, '
+      'encoderBackend: $encoderBackend)';
 }
 
 /// Point d'accès réseau au démarrage d'une session
@@ -459,6 +503,29 @@ final class SessionEndpointDirect extends SessionEndpointDto {
   final Uint8List certDer;
 }
 
+/// La session se met en relation **par ID** via un serveur de rendez-vous :
+/// STUN → hole punching → QUIC sur la socket percée, avec repli relais
+/// optionnel. C'est le seul point de contact **reconnectable** (miroir de
+/// `nd_ffi::SessionEndpointDto::ByRendezvous`). Toutes les adresses sont en
+/// texte (« ip:port »).
+final class SessionEndpointByRendezvous extends SessionEndpointDto {
+  const SessionEndpointByRendezvous({
+    required this.server,
+    this.stunServers = const [],
+    this.relay,
+  });
+
+  /// Adresse du serveur de rendez-vous (`nd-signaling`), ex. « 203.0.113.7:9000 ».
+  final String server;
+
+  /// Serveurs STUN interrogés pour le candidat réflexif. Liste vide =
+  /// candidats locaux seulement (LAN / boucle locale).
+  final List<String> stunServers;
+
+  /// Relais de repli (`nd-relay`) quand le punch échoue ; `null` = pas de repli.
+  final String? relay;
+}
+
 /// Coordonnées d'écoute d'une session hôte démarrée en
 /// [SessionEndpointLoopback] (miroir de `nd_ffi::ListenInfoDto`).
 class ListenInfoDto {
@@ -469,6 +536,77 @@ class ListenInfoDto {
 
   /// Certificat auto-signé (DER) à épingler côté pair.
   final Uint8List certDer;
+}
+
+/// Options avancées de démarrage d'une session (miroir de
+/// `nd_ffi::SessionOptionsDto`).
+///
+/// Complète [SessionConfigDto] : celui-ci porte le rôle, les ID et les
+/// permissions ; celui-là affine le comportement côté **contrôlé** (filtre de
+/// permissions granulaire faisant autorité, enregistrement local, encodage
+/// delta). [NativeApi.startSession] équivaut à un démarrage avec les options
+/// par défaut du moteur.
+class SessionOptionsDto {
+  const SessionOptionsDto({
+    required this.permissions,
+    this.recordingPath,
+    this.deltaMode = false,
+  });
+
+  /// Permissions granulaires appliquées avant chaque injection d'entrée
+  /// (contrôlé). Fait autorité sur les permissions de [SessionConfigDto].
+  final PermissionsDto permissions;
+
+  /// Chemin du MP4 à écrire pour l'enregistrement local (hôte) ; `null` =
+  /// pas d'enregistrement.
+  final String? recordingPath;
+
+  /// Encodage delta **opt-in** : à n'activer que si la capture renseigne
+  /// fidèlement les régions modifiées.
+  final bool deltaMode;
+
+  @override
+  bool operator ==(Object other) =>
+      other is SessionOptionsDto &&
+      other.permissions == permissions &&
+      other.recordingPath == recordingPath &&
+      other.deltaMode == deltaMode;
+
+  @override
+  int get hashCode => Object.hash(permissions, recordingPath, deltaMode);
+
+  @override
+  String toString() => 'SessionOptionsDto(permissions: $permissions, '
+      'recordingPath: $recordingPath, deltaMode: $deltaMode)';
+}
+
+/// Demande d'accès entrante vers un hôte « accès non surveillé », poussée par
+/// [NativeApi.unattendedIncomingStream] pour chaque appelant à approuver
+/// (miroir de `nd_ffi::IncomingRequestDto`).
+///
+/// L'UI présente la demande (dialogue d'acceptation) puis tranche via
+/// [NativeApi.approveIncoming] avec le même [peerId].
+class IncomingRequestDto {
+  const IncomingRequestDto({required this.peerId, required this.peerIdFormate});
+
+  /// ID NovaDesk brut de l'appelant (à repasser à [NativeApi.approveIncoming]).
+  final int peerId;
+
+  /// ID de l'appelant au format groupé (« 123 456 789 »), prêt à afficher.
+  final String peerIdFormate;
+
+  @override
+  bool operator ==(Object other) =>
+      other is IncomingRequestDto &&
+      other.peerId == peerId &&
+      other.peerIdFormate == peerIdFormate;
+
+  @override
+  int get hashCode => Object.hash(peerId, peerIdFormate);
+
+  @override
+  String toString() =>
+      'IncomingRequestDto(peerId: $peerId, peerIdFormate: $peerIdFormate)';
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +673,15 @@ abstract interface class NativeApi {
     required SessionEndpointDto endpoint,
   });
 
+  /// Démarre une session comme [startSession], mais avec des options avancées
+  /// ([SessionOptionsDto] : permissions granulaires, enregistrement local,
+  /// encodage delta). Miroir de `nd_ffi::start_session_with_options`.
+  Future<int> startSessionWithOptions({
+    required SessionConfigDto config,
+    required SessionEndpointDto endpoint,
+    required SessionOptionsDto options,
+  });
+
   /// Adresse et certificat d'écoute d'une session [SessionEndpointLoopback]
   /// (miroir de `nd_ffi::session_listen_info`).
   Future<ListenInfoDto> sessionListenInfo(int id);
@@ -580,4 +727,49 @@ abstract interface class NativeApi {
   /// Arrête la session et invalide son identifiant
   /// (miroir de `nd_ffi::stop_session`).
   Future<void> stopSession(int id);
+
+  // -------------------------------------------------------------------------
+  // Hôte « accès non surveillé » (lot §2b)
+  // -------------------------------------------------------------------------
+
+  /// Démarre un hôte « accès non surveillé » : publie [localId] au serveur de
+  /// [rendezvous] (« ip:port »), génère une identité TLS et attend les
+  /// appelants. Renvoie un **identifiant opaque d'hôte** (distinct des
+  /// identifiants de session). Miroir de `nd_ffi::start_unattended_host`.
+  ///
+  /// Chaque appelant est soumis à **approbation pilotée par l'UI** : abonnez-
+  /// vous à [unattendedIncomingStream] puis tranchez via [approveIncoming].
+  /// [stunServers] (« ip:port », liste éventuellement vide) alimente le hole
+  /// punching ; [permissions] filtre les entrées reçues (côté contrôlé).
+  Future<int> startUnattendedHost({
+    required int localId,
+    required String rendezvous,
+    required List<String> stunServers,
+    required PermissionsDto permissions,
+  });
+
+  /// Flux des demandes d'accès entrantes de l'hôte [hostId]. À brancher juste
+  /// après [startUnattendedHost] : une demande arrivée sans abonné n'est pas
+  /// livrée et expirera (refus par défaut). Miroir de
+  /// `nd_ffi::unattended_incoming_stream`.
+  Stream<IncomingRequestDto> unattendedIncomingStream(int hostId);
+
+  /// Tranche une demande entrante de l'hôte [hostId] : `accepter == true`
+  /// débloque et sert la session, `false` la refuse. [peerId] est celui de la
+  /// [IncomingRequestDto] reçue. Miroir de `nd_ffi::approve_incoming`.
+  Future<void> approveIncoming({
+    required int hostId,
+    required int peerId,
+    required bool accepter,
+  });
+
+  /// Instantané des statistiques cumulées des sessions servies par l'hôte
+  /// [hostId] (entrées appliquées/refusées, débit ABR, octets…).
+  /// `encoderBackend` reste `null` (non exposé par la poignée d'hôte).
+  /// Miroir de `nd_ffi::unattended_stats`.
+  Future<SessionStatsDto> unattendedStats(int hostId);
+
+  /// Arrête l'hôte [hostId] et invalide son identifiant : réveille toute
+  /// approbation en attente (refus). Miroir de `nd_ffi::stop_unattended_host`.
+  Future<void> stopUnattendedHost(int hostId);
 }
