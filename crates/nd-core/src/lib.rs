@@ -7,24 +7,34 @@
 //! un canal d'entrées et des statistiques continues à un consommateur (future UI,
 //! voir `../../plan-technique/16-roadmap-planning.md`).
 
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nd_capture::{CaptureConfig, CapturedFrame, ScreenCapturer};
-use nd_codec::{CodecKind, DecodedFrame, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder};
+use nd_codec::{
+    CodecKind, ContentProfile, DecodedFrame, EncodedChunk, EncoderConfig, NetworkEstimate,
+    RateController, VideoDecoder, VideoEncoder,
+};
 use nd_crypto::{HandshakeRole, NoiseHandshake, NoiseSession, PeerFingerprint, SecureSession};
-use nd_features::Permissions;
+use nd_features::{Mp4Muxer, Permissions, RecordingMetadata};
 use nd_input::{InputInjector, MouseButton};
 use nd_proto::{
     ChannelKind, InputEvent, MonitorId, NdError, NovaId, ProtocolVersion, Reliability, Result,
 };
 use nd_transport::{ChannelHandle, PathEstimate, Transport};
 
+/// Établissement QUIC par ID via le rendez-vous (punch + repli relais).
+mod p2p;
 /// Orchestrateur de session réutilisable (threads + canaux). Voir [`SessionEngine`].
 mod session;
+/// Service hôte « accès non surveillé ». Voir [`UnattendedHost`].
+mod unattended;
 
-pub use session::{SessionEndpoint, SessionEngine, SessionHandle, SessionStats};
+pub use session::{SessionEndpoint, SessionEngine, SessionHandle, SessionOptions, SessionStats};
+pub use unattended::{UnattendedHost, UnattendedHostHandle};
 
 /// Rôle du poste local dans la session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +306,260 @@ impl HostPipeline {
             std::thread::sleep(Duration::from_millis(12));
         }
         Ok(envoyees)
+    }
+
+    /// Mode « flux continu **piloté** » : comme [`HostPipeline::run_streaming`],
+    /// enrichi des briques temps réel du plan 03/04/13 :
+    ///
+    /// * **ABR bout-en-bout** : toutes les [`HostStreamOptions::abr_period`]
+    ///   (~1 Hz), l'estimation du chemin ([`Transport::path_estimate`]) est
+    ///   convertie ([`NetworkEstimate::from_path`]) et intégrée par le
+    ///   [`RateController`], qui applique le débit du palier retenu à
+    ///   l'encodeur (`set_target_bitrate`). Les estimations sans mesure de
+    ///   débit (`estimated_bandwidth_kbps == 0`, chemin pas encore jaugé) sont
+    ///   ignorées pour ne pas plonger au plancher en début de session.
+    /// * **Encodage delta** (opt-in, voir [`HostStreamOptions::delta_mode`]) :
+    ///   les frames capturées sont passées telles quelles à l'encodeur — une
+    ///   frame sans région modifiée devient une *trame de répétition* quasi
+    ///   gratuite au lieu d'un ré-encodage plein cadre.
+    /// * **Enregistrement MP4** (opt-in) : chaque [`EncodedChunk`] non vide est
+    ///   poussé dans un [`Mp4Muxer`] ; le fichier est clos (**relisible**) en
+    ///   fin de flux. Une erreur d'écriture termine le flux en erreur (pas
+    ///   d'enregistrement silencieusement tronqué).
+    /// * **Observabilité** : `on_tick` est rappelé à chaque image envoyée avec
+    ///   l'instantané [`HostStreamTick`] (consigne ABR, palier, enregistrement).
+    ///
+    /// Une erreur d'envoi (pair déconnecté) termine la diffusion **sans**
+    /// erreur, comme [`HostPipeline::run_streaming`]. Renvoie le rapport de fin
+    /// de flux (le fichier d'enregistrement n'y figure que s'il a été clos avec
+    /// au moins une image ; un fichier resté vide est supprimé).
+    ///
+    /// # Errors
+    /// Erreur de capture, d'encodage ou d'enregistrement.
+    pub fn run_streaming_pilote(
+        &mut self,
+        stop: Arc<AtomicBool>,
+        options: HostStreamOptions,
+        mut on_tick: impl FnMut(HostStreamTick),
+    ) -> Result<HostStreamReport> {
+        self.encoder.set_delta_mode(options.delta_mode);
+        let mut regulateur: Option<RateController> = None;
+        let mut enregistreur: Option<EnregistreurMp4> = None;
+        let mut prochain_abr = Instant::now();
+        let mut debit_cible_kbps = 0u32;
+        let mut envoyees = 0u64;
+
+        while !stop.load(Ordering::Relaxed) {
+            let capturee = self.capturer.next_frame()?;
+            let image_fraiche = capturee.image.is_some();
+            if image_fraiche && !self.configured {
+                let base = EncoderConfig {
+                    kind: CodecKind::H264,
+                    width: capturee.width,
+                    height: capturee.height,
+                    target_bitrate_kbps: 8_000,
+                    max_fps: 60,
+                };
+                self.encoder.configure(base)?;
+                debit_cible_kbps = base.target_bitrate_kbps;
+                regulateur = options
+                    .abr_profile
+                    .map(|profil| RateController::new(base, profil));
+                if let Some(chemin) = &options.recording {
+                    enregistreur = Some(EnregistreurMp4::ouvrir(chemin, base)?);
+                }
+                self.configured = true;
+            }
+            if !self.configured {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            // Régulation ABR : échantillonnage périodique du chemin réseau.
+            if let Some(regulateur) = regulateur.as_mut() {
+                let maintenant = Instant::now();
+                if maintenant >= prochain_abr {
+                    prochain_abr = maintenant + options.abr_period;
+                    let chemin = self.transport.path_estimate();
+                    if chemin.estimated_bandwidth_kbps > 0 {
+                        let cible = regulateur.apply_network_estimate(
+                            self.encoder.as_mut(),
+                            NetworkEstimate::from_path(
+                                chemin.rtt_us,
+                                chemin.loss_ratio,
+                                chemin.estimated_bandwidth_kbps,
+                            ),
+                        );
+                        debit_cible_kbps = cible.target_bitrate_kbps;
+                    }
+                }
+            }
+
+            // Encodage : en mode delta, la frame capturée passe telle quelle
+            // (`dirty` fidèle exigé ; image absente = trame de répétition) ; en
+            // mode plein cadre, la dernière image disponible est ré-encodée.
+            let force_keyframe = self.sent == 0;
+            let chunk = if options.delta_mode {
+                let chunk = self.encoder.encode(&capturee, force_keyframe)?;
+                if image_fraiche {
+                    self.last_frame = Some(capturee);
+                }
+                chunk
+            } else {
+                if image_fraiche {
+                    self.last_frame = Some(capturee);
+                }
+                let frame = self
+                    .last_frame
+                    .as_ref()
+                    .expect("configuré implique une image capturée");
+                self.encoder.encode(frame, force_keyframe)?
+            };
+
+            // Enregistrement : les trames de répétition (données vides) ne
+            // portent aucune image — la précédente dure simplement plus longtemps.
+            if let Some(enregistreur) = enregistreur.as_mut() {
+                if !chunk.data.is_empty() {
+                    enregistreur.muxer.record_video_chunk(&chunk)?;
+                    enregistreur.frames += 1;
+                }
+            }
+
+            if self
+                .transport
+                .send(self.video_channel, chunk.data, Reliability::UnreliableFec)
+                .is_err()
+            {
+                break;
+            }
+            envoyees += 1;
+            self.sent += 1;
+            on_tick(HostStreamTick {
+                target_bitrate_kbps: debit_cible_kbps,
+                abr_level: regulateur
+                    .as_ref()
+                    .map_or(0, |r| u32::try_from(r.palier()).unwrap_or(u32::MAX)),
+                frames_recorded: enregistreur.as_ref().map_or(0, |e| e.frames),
+            });
+            std::thread::sleep(Duration::from_millis(12));
+        }
+
+        let (frames_enregistrees, chemin_clos) = match enregistreur {
+            Some(enregistreur) => enregistreur.clore()?,
+            None => (0, None),
+        };
+        Ok(HostStreamReport {
+            frames_sent: envoyees,
+            frames_recorded: frames_enregistrees,
+            recording_path: chemin_clos,
+        })
+    }
+}
+
+/// Options du flux hôte piloté ([`HostPipeline::run_streaming_pilote`]).
+#[derive(Debug, Clone)]
+pub struct HostStreamOptions {
+    /// Profil de contenu de l'échelle ABR ; `None` coupe la régulation (le
+    /// débit reste celui de la configuration de base).
+    pub abr_profile: Option<ContentProfile>,
+    /// Période d'échantillonnage du chemin réseau pour l'ABR (~1 Hz conseillé).
+    pub abr_period: Duration,
+    /// Encodage delta **opt-in** : n'activer que si la source de capture
+    /// renseigne fidèlement `CapturedFrame::dirty` (toutes les régions
+    /// modifiées, défilements inclus). Le capteur DXGI actuel ne rapporte pas
+    /// les régions déplacées (`GetFrameMoveRects`) : laisser à `false` avec la
+    /// capture d'écran réelle (voir `nd-codec::delta`).
+    pub delta_mode: bool,
+    /// Chemin d'un fichier MP4 à enregistrer (opt-in) : chaque image encodée y
+    /// est poussée, le fichier est clos et relisible en fin de flux.
+    pub recording: Option<PathBuf>,
+}
+
+impl Default for HostStreamOptions {
+    /// ABR actif (profil bureautique [`ContentProfile::Text`], ~1 Hz), delta
+    /// coupé, pas d'enregistrement.
+    fn default() -> Self {
+        HostStreamOptions {
+            abr_profile: Some(ContentProfile::Text),
+            abr_period: Duration::from_secs(1),
+            delta_mode: false,
+            recording: None,
+        }
+    }
+}
+
+/// Instantané poussé par [`HostPipeline::run_streaming_pilote`] à chaque image
+/// envoyée (observabilité : statistiques de session, sondes).
+#[derive(Debug, Clone, Copy)]
+pub struct HostStreamTick {
+    /// Débit cible actuellement appliqué à l'encodeur, en kbit/s.
+    pub target_bitrate_kbps: u32,
+    /// Palier ABR courant (0 = plein régime ; croît en dégradant).
+    pub abr_level: u32,
+    /// Images écrites dans l'enregistreur depuis le début du flux.
+    pub frames_recorded: u64,
+}
+
+/// Rapport de fin d'un flux hôte piloté ([`HostPipeline::run_streaming_pilote`]).
+#[derive(Debug, Clone)]
+pub struct HostStreamReport {
+    /// Images envoyées par cet appel.
+    pub frames_sent: u64,
+    /// Images écrites dans le fichier d'enregistrement.
+    pub frames_recorded: u64,
+    /// Fichier MP4 clos (relisible), si l'enregistrement était actif et qu'au
+    /// moins une image y a été écrite.
+    pub recording_path: Option<PathBuf>,
+}
+
+/// Enregistreur MP4 du flux hôte : muxeur ouvert paresseusement (les
+/// dimensions ne sont connues qu'à la première image capturée).
+struct EnregistreurMp4 {
+    muxer: Mp4Muxer<File>,
+    chemin: PathBuf,
+    frames: u64,
+}
+
+impl EnregistreurMp4 {
+    /// Ouvre le fichier et le muxeur avec les métadonnées de la configuration
+    /// d'encodage (dimensions réelles, cadence nominale).
+    fn ouvrir(chemin: &Path, cfg: EncoderConfig) -> Result<Self> {
+        let fichier = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(chemin)?;
+        let muxer = Mp4Muxer::new(
+            fichier,
+            RecordingMetadata {
+                width: cfg.width,
+                height: cfg.height,
+                fps: cfg.max_fps,
+                codec: "h264".to_owned(),
+                start_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |e| u64::try_from(e.as_millis()).unwrap_or(u64::MAX)),
+            },
+        )?;
+        Ok(Self {
+            muxer,
+            chemin: chemin.to_path_buf(),
+            frames: 0,
+        })
+    }
+
+    /// Clôt le fichier : `(images écrites, chemin du MP4 relisible)`. Un
+    /// enregistrement resté vide (aucune image) est supprimé plutôt que de
+    /// laisser un fichier non décodable.
+    fn clore(self) -> Result<(u64, Option<PathBuf>)> {
+        if self.frames == 0 {
+            drop(self.muxer);
+            let _ = std::fs::remove_file(&self.chemin);
+            return Ok((0, None));
+        }
+        self.muxer.finish()?;
+        Ok((self.frames, Some(self.chemin)))
     }
 }
 

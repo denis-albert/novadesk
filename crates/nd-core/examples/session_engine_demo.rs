@@ -80,7 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             role: SessionRole::Controlled,
             local_id: id_hote,
             peer_id: None,
-            permissions: Permissions::default(),
+            // Les permissions sont désormais appliquées côté contrôlé avant
+            // chaque injection : cette sonde injecte des mouvements souris, elle
+            // doit donc les demander (le défaut est l'observation seule).
+            permissions: Permissions::full(),
         },
         SessionEndpoint::Loopback { listener: ecouteur },
     )?;

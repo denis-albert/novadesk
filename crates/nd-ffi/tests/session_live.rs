@@ -37,6 +37,11 @@ fn conversion_stats_moteur_en_dto() {
         bytes_out: 2_048,
         frames_decoded: 42,
         inputs_applied: 6,
+        inputs_denied: 0,
+        target_bitrate_kbps: 0,
+        abr_level: 0,
+        frames_recorded: 0,
+        reconnects: 0,
     };
     let dto = SessionStatsDto::from(stats);
     // Le cœur mesure le fps en f32 ; le DTO l'expose en f64, sans perte.
