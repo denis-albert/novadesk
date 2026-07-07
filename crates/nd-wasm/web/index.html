@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NovaDesk — client web (nd-wasm)</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem; }
+      h1 { font-size: 1.1rem; margin: 0; }
+      .barre { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+      input { padding: 0.3rem 0.4rem; }
+      button { padding: 0.35rem 0.7rem; cursor: pointer; }
+      /* tabindex=0 : le canvas peut recevoir le focus clavier (capture des touches). */
+      #ecran {
+        width: 640px; height: 480px; max-width: 100%;
+        background: #111; border: 1px solid #555; outline: none;
+        image-rendering: pixelated;
+      }
+      #etat { font-variant-numeric: tabular-nums; opacity: 0.85; }
+      code { background: rgba(127,127,127,0.2); padding: 0 0.25rem; border-radius: 3px; }
+      .note { max-width: 640px; font-size: 0.85rem; opacity: 0.8; }
+    </style>
+  </head>
+  <body>
+    <h1>NovaDesk — client web de visualisation (contrôle sortant)</h1>
+
+    <div class="barre">
+      <button id="btn-motif">Démo motif (RGBA→canvas)</button>
+      <button id="btn-codec">Démo codec (decode→canvas)</button>
+    </div>
+
+    <div class="barre">
+      <input id="url" size="34" placeholder="https://relais.example:4433/wt" />
+      <input id="peer" size="12" placeholder="ID du pair" />
+      <input id="token" size="12" placeholder="jeton" />
+      <button id="btn-connect">Connecter</button>
+      <button id="btn-disconnect">Déconnecter</button>
+    </div>
+
+    <!-- Le canvas est la surface d'affichage ET la cible de capture des entrées. -->
+    <canvas id="ecran" width="640" height="480" tabindex="0"></canvas>
+
+    <div id="etat">Chargement du module wasm…</div>
+
+    <p class="note">
+      Le <b>décodage</b> (WebCodecs <code>VideoDecoder</code>) et le <b>transport</b>
+      (<code>WebTransport</code>) exigent un navigateur Chromium récent. « Démo codec »
+      encode un motif de test en H.264 avec le <code>VideoEncoder</code> du navigateur
+      puis le redécode et l'affiche — <b>preuve du chemin decode→canvas sans serveur</b>.
+      « Connecter » nécessite un <b>pont WebTransport</b> côté relais (hors périmètre de
+      cette crate). Construction du module : voir <code>web/build.sh</code>.
+    </p>
+
+    <script type="module">
+      // Généré par `wasm-pack build --target web` (voir web/build.sh) : dossier ./pkg/.
+      import init, { WebClient } from "./pkg/nd_wasm.js";
+
+      const etat = document.getElementById("etat");
+      let client = null;
+      let frames = 0;
+
+      async function demarrer() {
+        await init();
+        client = new WebClient("ecran");
+        etat.textContent = "Moteur " + client.versionMoteur() + " — prêt.";
+
+        // Callback appelé après chaque frame peinte : compteur simple.
+        client.setOnFrame((largeur, hauteur) => {
+          frames += 1;
+          etat.textContent =
+            "Frames affichées : " + frames + " (dernière " + largeur + "×" + hauteur + ")";
+        });
+
+        cablerEntrees(client);
+      }
+
+      // Redirige les événements DOM du canvas vers le client (sérialisation nd-proto).
+      function cablerEntrees(client) {
+        const cv = document.getElementById("ecran");
+        cv.addEventListener("mousemove", (e) => client.sendMouseMove(e.offsetX, e.offsetY));
+        cv.addEventListener("mousedown", (e) => { cv.focus(); client.sendMouseButton(e.button, true); });
+        cv.addEventListener("mouseup", (e) => client.sendMouseButton(e.button, false));
+        cv.addEventListener("contextmenu", (e) => e.preventDefault());
+        cv.addEventListener("wheel", (e) => { e.preventDefault(); client.sendScroll(e.deltaX, e.deltaY); }, { passive: false });
+        cv.addEventListener("keydown", (e) => { e.preventDefault(); client.sendKey(e.code, true); });
+        cv.addEventListener("keyup", (e) => { e.preventDefault(); client.sendKey(e.code, false); });
+      }
+
+      document.getElementById("btn-motif").onclick = () => client && client.demarrerDemoMotif();
+      document.getElementById("btn-codec").onclick = () => { frames = 0; client && client.demarrerDemoCodec(120); };
+      document.getElementById("btn-connect").onclick = () => {
+        if (!client) return;
+        const url = document.getElementById("url").value.trim();
+        const peer = document.getElementById("peer").value.trim();
+        const token = document.getElementById("token").value.trim();
+        if (!url) { etat.textContent = "Renseigner l'URL du pont WebTransport."; return; }
+        frames = 0;
+        client.connect(url, peer, token);
+        etat.textContent = "Connexion à " + url + "…";
+      };
+      document.getElementById("btn-disconnect").onclick = () => client && client.disconnect();
+
+      demarrer().catch((e) => { etat.textContent = "Échec du chargement : " + e; });
+    </script>
+  </body>
+</html>

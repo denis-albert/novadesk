@@ -1,0 +1,13 @@
+#!/bin/sh
+# prerm NovaDesk (.deb) : arrête et désactive le service avant retrait.
+set -e
+
+case "$1" in
+    remove|deconfigure|purge)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl disable --now novadesk.service >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Point d'entrée de l'AppImage NovaDesk : situe le bundle dans l'AppDir et lance
+# le binaire avec le bon chemin de bibliothèques.
+HERE="$(dirname "$(readlink -f "$0")")"
+export LD_LIBRARY_PATH="$HERE/usr/lib/novadesk/lib:${LD_LIBRARY_PATH:-}"
+exec "$HERE/usr/lib/novadesk/novadesk" "$@"

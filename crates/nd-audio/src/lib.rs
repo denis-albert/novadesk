@@ -30,7 +30,7 @@ pub use level::{dbfs, est_silence, peak, rms, LevelMeter, DBFS_PLANCHER};
 #[cfg(target_os = "linux")]
 pub use linux::{PulseLoopbackCapturer, PulseMicCapturer, PulsePlayer};
 #[cfg(target_os = "macos")]
-pub use macos::CoreAudioPlayer;
+pub use macos::{CoreAudioPlayer, SckSystemCapturer};
 pub use mixing::{mix, mix_into, soft_clip, Mixer, SEUIL_SOFT_CLIP};
 #[cfg(windows)]
 pub use win::WasapiLoopbackCapturer;
@@ -95,16 +95,17 @@ pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
     Ok(Box::new(linux::PulseLoopbackCapturer::new()?))
 }
 
-/// Crée un capteur de l'audio système (loopback). Pas d'API publique de
-/// loopback sur macOS avant ScreenCaptureKit (macOS ≥ 13) — limite documentée
-/// en tête de `src/macos.rs` ; l'intégration ScreenCaptureKit viendra avec la
-/// capture d'écran (plans 02/08).
+/// Crée un capteur de l'audio système (loopback).
+///
+/// macOS : capture **ScreenCaptureKit** (macOS ≥ 13) — `SCStream` audio sur
+/// l'écran principal (`capturesAudio`, 48 kHz stéréo, audio du process exclu),
+/// chaque `CMSampleBuffer` converti en PCM stéréo puis encodé en Opus (trames de
+/// 20 ms). Consentement « Enregistrement de l'écran » requis. Avant macOS 13,
+/// renvoie [`NdError::NotImplemented`] (repli périphérique virtuel tiers type
+/// BlackHole — voir `src/macos.rs`).
 #[cfg(target_os = "macos")]
 pub fn create_system_capturer() -> Result<Box<dyn AudioCapturer>> {
-    Err(NdError::NotImplemented(
-        "nd-audio::create_system_capturer — macOS : loopback via ScreenCaptureKit (≥ 13) à venir ; \
-         avant macOS 13 seul un périphérique virtuel tiers (BlackHole) le permet (voir src/macos.rs)",
-    ))
+    Ok(Box::new(macos::SckSystemCapturer::new()?))
 }
 
 /// Crée un capteur de l'audio système (loopback). Non implémenté sur cet OS.

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Installeur MSI NovaDesk (WiX Toolset v4) — app cliente : UI Flutter +
+  nd_ffi.dll + ressources, raccourcis, et service Windows d'accès non surveillé.
+
+  Build (sur machine Windows avec WiX v4 « dotnet tool install -g wix ») :
+      wix build packaging/windows/wix/NovaDesk.wxs -arch x64 \
+          -d StageDir=ui\build\windows\x64\runner\Release \
+          -ext WixToolset.UI.wixext \
+          -o dist\NovaDesk-0.1.0-x86_64.msi
+
+  Où StageDir = dossier de sortie du build Flutter release (novadesk.exe,
+  flutter_windows.dll, nd_ffi.dll, data\...). L'installeur est ensuite SIGNÉ
+  Authenticode par sign.ps1 (voir ../sign.ps1).
+
+  Vérifiable ici : bonne formation XML (namespaces WiX). NON vérifiable ici :
+  « wix build » (WiX absent + pas de sortie Flutter). Voir ../README.md.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="NovaDesk"
+           Manufacturer="Équipe NovaDesk"
+           Version="0.1.0"
+           UpgradeCode="9820A326-4BE2-40EC-9BE4-882D9AAA3E65"
+           Scope="perMachine"
+           Compressed="yes"
+           Language="1036"
+           Codepage="1252">
+
+    <!-- Remplacement transactionnel des versions antérieures (rollback MSI natif).
+         UpgradeCode STABLE : ne jamais le changer entre versions. -->
+    <MajorUpgrade DowngradeErrorMessage="Une version plus récente de [ProductName] est déjà installée." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Icône ARP (Programmes et fonctionnalités) : celle de l'exécutable. -->
+    <Icon Id="novadesk.exe" SourceFile="$(var.StageDir)\novadesk.exe" />
+    <Property Id="ARPPRODUCTICON" Value="novadesk.exe" />
+    <Property Id="ARPHELPLINK" Value="https://novadesk.example" />
+
+    <!-- Nom du service (surchargée en ligne de commande : SERVICENAME=…). -->
+    <Property Id="SERVICENAME" Value="novadesk-svc" />
+
+    <!-- Arborescence d'installation. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NovaDesk" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="NovaDesk" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- Fonctionnalité unique : exécutable + service + raccourcis + ressources. -->
+    <Feature Id="Complete" Title="NovaDesk" Level="1" AllowAbsent="no">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="ApplicationShortcuts" />
+      <ComponentGroupRef Id="RuntimeFiles" />
+    </Feature>
+
+    <!-- Exécutable principal + service Windows d'accès non surveillé. -->
+    <Component Id="MainExecutable" Directory="INSTALLFOLDER" Bitness="always64"
+               Guid="5DE3A869-3B9C-4EA3-ABDE-268CF518F2EC">
+      <File Id="novadesk.exe" Source="$(var.StageDir)\novadesk.exe" KeyPath="yes" />
+
+      <!-- Service « accès non surveillé » : LocalSystem (capture bureau
+           sécurisé/UAC, plan 07), démarrage MANUEL (dormant) — activé quand
+           l'utilisateur configure l'accès non surveillé (parité AnyDesk).
+           L'exécutable doit honorer son argument de service, passé ci-dessous
+           (câblage côté client, non encore livré : voir ../README.md). -->
+      <ServiceInstall Id="NovaDeskService"
+                      Name="[SERVICENAME]"
+                      DisplayName="NovaDesk (accès non surveillé)"
+                      Description="Service NovaDesk pour l'accès non surveillé (capture du bureau sécurisé)."
+                      Type="ownProcess"
+                      Start="demand"
+                      ErrorControl="normal"
+                      Account="LocalSystem"
+                      Arguments="--service"
+                      Vital="no" />
+      <ServiceControl Id="NovaDeskServiceControl"
+                      Name="[SERVICENAME]"
+                      Stop="both"
+                      Remove="uninstall"
+                      Wait="yes" />
+    </Component>
+
+    <!-- Raccourcis menu Démarrer + bureau (nettoyés à la désinstallation). -->
+    <Component Id="ApplicationShortcuts" Directory="AppShortcutFolder"
+               Guid="34CC1E55-989D-4D7B-9C5C-5598CCF7D2E2">
+      <Shortcut Id="StartMenuShortcut" Name="NovaDesk"
+                Target="[INSTALLFOLDER]novadesk.exe" WorkingDirectory="INSTALLFOLDER" />
+      <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="NovaDesk"
+                Target="[INSTALLFOLDER]novadesk.exe" WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveAppShortcutFolder" Directory="AppShortcutFolder" On="uninstall" />
+      <RegistryValue Root="HKMU" Key="Software\NovaDesk" Name="shortcuts"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- Ressources runtime (flutter_windows.dll, nd_ffi.dll, data\**, plugins) :
+         moisson automatique du dossier de sortie Flutter, sauf l'exécutable
+         (déjà porté par MainExecutable). -->
+    <ComponentGroup Id="RuntimeFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.StageDir)\**" Exclude="$(var.StageDir)\novadesk.exe" />
+    </ComponentGroup>
+
+    <!-- Interface d'installation (dossier cible + EULA). Nécessite l'extension
+         WixToolset.UI.wixext au build. Pour une pose 100 % silencieuse
+         (entreprise), « msiexec /qn » ignore l'UI. -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="packaging/windows/wix/License.rtf" />
+
+  </Package>
+</Wix>

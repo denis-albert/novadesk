@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon (root) NovaDesk : accès non surveillé. Posé par le .pkg dans
+  /Library/LaunchDaemons/ et chargé par le postinstall. Tourne en root pour la
+  capture au niveau de la fenêtre de connexion (plan 15 §15.3.2).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.novadesk.NovaDesk</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/NovaDesk.app/Contents/MacOS/novadesk</string>
+        <string>--service</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/novadesk.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/novadesk.err.log</string>
+</dict>
+</plist>

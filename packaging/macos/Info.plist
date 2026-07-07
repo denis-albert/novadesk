@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  Info.plist de RÉFÉRENCE pour le bundle NovaDesk.app (macOS).
+  À fusionner dans le Info.plist généré par Flutter (ui/macos/Runner/Info.plist,
+  non présent sur ce poste). Les clés « *UsageDescription » sont OBLIGATOIRES :
+  sans elles, macOS tue l'app à la première demande d'accès (micro), et les
+  invites TCC n'ont pas de texte.
+  Rappel : la CAPTURE D'ÉCRAN (Screen Recording) et le CONTRÔLE (Accessibility)
+  ne se déclarent PAS ici — ce sont des autorisations TCC accordées par
+  l'utilisateur dans Réglages Système › Confidentialité et sécurité.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>NovaDesk</string>
+    <key>CFBundleDisplayName</key>
+    <string>NovaDesk</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.novadesk.NovaDesk</string>
+    <key>CFBundleExecutable</key>
+    <string>novadesk</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+
+    <!-- Capture audio de la session distante (WASAPI/CoreAudio, plan 08). -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>NovaDesk transmet le son de la session de bureau à distance.</string>
+    <!-- Webcam, si un jour partagée dans la session. -->
+    <key>NSCameraUsageDescription</key>
+    <string>NovaDesk peut partager la caméra pendant une session, si vous l'autorisez.</string>
+
+    <!-- Note (non-clé) : Screen Recording et Accessibility sont accordés via TCC
+         au premier usage ; l'app doit guider l'utilisateur vers Réglages Système. -->
+</dict>
+</plist>

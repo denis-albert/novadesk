@@ -1,0 +1,16 @@
+#!/bin/bash
+# postinstall du .pkg NovaDesk : installe et charge le LaunchDaemon d'accès non
+# surveillé. Exécuté en root par l'Installeur macOS.
+set -e
+
+PLIST="/Library/LaunchDaemons/com.novadesk.NovaDesk.plist"
+
+# Appartenance/permissions exigées par launchd (sinon refus de chargement).
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+# Recharge idempotente : on décharge une éventuelle instance puis on (re)charge.
+launchctl bootout system "$PLIST" 2>/dev/null || true
+launchctl bootstrap system "$PLIST"
+
+exit 0

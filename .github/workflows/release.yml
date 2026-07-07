@@ -1,23 +1,15 @@
-# Release NovaDesk — squelette de la chaîne du plan 15
-# (../plan-technique/15-deploiement-mise-a-jour.md).
+# Release NovaDesk — chaîne du plan 15 (../plan-technique/15-deploiement-mise-a-jour.md).
 #
-# Déclenché par un tag `vX.Y.Z`. Construit le workspace en `--release` sur les
-# trois OS de bureau, rassemble les binaires SERVEUR et publie un brouillon de
-# release GitHub avec les archives par plateforme.
+# Déclenché par un tag `vX.Y.Z`. Trois volets :
+#   1. `build`         — binaires SERVEUR bruts (3 OS), inchangé (régression zéro).
+#   2. `installeurs`   — installeurs CLIENT signés par OS (MSI/DMG+PKG/deb+AppImage+rpm).
+#   3. `metadonnees-maj` — manifestes de MAJ signés Ed25519 (packaging/update).
+#   4. `publier`       — un brouillon de release GitHub réunissant tout ce qui existe.
 #
-# CE QUI N'EST PAS FAIT ICI (volontairement — voir plan 15 et packaging/README.md) :
-# - Packaging installateurs : MSI/MSIX (WiX v4 via cargo-wix), .dmg/.pkg macOS,
-#   .deb/.rpm/AppImage/Flatpak Linux. Le client de bureau (UI Flutter + service
-#   système, plans 10 et 15) n'a pas encore de binaire installable.
-# - Signature de code (exige des secrets/certificats absents de ce dépôt) :
-#     Windows : Authenticode EV via HSM —
-#               `signtool sign /fd SHA256 /tr <TSA> /td SHA256 …`
-#     macOS   : `codesign --options runtime` (Hardened Runtime, Developer ID),
-#               notarisation `xcrun notarytool submit --wait`,
-#               agrafage `xcrun stapler staple`
-#     Linux   : dépôts apt/dnf signés GPG
-# - Chaîne de mise à jour applicative : métadonnées TUF signées Ed25519
-#   (plan 15 §15.6.4), rollout progressif (canari) et rollback automatique.
+# Les volets 2 et 3 exigent la sortie du runner Flutter (ui/windows|macos|linux/) et
+# des SECRETS de signature (certificats, graine TUF) : ils sont donc DÉSACTIVÉS par
+# défaut et s'activent en posant la variable de dépôt NOVADESK_PACKAGING_ENABLED=true.
+# Ainsi le workflow reste valide et le volet serveur ne casse jamais.
 
 name: Release
 
@@ -89,9 +81,159 @@ jobs:
           name: novadesk-server-${{ matrix.plateforme }}
           path: dist/
 
+  # ---------------------------------------------------------------------------
+  # Installeurs CLIENT signés (désactivés tant que NOVADESK_PACKAGING_ENABLED
+  # n'est pas « true » : nécessite le runner Flutter + secrets de signature).
+  # ---------------------------------------------------------------------------
+  installeurs:
+    name: Installeur ${{ matrix.plateforme }}
+    if: vars.NOVADESK_PACKAGING_ENABLED == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            plateforme: windows-x86_64
+          - os: macos-latest
+            plateforme: macos-universal
+          - os: ubuntu-latest
+            plateforme: linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dépendances système (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake nasm libasound2-dev libpipewire-0.3-dev \
+            libgtk-3-dev ninja-build
+
+      - name: Toolchain Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      # Bibliothèque de pont (nd_ffi.dll / .dylib / .so) chargée par l'UI.
+      - name: Build nd-ffi (cdylib)
+        run: cargo build -p nd-ffi --release
+
+      # Construit le client Flutter puis empaquette. NB : requiert les dossiers
+      # runner desktop (ui/windows|macos|linux/), non présents à ce stade.
+      - name: Build + paquet Windows (MSI)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NOVADESK_SIGN_PFX_BASE64: ${{ secrets.NOVADESK_SIGN_PFX_BASE64 }}
+          NOVADESK_SIGN_PFX_PASSWORD: ${{ secrets.NOVADESK_SIGN_PFX_PASSWORD }}
+        run: |
+          dotnet tool install -g wix
+          wix extension add -g WixToolset.UI.wixext
+          flutter config --enable-windows-desktop
+          flutter build windows --release
+          Copy-Item target/release/nd_ffi.dll ui/build/windows/x64/runner/Release/ -Force
+          New-Item -ItemType Directory -Force dist | Out-Null
+          wix build packaging/windows/wix/NovaDesk.wxs -arch x64 `
+            -d StageDir=ui/build/windows/x64/runner/Release `
+            -ext WixToolset.UI.wixext `
+            -o dist/NovaDesk-windows-x86_64.msi
+          ./packaging/windows/sign.ps1 -Path dist/NovaDesk-windows-x86_64.msi
+
+      - name: Build + paquet macOS (DMG + PKG)
+        if: runner.os == 'macOS'
+        env:
+          NOVADESK_MAC_DEV_ID_APP: ${{ secrets.NOVADESK_MAC_DEV_ID_APP }}
+          NOVADESK_MAC_DEV_ID_INSTALLER: ${{ secrets.NOVADESK_MAC_DEV_ID_INSTALLER }}
+          NOVADESK_NOTARY_PROFILE: ${{ secrets.NOVADESK_NOTARY_PROFILE }}
+          NOVADESK_APPLE_ID: ${{ secrets.NOVADESK_APPLE_ID }}
+          NOVADESK_TEAM_ID: ${{ secrets.NOVADESK_TEAM_ID }}
+          NOVADESK_APP_PASSWORD: ${{ secrets.NOVADESK_APP_PASSWORD }}
+        run: |
+          flutter config --enable-macos-desktop
+          flutter build macos --release
+          ./packaging/macos/codesign-notarize.sh
+          ./packaging/macos/build-pkg.sh
+
+      - name: Build + paquets Linux (deb + AppImage + rpm)
+        if: runner.os == 'Linux'
+        run: |
+          flutter config --enable-linux-desktop
+          flutter build linux --release
+          packaging/linux/deb/build-deb.sh ui/build/linux/x64/release/bundle
+          packaging/linux/appimage/build-appimage.sh ui/build/linux/x64/release/bundle
+          packaging/linux/rpm/build-rpm.sh ui/build/linux/x64/release/bundle dist || \
+            echo "rpmbuild indisponible sur ubuntu-latest — construire les .rpm sur un runner Fedora."
+
+      - name: Publier les installeurs (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: novadesk-installeur-${{ matrix.plateforme }}
+          path: dist/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Métadonnées de mise à jour signées (canaux stable/beta), plan 15 §15.6.4.
+  # ---------------------------------------------------------------------------
+  metadonnees-maj:
+    name: Métadonnées de MAJ signées
+    if: vars.NOVADESK_PACKAGING_ENABLED == 'true'
+    needs: installeurs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dépendances
+        run: pip install cryptography
+
+      - name: Récupérer les installeurs
+        uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+
+      # La graine du rôle « targets » vient d'un secret CI ; le corps du manifeste
+      # (URL + sha256 CALCULÉS sur les installeurs signés) serait généré ici, puis
+      # signé. On illustre la SIGNATURE ; le calcul des sha256 réels est un TODO
+      # documenté (packaging/update/README.md).
+      - name: Signer le manifeste stable
+        env:
+          NOVADESK_TUF_TARGETS_SEED_HEX: ${{ secrets.NOVADESK_TUF_TARGETS_SEED_HEX }}
+        run: |
+          if [ -z "${NOVADESK_TUF_TARGETS_SEED_HEX:-}" ]; then
+            echo "Secret NOVADESK_TUF_TARGETS_SEED_HEX absent — signature ignorée." >&2
+            exit 0
+          fi
+          echo "$NOVADESK_TUF_TARGETS_SEED_HEX" > targets.seed.hex
+          python packaging/update/sign_manifest.py sign \
+            --key targets.seed.hex \
+            --in packaging/update/tuf/manifest.stable.json \
+            --out dist-maj/manifest.stable.json
+          shred -u targets.seed.hex
+          cp packaging/update/tuf/root.json dist-maj/root.json
+
+      - name: Publier les métadonnées (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: novadesk-maj
+          path: dist-maj/
+          if-no-files-found: warn
+
   publier:
     name: Brouillon de release GitHub
-    needs: build
+    needs: [build, installeurs, metadonnees-maj]
+    # S'exécute dès que le build serveur a réussi, même si les volets packaging
+    # sont désactivés/ignorés (garantit l'ancien comportement, régression zéro).
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Télécharger les artefacts

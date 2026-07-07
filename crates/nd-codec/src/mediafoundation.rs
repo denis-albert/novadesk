@@ -9,9 +9,11 @@
 //! `METransformHaveOutput`, déverrouillage `MF_TRANSFORM_ASYNC_UNLOCK`, boucle
 //! `IMFMediaEventGenerator`) et demandent une machinerie nettement plus lourde pour
 //! un résultat identique côté API. Le pipeline synchrone ci-dessous
-//! (`ProcessInput`/`ProcessOutput`) est fiable et suffit à valider le flux ; le
-//! passage au MFT matériel (RTX 4080 → NVENC) se fera derrière le même trait
-//! [`VideoEncoder`] sans changer les appelants (voir plan 03/16).
+//! (`ProcessInput`/`ProcessOutput`) est fiable et suffit à valider le flux ; le MFT
+//! **matériel asynchrone** (RTX 4080 → NVENC) est implémenté dans le module frère
+//! `nvenc`, derrière le même trait [`VideoEncoder`] — le présent module reste le
+//! **repli logiciel** et fournit les briques communes (`pub(crate)`) : conversion
+//! NV12, garde d'initialisation MF, construction d'échantillons, tirage de sortie.
 //!
 //! ## Pipeline par frame
 //!
@@ -51,13 +53,13 @@ use crate::delta::{aire_totale, rects_pairs_bornes, RectPair, SuiviDelta};
 use crate::{CodecCaps, CodecKind, EncodedChunk, EncoderConfig, VideoEncoder};
 
 /// Convertit une erreur `windows` en `NdError::Codec` avec un contexte lisible.
-fn mf_err(quoi: &str, e: windows::core::Error) -> NdError {
+pub(crate) fn mf_err(quoi: &str, e: windows::core::Error) -> NdError {
     NdError::Codec(format!("Media Foundation, {quoi} : {e}"))
 }
 
 /// Emballe deux `u32` en un `u64` (convention MF pour `MF_MT_FRAME_SIZE`
 /// — largeur en poids fort — et `MF_MT_FRAME_RATE` — numérateur en poids fort).
-fn emballer_u64(haut: u32, bas: u32) -> u64 {
+pub(crate) fn emballer_u64(haut: u32, bas: u32) -> u64 {
     (u64::from(haut) << 32) | u64::from(bas)
 }
 
@@ -69,10 +71,10 @@ fn emballer_u64(haut: u32, bas: u32) -> u64 {
 /// être appelé sur le thread initialisateur, or l'encodeur est `Send` et peut être
 /// libéré ailleurs. Laisser COM initialisé pour la durée de vie du thread de travail
 /// est la pratique recommandée et sans fuite notable.
-struct MfRuntime;
+pub(crate) struct MfRuntime;
 
 impl MfRuntime {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         // SAFETY : appel FFI d'initialisation ; MFSTARTUP_NOSOCKET suffit (pas de
         // fonctionnalités réseau MF). Apparié à MFShutdown dans Drop.
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }.map_err(|e| mf_err("MFStartup", e))?;
@@ -91,7 +93,7 @@ impl Drop for MfRuntime {
 ///
 /// `S_OK`/`S_FALSE` : initialisé (on ne décompte pas, voir [`MfRuntime`]).
 /// `RPC_E_CHANGED_MODE` : le thread est déjà en STA — COM est utilisable tel quel.
-fn initialiser_com() -> Result<()> {
+pub(crate) fn initialiser_com() -> Result<()> {
     // SAFETY : appel FFI standard, sans paramètre réservé.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_err() && hr != RPC_E_CHANGED_MODE {
@@ -108,7 +110,7 @@ fn initialiser_com() -> Result<()> {
 /// NV12 : plan Y (`w*h` octets) suivi du plan UV entrelacé (`w*h/2` octets), chroma
 /// sous-échantillonnée 2×2 (moyenne du bloc). `w` et `h` doivent être pairs.
 /// Chemin scalaire ; SIMD/conversion GPU = optimisation future (plan 03).
-fn bgra_vers_nv12(bgra: &[u8], stride: usize, w: usize, h: usize, nv12: &mut Vec<u8>) {
+pub(crate) fn bgra_vers_nv12(bgra: &[u8], stride: usize, w: usize, h: usize, nv12: &mut Vec<u8>) {
     nv12.clear();
     nv12.resize(w * h + w * h / 2, 0);
     bgra_vers_nv12_rect(bgra, stride, w, h, nv12, RectPair::plein(w, h));
@@ -118,7 +120,7 @@ fn bgra_vers_nv12(bgra: &[u8], stride: usize, w: usize, h: usize, nv12: &mut Vec
 /// BGRA vers le tampon NV12 persistant `nv12` (déjà dimensionné à `w*h*3/2`).
 /// C'est le cœur de la **conversion partielle** du mode delta : seule la surface
 /// annoncée modifiée est reconvertie, le reste du plan NV12 est conservé tel quel.
-fn bgra_vers_nv12_rect(
+pub(crate) fn bgra_vers_nv12_rect(
     bgra: &[u8],
     stride: usize,
     w: usize,
@@ -229,108 +231,125 @@ impl MediaFoundationEncoder {
     fn creer_sample_nv12(&mut self) -> Result<IMFSample> {
         let horodatage = self.frames_soumises as i64 * self.duree_frame_100ns;
         self.frames_soumises += 1;
-
-        // SAFETY : appels FFI de construction ; `len` est la taille exacte allouée,
-        // le Lock/Unlock encadre strictement la copie dans le tampon MF.
-        unsafe {
-            let len = self.nv12.len() as u32;
-            let tampon =
-                MFCreateMemoryBuffer(len).map_err(|e| mf_err("MFCreateMemoryBuffer", e))?;
-            let mut ptr: *mut u8 = std::ptr::null_mut();
-            tampon
-                .Lock(&mut ptr, None, None)
-                .map_err(|e| mf_err("IMFMediaBuffer::Lock", e))?;
-            std::ptr::copy_nonoverlapping(self.nv12.as_ptr(), ptr, self.nv12.len());
-            tampon
-                .Unlock()
-                .map_err(|e| mf_err("IMFMediaBuffer::Unlock", e))?;
-            tampon
-                .SetCurrentLength(len)
-                .map_err(|e| mf_err("SetCurrentLength", e))?;
-
-            let sample = MFCreateSample().map_err(|e| mf_err("MFCreateSample", e))?;
-            sample
-                .AddBuffer(&tampon)
-                .map_err(|e| mf_err("IMFSample::AddBuffer", e))?;
-            sample
-                .SetSampleTime(horodatage)
-                .map_err(|e| mf_err("SetSampleTime", e))?;
-            sample
-                .SetSampleDuration(self.duree_frame_100ns)
-                .map_err(|e| mf_err("SetSampleDuration", e))?;
-            Ok(sample)
-        }
+        creer_sample_nv12_depuis(&self.nv12, horodatage, self.duree_frame_100ns)
     }
+}
 
-    /// Tente de tirer un échantillon encodé du MFT.
-    ///
-    /// `Ok(None)` : le MFT demande plus d'entrée (`MF_E_TRANSFORM_NEED_MORE_INPUT`).
-    /// Un changement de type de sortie (`MF_E_TRANSFORM_STREAM_CHANGE`) est
-    /// renégocié sur place puis l'appel est retenté.
-    fn tirer_sortie(&mut self, mft: &IMFTransform) -> Result<Option<(Vec<u8>, bool)>> {
-        loop {
-            // Échantillon de sortie : alloué par nous, sauf si le MFT fournit le sien.
-            let notre_sample = if self.fournit_echantillons {
-                None
-            } else {
-                // SAFETY : construction d'un sample + tampon de la taille conseillée.
-                unsafe {
-                    let tampon = MFCreateMemoryBuffer(self.taille_sortie as u32)
-                        .map_err(|e| mf_err("MFCreateMemoryBuffer (sortie)", e))?;
-                    let sample = MFCreateSample().map_err(|e| mf_err("MFCreateSample", e))?;
-                    sample
-                        .AddBuffer(&tampon)
-                        .map_err(|e| mf_err("IMFSample::AddBuffer", e))?;
-                    Some(sample)
-                }
-            };
+/// Construit un `IMFSample` portant une copie du tampon NV12 `nv12`, horodaté
+/// `horodatage_100ns` et de durée `duree_100ns` (unités MF de 100 ns). Brique
+/// commune aux backends MFT synchrone (ce module) et matériel asynchrone (`nvenc`).
+pub(crate) fn creer_sample_nv12_depuis(
+    nv12: &[u8],
+    horodatage_100ns: i64,
+    duree_100ns: i64,
+) -> Result<IMFSample> {
+    // SAFETY : appels FFI de construction ; `len` est la taille exacte allouée,
+    // le Lock/Unlock encadre strictement la copie dans le tampon MF.
+    unsafe {
+        let len = nv12.len() as u32;
+        let tampon = MFCreateMemoryBuffer(len).map_err(|e| mf_err("MFCreateMemoryBuffer", e))?;
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        tampon
+            .Lock(&mut ptr, None, None)
+            .map_err(|e| mf_err("IMFMediaBuffer::Lock", e))?;
+        std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
+        tampon
+            .Unlock()
+            .map_err(|e| mf_err("IMFMediaBuffer::Unlock", e))?;
+        tampon
+            .SetCurrentLength(len)
+            .map_err(|e| mf_err("SetCurrentLength", e))?;
 
-            let mut sorties = [MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                pSample: ManuallyDrop::new(notre_sample.clone()),
-                dwStatus: 0,
-                pEvents: ManuallyDrop::new(None),
-            }];
-            let mut statut = 0u32;
-            // SAFETY : `sorties` vit jusqu'après l'appel ; les champs ManuallyDrop
-            // sont récupérés/libérés juste en dessous quoi qu'il arrive.
-            let res = unsafe { mft.ProcessOutput(0, &mut sorties, &mut statut) };
+        let sample = MFCreateSample().map_err(|e| mf_err("MFCreateSample", e))?;
+        sample
+            .AddBuffer(&tampon)
+            .map_err(|e| mf_err("IMFSample::AddBuffer", e))?;
+        sample
+            .SetSampleTime(horodatage_100ns)
+            .map_err(|e| mf_err("SetSampleTime", e))?;
+        sample
+            .SetSampleDuration(duree_100ns)
+            .map_err(|e| mf_err("SetSampleDuration", e))?;
+        Ok(sample)
+    }
+}
 
-            // Reprend la propriété des COM placés/écrits dans la struct FFI pour ne
-            // rien fuiter (le sample fourni par le MFT arrive par ce canal).
-            // SAFETY : ProcessOutput est terminé ; ces champs ne sont plus relus.
-            let sample_sorti = unsafe { ManuallyDrop::take(&mut sorties[0].pSample) };
-            // SAFETY : idem — libère la collection d'événements éventuelle.
-            drop(unsafe { ManuallyDrop::take(&mut sorties[0].pEvents) });
-
-            match res {
-                Ok(()) => {
-                    let sample = sample_sorti.or(notre_sample).ok_or_else(|| {
-                        NdError::Codec("Media Foundation : ProcessOutput sans échantillon".into())
-                    })?;
-                    return Ok(Some(lire_sample_encode(&sample)?));
-                }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
-                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    // Renégociation du type de sortie (rare pour un encodeur, mais
-                    // requis par le contrat MFT), puis nouvel essai.
-                    // SAFETY : appels FFI ; le type retourné est appliqué tel quel.
-                    unsafe {
-                        let t = mft
-                            .GetOutputAvailableType(0, 0)
-                            .map_err(|e| mf_err("GetOutputAvailableType", e))?;
-                        mft.SetOutputType(0, &t, 0)
-                            .map_err(|e| mf_err("SetOutputType (renégociation)", e))?;
-                    }
-                }
-                Err(e) => return Err(mf_err("ProcessOutput", e)),
+/// Tente de tirer un échantillon encodé du flux de sortie `id_flux_sortie` d'un MFT
+/// (brique commune : backend synchrone de ce module et backend matériel `nvenc`).
+///
+/// `Ok(None)` : le MFT demande plus d'entrée (`MF_E_TRANSFORM_NEED_MORE_INPUT`).
+/// Un changement de type de sortie (`MF_E_TRANSFORM_STREAM_CHANGE`) est
+/// renégocié sur place puis l'appel est retenté. Si `fournit_echantillons` est
+/// faux, un échantillon de `taille_sortie` octets est alloué pour recevoir la
+/// sortie ; sinon le MFT fournit le sien (cas des MFT matériels).
+pub(crate) fn tirer_sortie_mft(
+    mft: &IMFTransform,
+    id_flux_sortie: u32,
+    fournit_echantillons: bool,
+    taille_sortie: usize,
+) -> Result<Option<(Vec<u8>, bool)>> {
+    loop {
+        // Échantillon de sortie : alloué par nous, sauf si le MFT fournit le sien.
+        let notre_sample = if fournit_echantillons {
+            None
+        } else {
+            // SAFETY : construction d'un sample + tampon de la taille conseillée.
+            unsafe {
+                let tampon = MFCreateMemoryBuffer(taille_sortie as u32)
+                    .map_err(|e| mf_err("MFCreateMemoryBuffer (sortie)", e))?;
+                let sample = MFCreateSample().map_err(|e| mf_err("MFCreateSample", e))?;
+                sample
+                    .AddBuffer(&tampon)
+                    .map_err(|e| mf_err("IMFSample::AddBuffer", e))?;
+                Some(sample)
             }
+        };
+
+        let mut sorties = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: id_flux_sortie,
+            pSample: ManuallyDrop::new(notre_sample.clone()),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut statut = 0u32;
+        // SAFETY : `sorties` vit jusqu'après l'appel ; les champs ManuallyDrop
+        // sont récupérés/libérés juste en dessous quoi qu'il arrive.
+        let res = unsafe { mft.ProcessOutput(0, &mut sorties, &mut statut) };
+
+        // Reprend la propriété des COM placés/écrits dans la struct FFI pour ne
+        // rien fuiter (le sample fourni par le MFT arrive par ce canal).
+        // SAFETY : ProcessOutput est terminé ; ces champs ne sont plus relus.
+        let sample_sorti = unsafe { ManuallyDrop::take(&mut sorties[0].pSample) };
+        // SAFETY : idem — libère la collection d'événements éventuelle.
+        drop(unsafe { ManuallyDrop::take(&mut sorties[0].pEvents) });
+
+        match res {
+            Ok(()) => {
+                let sample = sample_sorti.or(notre_sample).ok_or_else(|| {
+                    NdError::Codec("Media Foundation : ProcessOutput sans échantillon".into())
+                })?;
+                return Ok(Some(lire_sample_encode(&sample)?));
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                // Renégociation du type de sortie (rare pour un encodeur, mais
+                // requis par le contrat MFT), puis nouvel essai.
+                // SAFETY : appels FFI ; le type retourné est appliqué tel quel.
+                unsafe {
+                    let t = mft
+                        .GetOutputAvailableType(id_flux_sortie, 0)
+                        .map_err(|e| mf_err("GetOutputAvailableType", e))?;
+                    mft.SetOutputType(id_flux_sortie, &t, 0)
+                        .map_err(|e| mf_err("SetOutputType (renégociation)", e))?;
+                }
+            }
+            Err(e) => return Err(mf_err("ProcessOutput", e)),
         }
     }
 }
 
 /// Extrait les octets NAL (Annex B) et l'indicateur d'image-clé d'un échantillon.
-fn lire_sample_encode(sample: &IMFSample) -> Result<(Vec<u8>, bool)> {
+pub(crate) fn lire_sample_encode(sample: &IMFSample) -> Result<(Vec<u8>, bool)> {
     // SAFETY : lectures FFI encadrées ; `ptr` est valide pour `len` octets entre
     // Lock et Unlock, et la copie est faite avant Unlock.
     unsafe {
@@ -587,7 +606,9 @@ impl VideoEncoder for MediaFoundationEncoder {
         // restituée dans l'ordre : le flux H.264 reste valide.
         let mut tentatives = 0u32;
         let (donnees, image_cle) = loop {
-            if let Some(sortie) = self.tirer_sortie(&mft)? {
+            if let Some(sortie) =
+                tirer_sortie_mft(&mft, 0, self.fournit_echantillons, self.taille_sortie)?
+            {
                 break sortie;
             }
             tentatives += 1;
@@ -635,6 +656,12 @@ impl VideoEncoder for MediaFoundationEncoder {
 
     fn set_delta_mode(&mut self, actif: bool) {
         self.suivi.set_actif(actif);
+    }
+
+    fn nom_backend(&self) -> &str {
+        // Nom convivial officiel du MFT `CLSID_MSH264EncoderMFT` — logiciel,
+        // annoncé tel quel (voir doc de module : ce backend est le repli).
+        "H264 Encoder MFT (Microsoft, logiciel)"
     }
 }
 

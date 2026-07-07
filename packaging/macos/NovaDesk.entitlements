@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  Entitlements du Hardened Runtime pour NovaDesk.app (requis à la notarisation).
+  Signature : codesign avec l'option runtime et ce fichier d'entitlements
+  (voir codesign-notarize.sh pour la commande exacte).
+
+  Choix pour un bureau à distance :
+   - audio-input : capture du son de session (le micro reste gated TCC) ;
+   - apple-events : piloter d'autres apps / injecter des événements de haut niveau ;
+   - disable-library-validation : charger nd_ffi.dylib et les plugins Flutter
+     signés par une autre autorité que l'app (sinon rejet au chargement).
+  NB : la capture d'écran (ScreenCaptureKit) et l'injection clavier/souris
+  (CGEvent) NE sont PAS des entitlements — elles passent par les autorisations
+  TCC « Enregistrement de l'écran » et « Accessibilité », accordées par
+  l'utilisateur. Aucune clé sandbox ici : l'app de bureau à distance a besoin
+  d'un accès système hors bac à sable (distribution Developer ID, hors App Store).
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

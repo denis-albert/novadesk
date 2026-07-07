@@ -1,0 +1,131 @@
+# Orchestration des 4 serveurs NovaDesk (comble l'absence d'orchestration, tâche 4).
+#
+# Un seul `docker compose up --build` :
+#   1. construit l'image commune (Dockerfile multi-étapes) ;
+#   2. démarre nd-api, qui génère l'autorité Ed25519 et PUBLIE sa clé publique
+#      dans le volume partagé `nd-authority` ;
+#   3. démarre nd-rendezvous et nd-relay, qui ATTENDENT puis LISENT cette clé
+#      (ils refusent de s'ouvrir sans elle) ;
+#   4. démarre nd-accounts (indépendant, persistance redb dédiée).
+#
+# Réseau interne `novadesk` + volumes de persistance nommés. Aucune valeur
+# secrète en dur : les secrets (compte racine, secret comptes, OIDC) passent par
+# l'environnement (voir README et le fichier .env d'exemple).
+name: novadesk
+
+# Fabrique commune : construit depuis la RACINE du dépôt (workspace complet).
+x-novadesk-build: &nd-build
+  context: ../..
+  dockerfile: packaging/server/Dockerfile
+
+# Réglages partagés par les 4 services (image unique construite une fois).
+x-commun: &commun
+  image: novadesk-servers:local
+  build: *nd-build
+  restart: unless-stopped
+  init: true
+  networks: [novadesk]
+
+services:
+  nd-api:
+    <<: *commun
+    container_name: novadesk-api
+    entrypoint: ["/usr/local/bin/entrypoint-api.sh"]
+    environment:
+      ND_API_ADDR: "0.0.0.0:9300"
+      ND_API_STATE: "/data/etat.json"
+      ND_AUTHORITY_SEED: "/authority/autorite.cle"
+      ND_AUTHORITY_PUB: "/authority/autorite.pub"
+      # Compte opérateur qui amorce le RBAC (vide = administration verrouillée).
+      ND_COMPTE_RACINE: "${ND_COMPTE_RACINE:-}"
+    ports:
+      - "9300:9300"
+    volumes:
+      - nd-authority:/authority
+      - nd-api-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9300"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  nd-rendezvous:
+    <<: *commun
+    container_name: novadesk-rendezvous
+    entrypoint: ["/usr/local/bin/entrypoint-rendezvous.sh"]
+    environment:
+      ND_RDV_ADDR: "0.0.0.0:9000"
+      ND_AUTHORITY_PUB: "/authority/autorite.pub"
+    ports:
+      - "9000:9000"
+    volumes:
+      # Lecture seule : le rendez-vous ne fait que consommer la clé.
+      - nd-authority:/authority:ro
+    depends_on:
+      nd-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+
+  nd-relay:
+    <<: *commun
+    container_name: novadesk-relay
+    entrypoint: ["/usr/local/bin/entrypoint-relay.sh"]
+    environment:
+      ND_RELAY_ADDR: "0.0.0.0:9100"
+      ND_AUTHORITY_PUB: "/authority/autorite.pub"
+    ports:
+      - "9100:9100"
+    volumes:
+      - nd-authority:/authority:ro
+    depends_on:
+      nd-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9100"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+
+  nd-accounts:
+    <<: *commun
+    container_name: novadesk-accounts
+    entrypoint: ["/usr/local/bin/entrypoint-accounts.sh"]
+    environment:
+      ND_ACCOUNTS_ADDR: "0.0.0.0:9200"
+      ND_ACCOUNTS_DB: "/accounts/comptes.redb"
+      # Secret serveur (hex) — sinon fichier <base>.cle auto-généré et persisté.
+      ND_ACCOUNTS_SECRET: "${ND_ACCOUNTS_SECRET:-}"
+      # Fédération OIDC optionnelle (vides = désactivée).
+      ND_OIDC_ISSUER: "${ND_OIDC_ISSUER:-}"
+      ND_OIDC_AUTH_ENDPOINT: "${ND_OIDC_AUTH_ENDPOINT:-}"
+      ND_OIDC_TOKEN_ENDPOINT: "${ND_OIDC_TOKEN_ENDPOINT:-}"
+      ND_OIDC_JWKS_URI: "${ND_OIDC_JWKS_URI:-}"
+      ND_OIDC_CLIENT_ID: "${ND_OIDC_CLIENT_ID:-}"
+      ND_OIDC_REDIRECT_URI: "${ND_OIDC_REDIRECT_URI:-}"
+      ND_OIDC_LIER_PAR_EMAIL: "${ND_OIDC_LIER_PAR_EMAIL:-}"
+    ports:
+      - "9200:9200"
+    volumes:
+      - nd-accounts-data:/accounts
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9200"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+networks:
+  novadesk:
+    driver: bridge
+
+volumes:
+  nd-authority:
+  nd-api-data:
+  nd-accounts-data:

@@ -3,15 +3,79 @@ name = "nd-wasm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Cible WebAssembly du client web (voir plan 12)."
-
-[dependencies]
-nd-proto = { workspace = true }
-nd-core = { workspace = true }
+description = "Client web NovaDesk (contrôle sortant) : cœur Rust compilé en WebAssembly (voir plans 10/12)."
 
 [lib]
-# `cdylib` requis pour la cible wasm ; `rlib` pour pouvoir tester sur l'hôte.
+# `cdylib` : module wasm chargé par le navigateur (via wasm-bindgen / wasm-pack).
+# `rlib` : permet les tests hôte de la logique pure (mapping d'entrées, motif de démo,
+# analyse H.264 Annex B) — cf. `cargo test -p nd-wasm` côté natif.
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pur `std` → compile en wasm. Fournit `InputEvent` et sa sérialisation binaire,
+# réutilisée **telle quelle** pour le canal `Input` : zéro divergence de format avec
+# le client natif. `nd-core` est volontairement absent — sa chaîne de dépendances
+# (capture, codec openh264, QUIC/quinn, snow, windows-rs) ne compile pas en wasm.
+nd-proto = { workspace = true }
+
+# Dépendances navigateur : UNIQUEMENT pour la cible wasm. Le build natif du workspace
+# (`cargo build --workspace`) ne les tire pas → côté hôte, `nd-wasm` reste un rlib
+# quasi vide dont seule la logique pure est compilée/testée. Voir §BARRE QUALITÉ du
+# prompt 10 et la note de portabilité en tête de `src/lib.rs`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+# WebTransport et WebCodecs sont des API « unstable » de web-sys : le build wasm exige
+# `RUSTFLAGS=--cfg=web_sys_unstable_apis` (voir web/build.sh et la note de vérif).
+features = [
+    # Fenêtre / DOM / Canvas
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ImageData",
+    "console",
+    # Entrées
+    "EventTarget",
+    "Event",
+    "MouseEvent",
+    "WheelEvent",
+    "KeyboardEvent",
+    # Transport navigateur (WebTransport / flux)
+    "WebTransport",
+    "WebTransportBidirectionalStream",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportReceiveStream",
+    "WebTransportSendStream",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    # Décodage / encodage (WebCodecs)
+    "VideoDecoder",
+    "VideoDecoderInit",
+    "VideoDecoderConfig",
+    "VideoEncoder",
+    "VideoEncoderInit",
+    "VideoEncoderConfig",
+    "VideoEncoderBitrateMode",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "EncodedVideoChunkMetadata",
+    "VideoFrame",
+    "VideoFrameBufferInit",
+    "VideoPixelFormat",
+    "LatencyMode",
+    "CodecState",
+    "DomException",
+]
 
 [lints]
 workspace = true

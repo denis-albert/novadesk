@@ -7,12 +7,29 @@
 //! renvoie chaque frame avec une unique région modifiée pleine image (pas de
 //! détection de dommages dans ce jet — l'extension XDamage pourra l'affiner).
 //!
-//! **Wayland** : la capture y passe obligatoirement par le portail
-//! `xdg-desktop-portal` (D-Bus `org.freedesktop.portal.ScreenCast`) et un flux
-//! **PipeWire** — prévu pour un jet ultérieur (plan 02/12). En session Wayland pure
-//! (`WAYLAND_DISPLAY` défini sans `DISPLAY`), [`X11Capturer::new`] renvoie donc
-//! `NotImplemented`. Sous XWayland (`DISPLAY` défini), la capture X11 fonctionne
-//! mais peut ne montrer que les fenêtres X11 selon le compositeur.
+//! **Wayland — TODO ciblé (non implémenté, à ne pas confondre avec « fait »)** :
+//! la capture y passe obligatoirement par le portail `xdg-desktop-portal` et un
+//! flux **PipeWire**. Le chemin prévu (plan 02/12) est :
+//!
+//! 1. D-Bus `org.freedesktop.portal.ScreenCast` : `CreateSession` →
+//!    `SelectSources` (type moniteur, curseur intégré/masqué) → `Start`
+//!    (consentement utilisateur, choix de l'écran) ;
+//! 2. `OpenPipeWireRemote` renvoie un descripteur PipeWire (fd) ;
+//! 3. négociation d'un flux PipeWire (format `SPA` : `BGRA`/`NV12`,
+//!    dimensions, cadence), réception des buffers `DMA-BUF` (zéro-copie GPU) ou
+//!    `MemFd`/`SHM` (repli CPU) → conversion en [`CapturedFrame`] ;
+//! 4. mapping moniteur : le portail expose la géométrie de la source retenue.
+//!
+//! **Pourquoi c'est différé ici** : un client PipeWire natif lie `libpipewire`
+//! (bibliothèque **C**, via `pkg-config`), ce qui casserait la garantie
+//! « backends Linux 100 % Rust vérifiables en compilation croisée depuis
+//! Windows » (comme `libpulse` pour l'audio) et n'est pas testable sur ce poste.
+//! Un binding pur-Rust du protocole portail (D-Bus via `zbus`) reste possible
+//! mais le transport PipeWire lui-même exige la bibliothèque native. En session
+//! Wayland pure (`WAYLAND_DISPLAY` défini sans `DISPLAY`), [`X11Capturer::new`]
+//! et [`enumerate_monitors`] renvoient donc honnêtement `NotImplemented`. Sous
+//! XWayland (`DISPLAY` défini), la capture X11 fonctionne mais peut ne montrer
+//! que les fenêtres X11 selon le compositeur.
 //!
 //! Aucun `unsafe` : `x11rb` expose un protocole X11 entièrement sûr.
 

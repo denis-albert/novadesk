@@ -1,0 +1,39 @@
+# Manifeste flatpak-builder NovaDesk.
+# Build : flatpak-builder --repo=repo build-dir packaging/linux/flatpak/com.novadesk.NovaDesk.yaml
+# Le bundle Flutter Linux doit être placé dans « staging/bundle » à côté du manifeste
+# (source « dir » ci-dessous).
+app-id: com.novadesk.NovaDesk
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: novadesk
+
+# Sandbox : au strict nécessaire. La capture d'écran passe OBLIGATOIREMENT par
+# le portail (ScreenCast/PipeWire) — pas d'accès direct au serveur d'affichage.
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.freedesktop.portal.ScreenCast
+  - --filesystem=xdg-download
+
+modules:
+  - name: novadesk
+    buildsystem: simple
+    build-commands:
+      - install -d /app/lib/novadesk
+      - cp -R bundle/. /app/lib/novadesk/
+      - ln -sf ../lib/novadesk/novadesk /app/bin/novadesk
+      - install -Dm644 com.novadesk.NovaDesk.metainfo.xml /app/share/metainfo/com.novadesk.NovaDesk.metainfo.xml
+      - install -Dm644 novadesk.desktop /app/share/applications/com.novadesk.NovaDesk.desktop
+    sources:
+      - type: dir
+        path: staging
+      - type: file
+        path: com.novadesk.NovaDesk.metainfo.xml
+      - type: file
+        path: ../novadesk.desktop

@@ -1,0 +1,17 @@
+Package: novadesk
+Version: 0.1.0
+Architecture: amd64
+Maintainer: Équipe NovaDesk <contact@novadesk.example>
+Section: net
+Priority: optional
+Homepage: https://novadesk.example
+Depends: libc6 (>= 2.31), libgtk-3-0, libglib2.0-0, libx11-6, libpipewire-0.3-0
+Recommends: xdg-desktop-portal, xdg-desktop-portal-gtk
+Description: Bureau à distance NovaDesk (client)
+ NovaDesk est une solution de bureau à distance : cœur Rust (réseau, crypto,
+ média chiffré de bout en bout) piloté par une interface Flutter.
+ .
+ Ce paquet installe le client de bureau et, en option, un service systemd
+ « novadesk.service » pour l'accès non surveillé (désactivé par défaut).
+ .
+ La capture d'écran sous Wayland passe par xdg-desktop-portal + PipeWire.

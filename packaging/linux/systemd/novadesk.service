@@ -1,0 +1,22 @@
+[Unit]
+Description=NovaDesk — accès non surveillé (bureau à distance)
+Documentation=https://novadesk.example
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Le client doit honorer « --service » (câblage côté client à venir, comme
+# pour Windows/macOS). Capture Wayland : via xdg-desktop-portal + PipeWire.
+ExecStart=/usr/bin/novadesk --service
+Restart=on-failure
+RestartSec=2
+# Durcissement raisonnable — à assouplir si la capture exige plus d'accès.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -24,6 +24,7 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use nd_proto::{MonitorId, NdError, Result};
 
+use crate::screen::{point_absolu, MonitorRect};
 use crate::{InputInjector, MouseButton};
 
 /// Numéros de boutons dans la convention CoreGraphics (champ `MOUSE_EVENT_BUTTON_NUMBER`).
@@ -116,6 +117,28 @@ impl Default for QuartzInjector {
     }
 }
 
+/// Rectangles des écrans actifs (bornes CoreGraphics, en **points** de l'espace
+/// global ; origine possiblement négative pour un écran à gauche/au-dessus du
+/// principal). `MonitorId(i)` = `i`-ième écran de `CGGetActiveDisplayList`,
+/// cohérent avec l'énumération de `nd-capture` (§macOS). Renvoie un vecteur vide
+/// si l'énumération échoue (repli géré par l'appelant).
+fn moniteurs_actifs() -> Vec<MonitorRect> {
+    let ids = CGDisplay::active_displays().unwrap_or_default();
+    ids.iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let b = CGDisplay::new(id).bounds();
+            MonitorRect {
+                id: i as u32,
+                x: b.origin.x as i32,
+                y: b.origin.y as i32,
+                width: b.size.width.max(0.0) as u32,
+                height: b.size.height.max(0.0) as u32,
+            }
+        })
+        .collect()
+}
+
 /// Crée une source d'événements au niveau HID (état « matériel » de la session).
 fn source() -> Result<CGEventSource> {
     CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -202,13 +225,21 @@ fn bouton_depuis_numero(numero: u8) -> MouseButton {
 }
 
 impl InputInjector for QuartzInjector {
-    fn mouse_move_abs(&self, x: f64, y: f64, _monitor: MonitorId) -> Result<()> {
-        // Écran principal pour l'instant (parité avec l'implémentation Windows) ; le
-        // multi-écran (CGGetActiveDisplayList + rectangle du moniteur) viendra ensuite
-        // (plan 07/13). Coordonnées globales en points, origine en haut à gauche.
-        let bornes = CGDisplay::main().bounds();
-        let px = bornes.origin.x + x.clamp(0.0, 1.0) * bornes.size.width;
-        let py = bornes.origin.y + y.clamp(0.0, 1.0) * bornes.size.height;
+    fn mouse_move_abs(&self, x: f64, y: f64, monitor: MonitorId) -> Result<()> {
+        // Multi-écran : projette (x, y) sur le rectangle du moniteur visé (bornes
+        // CoreGraphics en points de l'espace global) via la logique partagée et
+        // testée [`crate::screen`]. Repli sur l'écran principal si l'énumération
+        // échoue. Coordonnées globales en points, origine en haut à gauche.
+        let (px, py) = match point_absolu(&moniteurs_actifs(), monitor, x, y) {
+            Some((px, py)) => (f64::from(px), f64::from(py)),
+            None => {
+                let bornes = CGDisplay::main().bounds();
+                (
+                    bornes.origin.x + x.clamp(0.0, 1.0) * bornes.size.width,
+                    bornes.origin.y + y.clamp(0.0, 1.0) * bornes.size.height,
+                )
+            }
+        };
         let (event_type, bouton) = self.type_deplacement();
         poste_souris(event_type, CGPoint::new(px, py), bouton, None)
     }

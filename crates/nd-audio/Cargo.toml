@@ -32,10 +32,23 @@ libpulse-binding = "2.30"
 libpulse-simple-binding = "2.29"
 
 # Implémentation macOS : rendu CoreAudio (AudioUnit « default output » +
-# rappel de rendu) via coreaudio-rs. La capture de l'audio système n'a pas
-# d'API publique avant macOS 13 (ScreenCaptureKit) — voir src/macos.rs.
+# rappel de rendu) via coreaudio-rs ; capture de l'audio système (macOS 13+) via
+# ScreenCaptureKit (SCStream audio) au travers des bindings objc2. Voir
+# src/macos.rs. NOTE : nd-audio ne compile pas en cible croisée depuis Windows
+# (libopus_sys se construit via CMake/MSVC, incompatible arm64-apple) — ce code
+# macOS est vérifié par résolution des dépendances + revue, à valider sur macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.12"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+# `objc2-core-audio-types` : expose CMSampleBuffer::audio_buffer_list_with_retained_block_buffer.
+objc2-core-media = { version = "0.3", features = ["objc2-core-audio-types"] }
+objc2-core-audio-types = "0.3"
+# `CFRetained` pour libérer le CMBlockBuffer retourné par l'extraction audio.
+objc2-core-foundation = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
 
 [lints]
 workspace = true

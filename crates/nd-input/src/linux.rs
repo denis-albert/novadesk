@@ -5,10 +5,17 @@
 //! boutons (molette incluse : boutons 4–7) et touches par keycode. La saisie Unicode
 //! remappe temporairement un keycode libre vers le keysym voulu (technique xdotool).
 //!
+//! **Multi-écran** : `mouse_move_abs` honore le paramètre moniteur. Les
+//! rectangles par écran proviennent de RandR (`randr_get_monitors`) ; le point
+//! normalisé est projeté sur le rectangle du bon écran via la logique partagée
+//! et testée [`crate::screen`], puis converti en coordonnées de la fenêtre
+//! racine. Repli sur la racine entière (moniteur 0) sans RandR.
+//!
 //! **Wayland** : cette implémentation exige un serveur X (ou XWayland avec accès au
-//! pointeur/clavier globaux, ce que les compositeurs refusent en général). Une session
-//! Wayland pure passera par `uinput` (privilèges) ou le portail `RemoteDesktop`
-//! (xdg-desktop-portal) dans un jet ultérieur — voir plan 07 §Wayland.
+//! pointeur/clavier globaux, ce que les compositeurs refusent en général). Une
+//! session Wayland pure passe désormais par `uinput` (voir [`crate::uinput`]) ;
+//! le portail `RemoteDesktop` (xdg-desktop-portal) + libei reste la voie
+//! « intégrée bureau » à venir — voir plan 07 §Wayland et `uinput.rs`.
 //!
 //! Aucun bloc `unsafe` ici : `x11rb` est du Rust pur (pas de bibliothèque C).
 
@@ -17,6 +24,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use nd_proto::{MonitorId, NdError, Result};
 use x11rb::connection::Connection;
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     ConnectionExt as _, Keysym, Window, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT,
     KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT,
@@ -24,6 +32,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
+use crate::screen::{point_absolu, MonitorRect};
 use crate::{InputInjector, MouseButton};
 
 /// `detail` de `xtest_fake_input` pour un MotionNotify : coordonnées absolues.
@@ -179,16 +188,57 @@ impl XtestInjector {
         self.fake_checked(BUTTON_PRESS_EVENT, button)?;
         self.fake_checked(BUTTON_RELEASE_EVENT, button)
     }
+
+    /// Rectangles des moniteurs dans l'espace de la fenêtre racine (RandR
+    /// `GetMonitors`, moniteurs actifs). `MonitorId(i)` = `i`-ième moniteur de la
+    /// réponse RandR — même correspondance que l'énumération de `nd-capture`
+    /// (§Linux). Repli sur la racine entière (moniteur 0 couvrant tout le bureau
+    /// virtuel) si RandR est absent/trop ancien : jamais de liste vide.
+    fn moniteurs(&self) -> Vec<MonitorRect> {
+        let mons = self
+            .conn
+            .randr_get_monitors(self.root, true)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|r| r.monitors)
+            .filter(|m| !m.is_empty());
+        match mons {
+            Some(mons) => mons
+                .iter()
+                .enumerate()
+                .map(|(i, m)| MonitorRect {
+                    id: i as u32,
+                    x: i32::from(m.x),
+                    y: i32::from(m.y),
+                    width: u32::from(m.width),
+                    height: u32::from(m.height),
+                })
+                .collect(),
+            None => vec![MonitorRect {
+                id: 0,
+                x: 0,
+                y: 0,
+                width: u32::from(self.width),
+                height: u32::from(self.height),
+            }],
+        }
+    }
 }
 
 impl InputInjector for XtestInjector {
-    fn mouse_move_abs(&self, x: f64, y: f64, _monitor: MonitorId) -> Result<()> {
-        // La racine X11 couvre tout le bureau virtuel (tous les écrans) : 0.0–1.0 s'y
-        // rapporte en entier. Le ciblage par moniteur (rectangles RandR) viendra avec
-        // le multi-écran (plan 07/13).
-        let px = en_i16(x.clamp(0.0, 1.0) * f64::from(self.width.saturating_sub(1)));
-        let py = en_i16(y.clamp(0.0, 1.0) * f64::from(self.height.saturating_sub(1)));
-        self.fake_motion(MOTION_ABSOLU, px, py)
+    fn mouse_move_abs(&self, x: f64, y: f64, monitor: MonitorId) -> Result<()> {
+        // Multi-écran : projette (x, y) sur le rectangle du moniteur visé (RandR),
+        // via la logique partagée et testée [`crate::screen`], puis convertit en
+        // coordonnées de la fenêtre racine. `moniteurs()` ne renvoie jamais une
+        // liste vide (repli racine), donc `point_absolu` réussit toujours ; le
+        // `unwrap_or_else` reste défensif.
+        let (px, py) = point_absolu(&self.moniteurs(), monitor, x, y).unwrap_or_else(|| {
+            (
+                (x.clamp(0.0, 1.0) * f64::from(self.width.saturating_sub(1))).round() as i32,
+                (y.clamp(0.0, 1.0) * f64::from(self.height.saturating_sub(1))).round() as i32,
+            )
+        });
+        self.fake_motion(MOTION_ABSOLU, en_i16(f64::from(px)), en_i16(f64::from(py)))
     }
 
     fn mouse_move_rel(&self, dx: f64, dy: f64) -> Result<()> {

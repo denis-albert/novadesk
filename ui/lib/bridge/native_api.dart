@@ -360,6 +360,118 @@ final class InputUnicode extends InputEventDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session live : trame vidéo, statistiques, endpoint
+// ---------------------------------------------------------------------------
+
+/// Image décodée prête à afficher, poussée par [NativeApi.sessionVideoStream]
+/// (miroir de `nd_ffi::VideoFrameDto`, lui-même miroir de
+/// `nd_codec::DecodedFrame`).
+///
+/// C'est l'unité du **rendu 100 % Dart** : l'UI convertit chaque trame en
+/// `ui.Image` via `decodeImageFromPixels` puis la peint (aucun plugin natif).
+class VideoFrameDto {
+  const VideoFrameDto({
+    required this.width,
+    required this.height,
+    required this.rgba,
+  });
+
+  /// Largeur en pixels.
+  final int width;
+
+  /// Hauteur en pixels.
+  final int height;
+
+  /// Pixels RGBA (largeur × hauteur × 4 octets), ordre R, G, B, A.
+  final Uint8List rgba;
+
+  @override
+  String toString() => 'VideoFrameDto(${width}x$height, ${rgba.length} o)';
+}
+
+/// Instantané des statistiques d'une session, rafraîchies en continu par le
+/// moteur (miroir de `nd_ffi::SessionStatsDto`).
+class SessionStatsDto {
+  const SessionStatsDto({
+    required this.fps,
+    required this.rttUs,
+    required this.bytesIn,
+    required this.bytesOut,
+    required this.frames,
+  });
+
+  /// Images décodées par seconde (fenêtre glissante d'une seconde).
+  final double fps;
+
+  /// RTT du chemin réseau en microsecondes.
+  final int rttUs;
+
+  /// Octets utiles reçus (après déchiffrement, hors handshake).
+  final int bytesIn;
+
+  /// Octets utiles émis (avant chiffrement, hors handshake).
+  final int bytesOut;
+
+  /// Trames décodées livrées depuis le début de la session.
+  final int frames;
+
+  @override
+  bool operator ==(Object other) =>
+      other is SessionStatsDto &&
+      other.fps == fps &&
+      other.rttUs == rttUs &&
+      other.bytesIn == bytesIn &&
+      other.bytesOut == bytesOut &&
+      other.frames == frames;
+
+  @override
+  int get hashCode => Object.hash(fps, rttUs, bytesIn, bytesOut, frames);
+
+  @override
+  String toString() =>
+      'SessionStatsDto(fps: $fps, rttUs: $rttUs, bytesIn: $bytesIn, '
+      'bytesOut: $bytesOut, frames: $frames)';
+}
+
+/// Point d'accès réseau au démarrage d'une session
+/// (miroir de `nd_ffi::SessionEndpointDto`).
+sealed class SessionEndpointDto {
+  const SessionEndpointDto();
+}
+
+/// La session lie un écouteur QUIC local (`127.0.0.1`, port éphémère) et
+/// **accepte** la connexion entrante (rôle hôte typique). L'adresse et le
+/// certificat à transmettre au pair se relisent via
+/// [NativeApi.sessionListenInfo].
+final class SessionEndpointLoopback extends SessionEndpointDto {
+  const SessionEndpointLoopback();
+}
+
+/// La session **se connecte** directement à [addr] (« ip:port ») avec le
+/// certificat auto-signé (DER) épinglé [certDer] du pair (rôle contrôleur).
+final class SessionEndpointDirect extends SessionEndpointDto {
+  const SessionEndpointDirect({required this.addr, required this.certDer});
+
+  /// Adresse QUIC (UDP) du pair, ex. « 127.0.0.1:53211 ».
+  final String addr;
+
+  /// Certificat DER du pair, épinglé à la connexion.
+  final Uint8List certDer;
+}
+
+/// Coordonnées d'écoute d'une session hôte démarrée en
+/// [SessionEndpointLoopback] (miroir de `nd_ffi::ListenInfoDto`).
+class ListenInfoDto {
+  const ListenInfoDto({required this.addr, required this.certDer});
+
+  /// Adresse d'écoute effective (« 127.0.0.1:port »).
+  final String addr;
+
+  /// Certificat auto-signé (DER) à épingler côté pair.
+  final Uint8List certDer;
+}
+
+// ---------------------------------------------------------------------------
 // Interface de la façade
 // ---------------------------------------------------------------------------
 
@@ -410,4 +522,62 @@ abstract interface class NativeApi {
   /// Désérialise un événement d'entrée ; lève [NovaApiException] si les
   /// octets sont illisibles (miroir de `nd_ffi::decode_input_event`).
   Future<InputEventDto> decodeInputEvent({required Uint8List data});
+
+  // -------------------------------------------------------------------------
+  // Session live (dépend du lot 03 : streaming FFI)
+  // -------------------------------------------------------------------------
+
+  /// Démarre une session réelle (QUIC → Noise → capture/codec/entrées) et
+  /// renvoie son **identifiant opaque** ; lève [NovaApiException] en cas
+  /// d'échec (miroir de `nd_ffi::start_session`).
+  Future<int> startSession({
+    required SessionConfigDto config,
+    required SessionEndpointDto endpoint,
+  });
+
+  /// Adresse et certificat d'écoute d'une session [SessionEndpointLoopback]
+  /// (miroir de `nd_ffi::session_listen_info`).
+  Future<ListenInfoDto> sessionListenInfo(int id);
+
+  /// Flux des transitions d'état de la session
+  /// (`resolving → … → active → … → closed`), miroir de
+  /// `nd_ffi::session_state_stream`.
+  Stream<SessionStateDto> sessionStateStream(int id);
+
+  /// Flux des trames vidéo décodées (rôle contrôleur). **Fonction clé du
+  /// rendu** : l'UI peint chaque [VideoFrameDto] (miroir de
+  /// `nd_ffi::session_video_stream`).
+  Stream<VideoFrameDto> sessionVideoStream(int id);
+
+  /// Attend (au plus [timeoutMs]) la prochaine transition d'état ; `null` si
+  /// aucune n'arrive ou si la session est terminée. Repli synchrone,
+  /// mutuellement exclusif avec [sessionStateStream]
+  /// (miroir de `nd_ffi::wait_session_state`).
+  Future<SessionStateDto?> waitSessionState(int id, {required int timeoutMs});
+
+  /// Collecte jusqu'à [maxFrames] trames décodées (au plus [timeoutMs]).
+  /// Repli synchrone, mutuellement exclusif avec [sessionVideoStream]
+  /// (miroir de `nd_ffi::collect_video_frames`).
+  Future<List<VideoFrameDto>> collectVideoFrames(
+    int id, {
+    required int maxFrames,
+    required int timeoutMs,
+  });
+
+  /// Instantané des statistiques de la session (fps, RTT, octets, trames),
+  /// miroir de `nd_ffi::session_stats`.
+  Future<SessionStatsDto> sessionStats(int id);
+
+  /// Dernière erreur d'exécution du moteur, `null` tant que la session vit ou
+  /// si elle s'est close proprement. À afficher quand l'état passe à `closed`
+  /// (miroir de `nd_ffi::session_last_error`).
+  Future<String?> sessionLastError(int id);
+
+  /// Pousse un événement d'entrée vers le pair (rôle contrôleur) : les octets
+  /// partent sur le canal `Input` chiffré (miroir de `nd_ffi::send_input`).
+  Future<void> sendInput(int id, InputEventDto event);
+
+  /// Arrête la session et invalide son identifiant
+  /// (miroir de `nd_ffi::stop_session`).
+  Future<void> stopSession(int id);
 }

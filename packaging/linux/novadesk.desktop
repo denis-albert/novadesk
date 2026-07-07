@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NovaDesk
+GenericName=Bureau à distance
+Comment=Bureau à distance NovaDesk (cœur Rust, UI Flutter)
+Exec=novadesk %u
+Icon=novadesk
+Terminal=false
+Categories=Network;RemoteAccess;Utility;
+Keywords=remote;desktop;support;distant;
+StartupNotify=true
+StartupWMClass=novadesk

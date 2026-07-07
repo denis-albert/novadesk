@@ -1,9 +1,14 @@
 //! Implémentation Windows de [`InputInjector`] via **`SendInput`**.
 //!
 //! Souris en coordonnées absolues normalisées, boutons, molette haute résolution,
-//! touches par scancode et saisie Unicode. Voir plan 07 §Windows. Le multi-écran
-//! (drapeau `VIRTUALDESK` + rectangle du moniteur) et l'injection dans le bureau
-//! sécurisé/UAC (service SYSTEM) viendront ensuite.
+//! touches par scancode et saisie Unicode. Voir plan 07 §Windows.
+//!
+//! **Multi-écran** : `mouse_move_abs` honore le paramètre moniteur. Les moniteurs
+//! sont énumérés via `EnumDisplayMonitors`/`GetMonitorInfoW` (rectangles dans le
+//! bureau virtuel), le point normalisé est projeté sur le rectangle du bon écran
+//! ([`crate::screen`]), puis converti en coordonnées `0..=65535` du bureau virtuel
+//! et injecté avec `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`. L'injection
+//! dans le bureau sécurisé/UAC (service SYSTEM) viendra ensuite.
 //!
 //! Entrées avancées (plan 07) : suivi de l'état enfoncé des touches/boutons pour un
 //! `release_all()` réel, séquence d'attention sécurisée (Ctrl+Alt+Suppr) via `SendSAS`
@@ -16,15 +21,18 @@ use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard};
 
 use nd_proto::{MonitorId, NdError, Result};
-use windows::Win32::Foundation::{FALSE, POINT, RECT};
+use windows::Win32::Foundation::{BOOL, FALSE, LPARAM, POINT, RECT, TRUE};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::Security::Authentication::Identity::SendSAS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
-    VIRTUAL_KEY,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
     InitializeTouchInjection, InjectTouchInput, POINTER_FLAGS, POINTER_FLAG_DOWN,
@@ -32,9 +40,12 @@ use windows::Win32::UI::Input::Pointer::{
     POINTER_INFO, POINTER_TOUCH_INFO, TOUCH_FEEDBACK_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PT_TOUCH, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_ORIENTATION, TOUCH_MASK_PRESSURE,
+    GetSystemMetrics, MONITORINFOF_PRIMARY, PT_TOUCH, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, TOUCH_MASK_CONTACTAREA, TOUCH_MASK_ORIENTATION,
+    TOUCH_MASK_PRESSURE,
 };
 
+use crate::screen::{pixel_vers_normalise_65535, point_absolu, BureauVirtuel, MonitorRect};
 use crate::{InputInjector, MouseButton};
 
 /// Incrément standard d'un cran de molette.
@@ -315,17 +326,115 @@ pub fn send_secure_attention_sequence() -> Result<()> {
     Ok(())
 }
 
+/// Rappel `EnumDisplayMonitors` : accumule le rectangle de chaque moniteur.
+///
+/// `data` transporte un `*mut Vec<(RECT, bool)>` (rectangle + drapeau primaire).
+/// On ne fixe pas encore l'identifiant : il est attribué après tri (primaire en
+/// tête) dans [`enumerer_moniteurs`].
+///
+/// SAFETY : `data` provient de [`enumerer_moniteurs`] et pointe vers un
+/// `Vec<(RECT, bool)>` valide pour toute la durée de l'énumération (pile de
+/// l'appelant). `hmon` est un handle valide fourni par le système.
+unsafe extern "system" fn rappel_moniteur(
+    hmon: HMONITOR,
+    _hdc: HDC,
+    _clip: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let moniteurs = &mut *(data.0 as *mut Vec<(RECT, bool)>);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // GetMonitorInfoW renseigne `rcMonitor` (rectangle bureau virtuel) et
+    // `dwFlags` (bit MONITORINFOF_PRIMARY). Un échec ponctuel saute ce moniteur
+    // sans interrompre l'énumération.
+    if GetMonitorInfoW(hmon, &mut info).as_bool() {
+        let est_primaire = info.dwFlags & MONITORINFOF_PRIMARY != 0;
+        moniteurs.push((info.rcMonitor, est_primaire));
+    }
+    TRUE
+}
+
+/// Énumère les moniteurs du bureau (rectangles dans le bureau virtuel).
+///
+/// `MonitorId(0)` = moniteur **principal** (placé en tête) ; les suivants gardent
+/// l'ordre d'énumération du système. Cet ordre suit la convention documentée par
+/// `nd-capture` (`MonitorId(0)` = sortie principale) ; l'alignement fin avec
+/// l'ordre DXGI de `nd-capture` relève de l'intégration multi-écran (plan 13).
+/// Renvoie un vecteur vide si l'énumération échoue (repli géré par l'appelant).
+fn enumerer_moniteurs() -> Vec<MonitorRect> {
+    let mut bruts: Vec<(RECT, bool)> = Vec::new();
+    // SAFETY : appel FFI standard ; `rappel_moniteur` reçoit un pointeur valide
+    // vers `bruts` le temps (synchrone) de l'énumération, aucun HDC/clip requis.
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(rappel_moniteur),
+            LPARAM(std::ptr::addr_of_mut!(bruts) as isize),
+        );
+    }
+    // Moniteur principal en tête (tri stable : l'ordre système est conservé
+    // pour les écrans secondaires).
+    bruts.sort_by(|a, b| b.1.cmp(&a.1));
+    bruts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (r, _))| MonitorRect {
+            id: i as u32,
+            x: r.left,
+            y: r.top,
+            width: (r.right - r.left).max(0) as u32,
+            height: (r.bottom - r.top).max(0) as u32,
+        })
+        .collect()
+}
+
+/// Bornes du bureau virtuel (union de tous les moniteurs), via `GetSystemMetrics`.
+fn bureau_virtuel() -> BureauVirtuel {
+    // SAFETY : `GetSystemMetrics` est sans effet de bord et sûr pour tout index.
+    let (x, y, largeur, hauteur) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    BureauVirtuel {
+        x,
+        y,
+        width: largeur.max(1) as u32,
+        height: hauteur.max(1) as u32,
+    }
+}
+
 impl InputInjector for SendInputInjector {
-    fn mouse_move_abs(&self, x: f64, y: f64, _monitor: MonitorId) -> Result<()> {
-        // Écran primaire pour l'instant (moniteur 0). Le multi-écran ajoutera le
-        // drapeau VIRTUALDESK et le rectangle du moniteur (plan 07).
-        let dx = (x.clamp(0.0, 1.0) * 65535.0).round() as i32;
-        let dy = (y.clamp(0.0, 1.0) * 65535.0).round() as i32;
+    fn mouse_move_abs(&self, x: f64, y: f64, monitor: MonitorId) -> Result<()> {
+        let moniteurs = enumerer_moniteurs();
+        // Projette (x, y) normalisés sur le rectangle du moniteur visé, puis
+        // convertit en coordonnées 0..=65535 du bureau virtuel.
+        let (dx, dy) = match point_absolu(&moniteurs, monitor, x, y) {
+            Some((px, py)) => pixel_vers_normalise_65535(px, py, bureau_virtuel()),
+            // Énumération indisponible : repli sur l'écran primaire seul
+            // (comportement historique, sans VIRTUALDESK).
+            None => {
+                let dx = (x.clamp(0.0, 1.0) * 65_535.0).round() as i32;
+                let dy = (y.clamp(0.0, 1.0) * 65_535.0).round() as i32;
+                return send_one(mouse_input(
+                    dx,
+                    dy,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                ));
+            }
+        };
         send_one(mouse_input(
             dx,
             dy,
             0,
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         ))
     }
 

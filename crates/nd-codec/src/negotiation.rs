@@ -16,11 +16,12 @@ use crate::{CodecCaps, CodecKind, EncoderConfig, VideoEncoder};
 ///
 /// - Le repli logiciel openh264 (H.264) est **toujours** présent : il ne dépend
 ///   d'aucune ressource plateforme.
-/// - L'encodeur plateforme (Windows : Media Foundation, H.264) n'est annoncé que si
-///   sa création réussit effectivement ici via [`crate::create_hardware_encoder`] —
-///   on n'annonce jamais au pair distant une capacité « sur le papier » qui
-///   échouerait en session. Son champ [`CodecCaps::hardware`] reflète ses capacités
-///   réelles (voir `mediafoundation` : le premier jet est un MFT logiciel).
+/// - L'encodeur plateforme (Windows, H.264) n'est annoncé que si sa création
+///   réussit effectivement ici — on n'annonce jamais au pair distant une capacité
+///   « sur le papier » qui échouerait en session. L'entrée reflète le backend que
+///   [`crate::create_hardware_encoder`] choisirait réellement : MFT **matériel**
+///   (`nvenc`, `hardware: true`) si un encodeur GPU est instanciable, sinon repli
+///   MFT logiciel (`mediafoundation`, `hardware: false`).
 ///
 /// L'ordre du vecteur n'a pas de signification : la sélection passe par
 /// [`negotiate`], qui agrège toutes les entrées.
@@ -29,8 +30,14 @@ pub fn available_encoders() -> Vec<CodecCaps> {
     let mut encodeurs = vec![crate::software::Openh264Encoder::capabilities()];
 
     #[cfg(windows)]
-    if crate::create_hardware_encoder(CodecKind::H264).is_ok() {
-        encodeurs.push(crate::mediafoundation::MediaFoundationEncoder::capabilities());
+    {
+        // Même ordre de préférence que `create_hardware_encoder` (matériel puis
+        // repli), pour que l'annonce corresponde au backend réellement servi.
+        if crate::nvenc::NvencEncoder::new().is_ok() {
+            encodeurs.push(crate::nvenc::NvencEncoder::capabilities());
+        } else if crate::mediafoundation::MediaFoundationEncoder::new().is_ok() {
+            encodeurs.push(crate::mediafoundation::MediaFoundationEncoder::capabilities());
+        }
     }
 
     encodeurs

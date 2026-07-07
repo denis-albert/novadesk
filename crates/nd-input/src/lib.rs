@@ -7,6 +7,10 @@
 
 use nd_proto::{MonitorId, Result};
 
+/// Cartographie multi-écran des coordonnées absolues (agnostique OS, testée
+/// partout — voir [`screen`]). Utilisée par les backends Windows/macOS/Linux.
+mod screen;
+
 /// Bouton de souris.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -59,13 +63,47 @@ pub use macos::QuartzInjector;
 mod linux;
 
 #[cfg(target_os = "linux")]
+mod uinput;
+
+#[cfg(target_os = "linux")]
 pub use linux::XtestInjector;
+
+#[cfg(target_os = "linux")]
+pub use uinput::UinputInjector;
+
+/// Sélectionne l'injecteur Linux : `uinput` (niveau noyau) en session Wayland
+/// pure, XTEST (X11) sinon.
+///
+/// La détection suit la même convention que `nd-capture` : une session est
+/// « Wayland pure » quand `WAYLAND_DISPLAY` est défini **sans** serveur X
+/// joignable (`DISPLAY` absent). Sous XWayland (les deux définis), XTEST reste
+/// préféré (intégré au serveur d'affichage, sans droits `/dev/uinput`). Si la
+/// création uinput échoue mais qu'un serveur X est joignable, on retombe sur
+/// XTEST plutôt que d'échouer — voir `uinput.rs` (droits requis).
+#[cfg(target_os = "linux")]
+fn create_linux_injector() -> Result<Box<dyn InputInjector>> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    if wayland && !x11 {
+        // Wayland pur : uinput est la seule voie fiable.
+        return Ok(Box::new(uinput::UinputInjector::new()?));
+    }
+    if wayland {
+        // Session Wayland avec XWayland disponible : tente uinput (injection
+        // globale), repli XTEST si les droits uinput manquent.
+        if let Ok(injecteur) = uinput::UinputInjector::new() {
+            return Ok(Box::new(injecteur));
+        }
+    }
+    Ok(Box::new(linux::XtestInjector::new()?))
+}
 
 /// Crée l'injecteur adapté à la plateforme courante.
 ///
 /// Windows : `SendInput`. macOS : Quartz Event Services (`CGEventPost`, permission
-/// Accessibilité/TCC requise). Linux : XTEST sur X11 (Wayland : jet ultérieur, voir
-/// plan 07 §Wayland). Autres OS : `NotImplemented`.
+/// Accessibilité/TCC requise). Linux : XTEST sur X11/XWayland, ou `/dev/uinput`
+/// (niveau noyau) en session Wayland pure — voir [`create_linux_injector`] et
+/// plan 07 §Wayland. Autres OS : `NotImplemented`.
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     #[cfg(windows)]
     {
@@ -77,7 +115,7 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(linux::XtestInjector::new()?))
+        create_linux_injector()
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {

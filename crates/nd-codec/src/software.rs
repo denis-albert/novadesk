@@ -385,6 +385,10 @@ impl VideoEncoder for Openh264Encoder {
     fn set_delta_mode(&mut self, actif: bool) {
         self.suivi.set_actif(actif);
     }
+
+    fn nom_backend(&self) -> &str {
+        "openh264 (encodeur H.264 logiciel)"
+    }
 }
 
 // ---------------------------------------------------------------------------

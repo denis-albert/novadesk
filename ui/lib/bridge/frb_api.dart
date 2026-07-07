@@ -114,6 +114,93 @@ class FrbNativeApi implements NativeApi {
   }
 
   // ---------------------------------------------------------------------------
+  // Session live — délégation aux fonctions générées (u64 ⇄ BigInt)
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<int> startSession({
+    required SessionConfigDto config,
+    required SessionEndpointDto endpoint,
+  }) async {
+    try {
+      final id = await frb.startSession(
+        config: _configVers(config),
+        endpoint: _endpointVers(endpoint),
+      );
+      return id.toInt();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<ListenInfoDto> sessionListenInfo(int id) async {
+    try {
+      final info = await frb.sessionListenInfo(id: BigInt.from(id));
+      return ListenInfoDto(addr: info.addr, certDer: info.certDer);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Stream<SessionStateDto> sessionStateStream(int id) =>
+      frb.sessionStateStream(id: BigInt.from(id)).map(_stateDepuis);
+
+  @override
+  Stream<VideoFrameDto> sessionVideoStream(int id) =>
+      frb.sessionVideoStream(id: BigInt.from(id)).map(_frameDepuis);
+
+  @override
+  Future<SessionStateDto?> waitSessionState(
+    int id, {
+    required int timeoutMs,
+  }) async {
+    final s = await frb.waitSessionState(
+      id: BigInt.from(id),
+      timeoutMs: BigInt.from(timeoutMs),
+    );
+    return s == null ? null : _stateDepuis(s);
+  }
+
+  @override
+  Future<List<VideoFrameDto>> collectVideoFrames(
+    int id, {
+    required int maxFrames,
+    required int timeoutMs,
+  }) async {
+    final frames = await frb.collectVideoFrames(
+      id: BigInt.from(id),
+      maxFrames: maxFrames,
+      timeoutMs: BigInt.from(timeoutMs),
+    );
+    return frames.map(_frameDepuis).toList();
+  }
+
+  @override
+  Future<SessionStatsDto> sessionStats(int id) async {
+    final s = await frb.sessionStats(id: BigInt.from(id));
+    return SessionStatsDto(
+      fps: s.fps,
+      rttUs: s.rttUs.toInt(),
+      bytesIn: s.bytesIn.toInt(),
+      bytesOut: s.bytesOut.toInt(),
+      frames: s.frames.toInt(),
+    );
+  }
+
+  @override
+  Future<String?> sessionLastError(int id) =>
+      frb.sessionLastError(id: BigInt.from(id));
+
+  @override
+  Future<void> sendInput(int id, InputEventDto event) =>
+      frb.sendInput(id: BigInt.from(id), event: _inputVers(event));
+
+  @override
+  Future<void> stopSession(int id) => frb.stopSession(id: BigInt.from(id));
+
+  // ---------------------------------------------------------------------------
   // Conversions internes
   // ---------------------------------------------------------------------------
 
@@ -144,6 +231,19 @@ class FrbNativeApi implements NativeApi {
         SessionStateDto.closed => frb.SessionStateDto.closed,
       };
 
+  static SessionStateDto _stateDepuis(frb.SessionStateDto s) => switch (s) {
+        frb.SessionStateDto.idle => SessionStateDto.idle,
+        frb.SessionStateDto.resolving => SessionStateDto.resolving,
+        frb.SessionStateDto.connecting => SessionStateDto.connecting,
+        frb.SessionStateDto.handshaking => SessionStateDto.handshaking,
+        frb.SessionStateDto.active => SessionStateDto.active,
+        frb.SessionStateDto.reconnecting => SessionStateDto.reconnecting,
+        frb.SessionStateDto.closed => SessionStateDto.closed,
+      };
+
+  static VideoFrameDto _frameDepuis(frb.VideoFrameDto f) =>
+      VideoFrameDto(width: f.width, height: f.height, rgba: f.rgba);
+
   static frb.PermissionsDto _permsVers(PermissionsDto p) => frb.PermissionsDto(
         keyboard: p.keyboard,
         mouse: p.mouse,
@@ -161,6 +261,21 @@ class FrbNativeApi implements NativeApi {
         audio: p.audio,
         viewOnly: p.viewOnly,
       );
+
+  static frb.SessionConfigDto _configVers(SessionConfigDto c) =>
+      frb.SessionConfigDto(
+        role: _roleVers(c.role),
+        localId: BigInt.from(c.localId),
+        peerId: c.peerId == null ? null : BigInt.from(c.peerId!),
+        permissions: _permsVers(c.permissions),
+      );
+
+  static frb.SessionEndpointDto _endpointVers(SessionEndpointDto e) =>
+      switch (e) {
+        SessionEndpointLoopback() => const frb.SessionEndpointDto.loopback(),
+        SessionEndpointDirect(:final addr, :final certDer) =>
+          frb.SessionEndpointDto.direct(addr: addr, certDer: certDer),
+      };
 
   static frb.InputEventDto _inputVers(InputEventDto e) => switch (e) {
         InputMouseMoveAbs(:final x, :final y, :final monitor) =>

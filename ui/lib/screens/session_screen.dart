@@ -4,20 +4,25 @@
 /// affichage, entrées, outils, permissions, actions, « Terminer » rouge),
 /// chrome (onglets + barre d'état) masqué en plein écran.
 ///
-/// Rendu vidéo (plan 10 §10.3) : la trame décodée reste en mémoire GPU ; le
-/// cœur Rust publiera un `textureId` entier. Tant que le pont réel n'est pas
-/// branché, `_textureId` reste `null` et un aperçu simulé est affiché.
+/// Rendu vidéo **100 % pur Dart** (aucun `Texture`/plugin natif) : chaque
+/// [VideoFrameDto] du flux `session_video_stream` est convertie en `ui.Image`
+/// via `decodeImageFromPixels` (RGBA) puis peinte par [_PeintreVideo] en
+/// conservant le ratio. Les images précédentes sont libérées (pas de fuite).
+///
+/// Cycle de vie réel : `start_session` à l'ouverture, abonnement aux flux
+/// d'états et de trames, statistiques live via `session_stats`, `stop_session`
+/// au `dispose`.
 ///
 /// Capture des entrées : la surface écoute souris ([Listener]) et clavier
-/// ([Focus]) ; chaque geste devient un `InputEventDto` sérialisé par
-/// `encode_input_event` (façade `nd-ffi`).
+/// ([Focus]) ; chaque geste part réellement au pair via `send_input`.
 library;
 
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, ValueListenable;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -58,10 +63,34 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   final FocusNode _noeudFocus = FocusNode(debugLabel: 'surface-session');
   final TextEditingController _chatController = TextEditingController();
 
-  /// Identifiant de texture GPU externe fourni par le cœur Rust.
-  /// `null` tant que le pont réel n'est pas branché (plan 10 §10.3).
-  // ignore: prefer_final_fields
-  int? _textureId;
+  /// Identifiant de la session ouverte par le cœur (`start_session`),
+  /// `null` tant que le démarrage n'a pas abouti.
+  int? _sessionId;
+
+  /// Abonnements aux flux du cœur (transitions d'état + trames vidéo).
+  StreamSubscription<SessionStateDto>? _abonnementEtat;
+  StreamSubscription<VideoFrameDto>? _abonnementVideo;
+
+  /// Minuterie de rafraîchissement des statistiques live (~1 s).
+  Timer? _minuterieStats;
+
+  /// Trame vidéo courante décodée en `ui.Image`, peinte par [_PeintreVideo].
+  /// Un `ValueNotifier` isole le rafraîchissement vidéo (~30 IPS) du reste de
+  /// l'arbre : seul le `CustomPaint` se repeint, pas toute la fenêtre.
+  final ValueNotifier<ui.Image?> _trameCourante = ValueNotifier<ui.Image?>(null);
+
+  /// Vrai dès la première trame reçue : bascule le placeholder vers la vidéo.
+  bool _aRecuUneTrame = false;
+
+  /// Garde anti-empilement : on saute une trame si le décodage précédent n'est
+  /// pas terminé (le moteur privilégie déjà les trames les plus récentes).
+  bool _decodageEnCours = false;
+
+  /// Dernières statistiques live (`session_stats`).
+  SessionStatsDto? _stats;
+
+  /// Vrai quand l'arrêt du moteur a déjà été demandé (idempotence).
+  bool _sessionArretee = false;
 
   SessionStateDto _etat = SessionStateDto.idle;
   SessionStatusDto? _statut;
@@ -85,9 +114,8 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   bool _permBloquerEntree = false;
   bool _permConfidentialite = false;
 
-  // Compteurs d'entrées encodées (HUD honnête, plan 10 §10.6.2).
+  // Compteur d'entrées réellement envoyées au pair via `send_input` (HUD).
   int _evenementsEnvoyes = 0;
-  int _octetsEnvoyes = 0;
 
   // Regroupement des mouvements souris pour ne pas saturer le pont
   // (plan 10 §10.2.2) : envoi au plus toutes les 8 ms.
@@ -135,11 +163,20 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   @override
   void initState() {
     super.initState();
-    unawaited(_deroulerConnexion());
+    unawaited(_demarrerSession());
   }
 
   @override
   void dispose() {
+    // Coupe d'abord les flux : aucun callback ne doit survivre au démontage.
+    unawaited(_abonnementEtat?.cancel());
+    unawaited(_abonnementVideo?.cancel());
+    _minuterieStats?.cancel();
+    // Arrête le moteur (best-effort, idempotent).
+    unawaited(_arreterMoteur());
+    // Libère la dernière image décodée (pas de fuite mémoire).
+    _trameCourante.value?.dispose();
+    _trameCourante.dispose();
     if (_pleinEcran && _estDesktop) {
       // Restaure la fenêtre si la session se ferme en plein écran.
       unawaited(windowManager.setFullScreen(false));
@@ -150,29 +187,59 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // Cycle de vie simulé de la session
+  // Cycle de vie réel de la session (piloté par le cœur Rust via NativeApi)
   // ---------------------------------------------------------------------------
 
-  /// SIMULATION : déroule la machine à états `nd_core::SessionState`
-  /// (résolution → connexion → authentification → active). Le vrai pont
-  /// poussera ces transitions via un `Stream` FRB (plan 10 §10.2.2).
-  Future<void> _deroulerConnexion() async {
-    const etapes = <(SessionStateDto, Duration)>[
-      (SessionStateDto.resolving, Duration(milliseconds: 450)),
-      (SessionStateDto.connecting, Duration(milliseconds: 700)),
-      (SessionStateDto.handshaking, Duration(milliseconds: 600)),
-      (SessionStateDto.active, Duration.zero),
-    ];
-    for (final (etat, duree) in etapes) {
-      if (!mounted || _termine) return;
-      await _changerEtat(etat);
-      await Future<void>.delayed(duree);
+  /// Ouvre la session auprès du cœur (`start_session`) puis s'abonne aux flux
+  /// d'états et de trames vidéo. Remplace l'ancienne simulation par minuteries.
+  Future<void> _demarrerSession() async {
+    try {
+      // En l'absence du service de rendez-vous (plan 11), on démarre en
+      // Loopback ; le contrôleur réel passera un `SessionEndpointDirect`
+      // (adresse + certificat épinglé) fourni par le rendez-vous.
+      final id = await _api.startSession(
+        config: widget.args.config,
+        endpoint: const SessionEndpointLoopback(),
+      );
+      if (!mounted) {
+        unawaited(_api.stopSession(id));
+        return;
+      }
+      _sessionId = id;
+      _abonnementEtat = _api.sessionStateStream(id).listen(
+        (SessionStateDto etat) {
+          unawaited(_surEtat(etat));
+        },
+        onError: (Object e) {
+          _signalerErreurFatale(_messageErreur(e));
+        },
+      );
+      _abonnementVideo = _api.sessionVideoStream(id).listen(
+        _surTrameVideo,
+        onError: (Object _) {
+          // Trame corrompue : ignorée, le flux continue.
+        },
+      );
+    } catch (e) {
+      _signalerErreurFatale(_messageErreur(e));
     }
   }
 
-  /// Change l'état et rafraîchit le statut affichable via la façade
-  /// (`session_status` fournit le libellé + l'ID pair formaté).
-  Future<void> _changerEtat(SessionStateDto etat) async {
+  /// Applique un état reçu du flux : met à jour le badge/statut, démarre le
+  /// polling de stats à l'activation, gère la fermeture.
+  Future<void> _surEtat(SessionStateDto etat) async {
+    await _appliquerEtat(etat);
+    if (!mounted) return;
+    if (etat == SessionStateDto.active) {
+      _demarrerStats();
+    } else if (etat == SessionStateDto.closed) {
+      await _surFermeture();
+    }
+  }
+
+  /// Rafraîchit l'état affichable via la façade (`session_status` fournit le
+  /// libellé + l'ID pair formaté).
+  Future<void> _appliquerEtat(SessionStateDto etat) async {
     final statut = await _api.sessionStatus(
       state: etat,
       peerId: widget.args.config.peerId,
@@ -184,14 +251,113 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     });
   }
 
+  /// Fermeture émise par le moteur : affiche l'éventuelle dernière erreur puis
+  /// revient à l'accueil (sauf si l'utilisateur a lui-même terminé).
+  Future<void> _surFermeture() async {
+    if (_termine) return;
+    String? erreur;
+    final id = _sessionId;
+    if (id != null) {
+      try {
+        erreur = await _api.sessionLastError(id);
+      } catch (_) {
+        // Erreur ignorée : on retourne quand même à l'accueil.
+      }
+    }
+    if (!mounted) return;
+    if (erreur != null) {
+      _informer('Session terminée : $erreur');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  /// Décode une trame RGBA en `ui.Image` (pur Dart, aucun plugin natif) puis la
+  /// publie au peintre. Saute la trame si un décodage est déjà en vol.
+  void _surTrameVideo(VideoFrameDto trame) {
+    if (_decodageEnCours) return;
+    _decodageEnCours = true;
+    ui.decodeImageFromPixels(
+      trame.rgba,
+      trame.width,
+      trame.height,
+      ui.PixelFormat.rgba8888,
+      (ui.Image image) {
+        _decodageEnCours = false;
+        if (!mounted) {
+          image.dispose(); // écran démonté entre-temps : pas de fuite
+          return;
+        }
+        final ancienne = _trameCourante.value;
+        _trameCourante.value = image; // repeint le seul CustomPaint
+        ancienne?.dispose(); // libère la trame précédente (pas de fuite)
+        if (!_aRecuUneTrame) {
+          setState(() => _aRecuUneTrame = true);
+        }
+      },
+    );
+  }
+
+  /// Démarre le polling des statistiques live (~1 s) à l'activation.
+  void _demarrerStats() {
+    if (_minuterieStats != null) return;
+    unawaited(_rafraichirStats());
+    _minuterieStats = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => unawaited(_rafraichirStats()),
+    );
+  }
+
+  Future<void> _rafraichirStats() async {
+    final id = _sessionId;
+    if (id == null) return;
+    try {
+      final stats = await _api.sessionStats(id);
+      if (!mounted) return;
+      setState(() => _stats = stats);
+    } catch (_) {
+      // Statistiques indisponibles : le HUD conserve la dernière valeur.
+    }
+  }
+
+  /// Arrête le moteur (`stop_session`) une seule fois (idempotent).
+  Future<void> _arreterMoteur() async {
+    final id = _sessionId;
+    if (id == null || _sessionArretee) return;
+    _sessionArretee = true;
+    try {
+      await _api.stopSession(id);
+    } catch (_) {
+      // Arrêt best-effort : rien de plus à faire côté UI.
+    }
+  }
+
+  /// Erreur fatale (démarrage ou flux d'états) : informe puis revient à l'accueil.
+  void _signalerErreurFatale(String message) {
+    if (!mounted) return;
+    _informer('Session interrompue : $message');
+    Future<void>.delayed(const Duration(milliseconds: 350)).then((_) {
+      if (mounted) Navigator.of(context).pop();
+    });
+  }
+
+  String _messageErreur(Object e) =>
+      e is NovaApiException ? e.message : e.toString();
+
+  /// Fin demandée par l'utilisateur (bouton « Terminer ») : arrête le moteur
+  /// puis referme la fenêtre de session.
   Future<void> _terminerSession() async {
+    if (_termine) return;
     _termine = true;
-    await _changerEtat(SessionStateDto.closed);
+    await _arreterMoteur();
+    if (mounted) {
+      await _appliquerEtat(SessionStateDto.closed);
+    }
     if (_pleinEcran && _estDesktop) {
       _pleinEcran = false;
       await windowManager.setFullScreen(false);
     }
-    await Future<void>.delayed(const Duration(milliseconds: 350));
+    await Future<void>.delayed(const Duration(milliseconds: 300));
     if (mounted) {
       Navigator.of(context).pop();
     }
@@ -201,10 +367,12 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   // Envoi des entrées (souris / clavier) vers le cœur
   // ---------------------------------------------------------------------------
 
-  /// Sérialise l'événement via `encode_input_event`. Une fois le transport
-  /// branché, les octets partiront sur le canal `Input` (nd-proto) ; ici on
-  /// tient des compteurs pour le HUD.
+  /// Envoie réellement l'événement au pair via `send_input` (canal `Input`
+  /// chiffré du moteur), sous réserve des gardes de permission. Le compteur du
+  /// HUD n'est incrémenté que sur envoi réussi.
   Future<void> _envoyer(InputEventDto evenement) async {
+    final id = _sessionId;
+    if (id == null) return;
     final estSouris = switch (evenement) {
       InputMouseMoveAbs() ||
       InputMouseMoveRel() ||
@@ -216,12 +384,13 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     if (estSouris && !_sourisActive) return;
     if (!estSouris && !_clavierActif) return;
 
-    final octets = await _api.encodeInputEvent(event: evenement);
+    try {
+      await _api.sendInput(id, evenement);
+    } catch (_) {
+      return; // envoi échoué : on n'incrémente pas le compteur
+    }
     if (!mounted) return;
-    setState(() {
-      _evenementsEnvoyes++;
-      _octetsEnvoyes += octets.length;
-    });
+    setState(() => _evenementsEnvoyes++);
   }
 
   double _normaliser(double valeur, double maximum) =>
@@ -330,7 +499,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     for (final touche in touches.reversed) {
       await _envoyer(InputKey(scancode: touche.usbHidUsage, down: false));
     }
-    _informer('Ctrl+Alt+Suppr envoyé au poste distant (simulation).');
+    _informer('Ctrl+Alt+Suppr envoyé au poste distant.');
   }
 
   void _informer(String message) {
@@ -391,9 +560,12 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   }
 
   /// Contenu session de la barre d'état basse (discrète, doc 03 §3).
+  /// Alimentée en direct par `session_stats` (fps / RTT / octets) dès l'état
+  /// actif ; à défaut, elle reste sur des libellés honnêtes.
   Widget _etatSession() {
     final t = NovaTokens.of(context);
     final peer = _statut?.peer;
+    final stats = _stats;
     return Row(
       children: [
         Flexible(child: SessionStateBadge(etat: _etat, dense: true)),
@@ -404,7 +576,10 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
               if (peer != null) 'Pair : $peer',
               'Qualité : $_qualite',
               _moniteur == 2 ? 'Tous les écrans' : 'Écran ${_moniteur + 1}',
-              'Entrées : $_evenementsEnvoyes évt ($_octetsEnvoyes o)',
+              if (stats != null) '${stats.fps.toStringAsFixed(0)} IPS',
+              if (stats != null) '${(stats.rttUs / 1000).toStringAsFixed(0)} ms',
+              if (stats != null) '↓ ${_formaterOctets(stats.bytesIn)}',
+              'Entrées : $_evenementsEnvoyes',
             ].join(' · '),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
@@ -413,6 +588,18 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
         ),
       ],
     );
+  }
+
+  /// Formate un volume d'octets pour le HUD (Ko/Mo/Go, décimale française).
+  String _formaterOctets(int octets) {
+    if (octets < 1024) return '$octets o';
+    if (octets < 1024 * 1024) {
+      return '${(octets / 1024).toStringAsFixed(0)} Ko';
+    }
+    if (octets < 1024 * 1024 * 1024) {
+      return '${(octets / (1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Mo';
+    }
+    return '${(octets / (1024 * 1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Go';
   }
 
   // ---------------------------------------------------------------------------
@@ -443,14 +630,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                 child: Container(
                   color: const Color(0xFF000000),
                   alignment: Alignment.center,
-                  child: _textureId != null
-                      // Composition zéro-copie de la trame GPU décodée
-                      // (plan 10 §10.3.1).
-                      ? Texture(
-                          textureId: _textureId!,
-                          filterQuality: FilterQuality.medium,
-                        )
-                      : _apercuSimule(),
+                  child: _contenuSurface(),
                 ),
               ),
             ),
@@ -460,9 +640,26 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     );
   }
 
-  /// Aperçu simulé du bureau distant (maquette `.screen`) tant qu'aucune
-  /// texture n'est publiée par le cœur : dégradé sombre, résumé de session,
-  /// barre des tâches esquissée.
+  /// Contenu de la surface : la vidéo décodée dès la première trame reçue,
+  /// sinon le panneau d'attente (établissement / session terminée).
+  Widget _contenuSurface() {
+    final montrerVideo = _aRecuUneTrame && _etat != SessionStateDto.closed;
+    if (!montrerVideo) return _apercuSimule();
+    // SizedBox.expand : la surface vidéo occupe tout le cadre ; le peintre
+    // conserve le ratio et laisse des bandes noires (letterbox) au besoin.
+    return SizedBox.expand(
+      child: RepaintBoundary(
+        child: CustomPaint(
+          painter: _PeintreVideo(_trameCourante),
+          size: Size.infinite,
+        ),
+      ),
+    );
+  }
+
+  /// Aperçu simulé du bureau distant (maquette `.screen`) tant qu'aucune trame
+  /// vidéo n'est encore décodée : dégradé sombre, résumé de session, barre des
+  /// tâches esquissée.
   Widget _apercuSimule() {
     final enEtablissement = switch (_etat) {
       SessionStateDto.resolving ||
@@ -532,9 +729,8 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                 const SizedBox(height: 5),
                 Text(
                   _etat == SessionStateDto.active
-                      ? '1920 × 1080 · 60 IPS · latence 12 ms · '
-                          'chiffré (Noise XX) — la trame décodée sera '
-                          'composée ici (texture GPU, plan 10 §10.3)'
+                      ? 'Réception du flux vidéo… — les trames RGBA décodées '
+                          's’affichent ici (rendu Dart, sans plugin natif)'
                       : 'Chiffrement TLS 1.3 + Noise_IK',
                   textAlign: TextAlign.center,
                   style: TextStyle(
@@ -700,8 +896,11 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
 
   /// Identité du pair : avatar rouge (maquette `.peer .av`) + nom + latence.
   Widget _blocPair() {
+    final stats = _stats;
     final sousTitre = _etat == SessionStateDto.active
-        ? 'connecté · 12 ms'
+        ? (stats != null
+            ? 'connecté · ${(stats.rttUs / 1000).toStringAsFixed(0)} ms'
+            : 'connecté')
         : _etat.label;
     return Padding(
       padding: const EdgeInsets.only(left: 3, right: 12),
@@ -1318,6 +1517,44 @@ class _CorpsBoutonBarreState extends State<_CorpsBoutonBarre> {
       ),
     );
   }
+}
+
+/// Peintre de la surface vidéo : dessine la trame `ui.Image` courante en
+/// conservant le ratio (letterbox sur fond noir), **sans aucun plugin natif**.
+/// Le repeint est piloté par le `ValueListenable` — seule cette surface se
+/// rafraîchit à ~30 IPS, pas le reste de la fenêtre.
+class _PeintreVideo extends CustomPainter {
+  _PeintreVideo(this.trame) : super(repaint: trame);
+
+  final ValueListenable<ui.Image?> trame;
+
+  static final Paint _peinture = Paint()
+    ..filterQuality = FilterQuality.medium
+    ..isAntiAlias = false;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final image = trame.value;
+    if (image == null || size.isEmpty) return;
+    final double iw = image.width.toDouble();
+    final double ih = image.height.toDouble();
+    if (iw <= 0 || ih <= 0) return;
+    // Mise à l'échelle « contain » : conserve le ratio, centre la trame.
+    final double echelle = math.min(size.width / iw, size.height / ih);
+    final double dw = iw * echelle;
+    final double dh = ih * echelle;
+    final double dx = (size.width - dw) / 2;
+    final double dy = (size.height - dh) / 2;
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(0, 0, iw, ih),
+      Rect.fromLTWH(dx, dy, dw, dh),
+      _peinture,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _PeintreVideo old) => old.trame != trame;
 }
 
 /// Message du panneau de discussion.

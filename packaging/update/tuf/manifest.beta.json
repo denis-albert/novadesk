@@ -1,0 +1,48 @@
+{
+  "signed": {
+    "_type": "novadesk-update-manifest",
+    "spec_version": "1.0",
+    "channel": "beta",
+    "latest": "0.2.0",
+    "min_supported": "0.1.0",
+    "expires": "2026-10-02T00:00:00Z",
+    "delta_from": "0.1.0",
+    "artifacts": [
+      {
+        "platform": "windows-x86_64",
+        "kind": "msi",
+        "url": "https://updates.novadesk.example/beta/0.2.0/NovaDesk-0.2.0-x86_64.msi",
+        "size": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "platform": "macos-universal",
+        "kind": "dmg",
+        "url": "https://updates.novadesk.example/beta/0.2.0/NovaDesk-0.2.0-universal.dmg",
+        "size": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "platform": "linux-x86_64",
+        "kind": "appimage",
+        "url": "https://updates.novadesk.example/beta/0.2.0/NovaDesk-0.2.0-x86_64.AppImage",
+        "size": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      {
+        "platform": "linux-x86_64",
+        "kind": "deb",
+        "url": "https://updates.novadesk.example/beta/0.2.0/novadesk_0.2.0_amd64.deb",
+        "size": 0,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  "signatures": [
+    {
+      "keyid": "20372f14067e07790d9ad58aef5350a3ae8d047e42f27f01e7d899776cb66681",
+      "algo": "ed25519",
+      "sig": "3b749fcbd04866b00fb28a80c5e5219a5866e71866c2671647e82c3d8b5a4550cbb35a80eddbacc5f6374e7766345da3a346826b7f6a9c0fcf3fc4a8824aea06"
+    }
+  ]
+}

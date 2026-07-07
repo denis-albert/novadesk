@@ -1,0 +1,11 @@
+# Contexte de build = racine du dépôt : on exclut ce qui alourdit ou n'est pas
+# nécessaire à la compilation des serveurs Rust.
+target/
+**/target/
+ui/build/
+ui/.dart_tool/
+.git/
+.github/
+plan-technique/
+packaging/update/keys/*.hex
+**/*.md

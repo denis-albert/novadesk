@@ -11,6 +11,7 @@
 /// généré produit les octets attendus par le canal `Input`.
 library;
 
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'native_api.dart';
@@ -223,5 +224,158 @@ class MockNativeApi implements NativeApi {
           "événement d'entrée illisible (${data.length} octet(s) reçus)");
     }
     return evenement;
+  }
+
+  // -------------------------------------------------------------------------
+  // Session live — flux de synthèse (démontre le rendu SANS le cœur natif)
+  // -------------------------------------------------------------------------
+
+  int _prochainIdSession = 1;
+  final Map<int, DateTime> _debutSession = {};
+  final Random _alea = Random();
+
+  @override
+  Future<int> startSession({
+    required SessionConfigDto config,
+    required SessionEndpointDto endpoint,
+  }) async {
+    final id = _prochainIdSession++;
+    _debutSession[id] = DateTime.now();
+    return id;
+  }
+
+  @override
+  Future<ListenInfoDto> sessionListenInfo(int id) async {
+    // Hôte fictif en écoute loopback : adresse plausible, certificat vide.
+    return ListenInfoDto(addr: '127.0.0.1:53211', certDer: Uint8List(0));
+  }
+
+  /// Progression d'état de synthèse : `resolving → connecting → handshaking →
+  /// active`, avec des délais réalistes, puis reste actif jusqu'à l'annulation.
+  @override
+  Stream<SessionStateDto> sessionStateStream(int id) async* {
+    const etapes = <(SessionStateDto, int)>[
+      (SessionStateDto.resolving, 350),
+      (SessionStateDto.connecting, 500),
+      (SessionStateDto.handshaking, 450),
+      (SessionStateDto.active, 0),
+    ];
+    for (final (etat, ms) in etapes) {
+      if (ms > 0) {
+        await Future<void>.delayed(Duration(milliseconds: ms));
+      }
+      yield etat;
+    }
+  }
+
+  /// ~30 trames/s d'une mire animée 320×180 (barres de couleur + réticule de
+  /// balayage rouge NovaDesk) : le rendu `VideoFrameDto → ui.Image → CustomPaint`
+  /// est ainsi **démontrable sans DLL native**. S'arrête à l'annulation.
+  @override
+  Stream<VideoFrameDto> sessionVideoStream(int id) {
+    return Stream<VideoFrameDto>.periodic(
+      const Duration(milliseconds: 33),
+      (tick) => _genererFrameMire(tick),
+    );
+  }
+
+  @override
+  Future<SessionStateDto?> waitSessionState(
+    int id, {
+    required int timeoutMs,
+  }) async {
+    // Repli synchrone (l'UI consomme le flux) : renvoie l'état actif après un
+    // court délai borné par [timeoutMs].
+    await Future<void>.delayed(
+      Duration(milliseconds: min(timeoutMs, 50)),
+    );
+    return SessionStateDto.active;
+  }
+
+  @override
+  Future<List<VideoFrameDto>> collectVideoFrames(
+    int id, {
+    required int maxFrames,
+    required int timeoutMs,
+  }) async {
+    // Repli synchrone : renvoie quelques trames de synthèse (borné).
+    final n = max(0, min(maxFrames, 8));
+    return List<VideoFrameDto>.generate(n, _genererFrameMire);
+  }
+
+  @override
+  Future<SessionStatsDto> sessionStats(int id) async {
+    final debut = _debutSession[id];
+    final secondes = debut == null
+        ? 0.0
+        : DateTime.now().difference(debut).inMilliseconds / 1000.0;
+    // Valeurs plausibles avec un léger jitter, montant avec la durée.
+    final fps = secondes < 0.5 ? 0.0 : 29.0 + _alea.nextDouble() * 2.0;
+    return SessionStatsDto(
+      fps: fps,
+      rttUs: 9000 + _alea.nextInt(7000),
+      bytesIn: (secondes * 2100000).round(),
+      bytesOut: (secondes * 7600).round(),
+      frames: (secondes * 30).round(),
+    );
+  }
+
+  @override
+  Future<String?> sessionLastError(int id) async => null;
+
+  @override
+  Future<void> sendInput(int id, InputEventDto event) async {
+    // Le mock accepte et ignore l'entrée (aucun pair réel à piloter).
+  }
+
+  @override
+  Future<void> stopSession(int id) async {
+    _debutSession.remove(id);
+  }
+
+  // Barres facon mire télé : blanc, jaune, cyan, vert, magenta, rouge, bleu, noir.
+  static const List<List<int>> _barresMire = [
+    [236, 239, 244],
+    [232, 205, 74],
+    [86, 199, 214],
+    [96, 194, 120],
+    [206, 106, 197],
+    [231, 86, 76],
+    [86, 118, 224],
+    [26, 28, 34],
+  ];
+
+  /// Génère une trame 320×180 : 8 barres de couleur, un ombrage diagonal qui
+  /// défile (animation visible) et un réticule de balayage rouge #EF443B.
+  VideoFrameDto _genererFrameMire(int tick) {
+    const int w = 320;
+    const int h = 180;
+    final rgba = Uint8List(w * h * 4);
+    final int balayageX = tick % w;
+    final int balayageY = tick % h;
+    final int defile = tick * 3;
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      final bool ligneH = (y - balayageY).abs() < 1;
+      for (var x = 0; x < w; x++) {
+        final barre = _barresMire[(x * 8) ~/ w];
+        // Bandes sombres diagonales qui défilent avec le temps.
+        final int onde = ((x + y + defile) & 63) < 32 ? 0 : 20;
+        int r = barre[0] - onde;
+        int g = barre[1] - onde;
+        int b = barre[2] - onde;
+        // Réticule de balayage aux couleurs NovaDesk (#EF443B).
+        if ((x - balayageX).abs() < 1 || ligneH) {
+          r = 0xEF;
+          g = 0x44;
+          b = 0x3B;
+        }
+        rgba[i++] = r < 0 ? 0 : (r > 255 ? 255 : r);
+        rgba[i++] = g < 0 ? 0 : (g > 255 ? 255 : g);
+        rgba[i++] = b < 0 ? 0 : (b > 255 ? 255 : b);
+        rgba[i++] = 255;
+      }
+    }
+    return VideoFrameDto(width: w, height: h, rgba: rgba);
   }
 }

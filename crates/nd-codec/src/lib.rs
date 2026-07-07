@@ -83,6 +83,15 @@ pub trait VideoEncoder: Send {
     fn set_delta_mode(&mut self, actif: bool) {
         let _ = actif;
     }
+    /// Nom lisible du backend d'encodage réellement à l'œuvre (observabilité :
+    /// journal de session, sondes de diagnostic). Pour un backend matériel, c'est
+    /// le **nom exact** de l'encodeur sélectionné (ex. « NVIDIA H264 Encoder
+    /// MFT ») — la preuve que le GPU est bien utilisé, jamais un libellé « sur le
+    /// papier ». Implémentation par défaut fournie (libellé générique) pour rester
+    /// additif vis-à-vis des implémentations existantes du trait.
+    fn nom_backend(&self) -> &str {
+        "encodeur vidéo (backend non identifié)"
+    }
 }
 
 /// Image décodée : dimensions + pixels RGBA prêts pour l'affichage (voir plan 10).
@@ -105,9 +114,16 @@ pub trait VideoDecoder: Send {
 /// Backend logiciel H.264 (openh264). Voir plan 03.
 mod software;
 
-/// Backend plateforme Windows : H.264 via Media Foundation (MFT). Voir plan 03.
+/// Backend plateforme Windows : H.264 via Media Foundation (MFT logiciel
+/// synchrone — repli du matériel). Voir plan 03.
 #[cfg(windows)]
 mod mediafoundation;
+
+/// Backend plateforme Windows : H.264 via le MFT **matériel asynchrone** (NVENC
+/// sur GPU NVIDIA), énuméré par `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE)`. Voir plan
+/// 03/16 « matériel d'abord ».
+#[cfg(windows)]
+mod nvenc;
 
 /// Négociation de codec entre pairs et échelle de débit adaptatif (ABR). Voir plan 03.
 mod negotiation;
@@ -145,22 +161,42 @@ pub fn create_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
 /// Crée l'encodeur **plateforme/matériel** pour le codec demandé (plan 03
 /// « matériel d'abord »).
 ///
-/// Windows + H.264 → encodeur Media Foundation (MFT — voir `mediafoundation` pour
-/// le choix « MFT logiciel synchrone d'abord, MFT matériel asynchrone ensuite »).
+/// Windows + H.264, dans l'ordre :
+///
+/// 1. **MFT matériel asynchrone** (module `nvenc`) — sur ce parc, l'encodeur
+///    **NVENC** du GPU NVIDIA ; le nom exact du MFT sélectionné est exposé par
+///    [`VideoEncoder::nom_backend`] (preuve matériel). Il honore
+///    `set_target_bitrate` (reconfiguration à chaud sans image-clé parasite) et le
+///    mode delta (saut de trames + conversion partielle).
+/// 2. **Repli documenté** : si aucun MFT matériel n'est énuméré/instanciable
+///    (machine sans GPU dédié, pilote absent, session distante restreinte…), le
+///    MFT **logiciel** Media Foundation prend le relais — même trait, mêmes
+///    appelants, un avertissement clair est émis une fois sur stderr (pas de
+///    façade de journalisation dans le workspace à ce jour). Ce chemin ne panique
+///    jamais : il dégrade proprement.
+///
 /// Autres plateformes ou codecs : `NdError::NotImplemented`. Ce chemin s'ajoute à
 /// [`create_encoder`] (repli logiciel openh264) sans le remplacer : l'appelant
 /// tente d'abord le matériel puis se replie (plan 03/16).
-///
-/// TODO(NVENC, plan 03/16 — lot ultérieur, hors périmètre du lot « boucle de
-/// performance ») : le backend matériel NVIDIA (nvEncodeAPI ou MFT matériel
-/// asynchrone) s'insérera **ici**, derrière une feature `nvenc`, en tête des
-/// candidats — même trait [`VideoEncoder`], mêmes appelants. Il devra honorer
-/// `set_target_bitrate` (reconfiguration NVENC sans image-clé) et le mode delta
-/// (au moins le saut de trames ; le vrai ROI matériel devient alors possible).
 pub fn create_hardware_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
     #[cfg(windows)]
     if kind == CodecKind::H264 {
-        return Ok(Box::new(mediafoundation::MediaFoundationEncoder::new()?));
+        match nvenc::NvencEncoder::new() {
+            Ok(enc) => return Ok(Box::new(enc)),
+            Err(e) => {
+                // Repli logiciel documenté (voir doc ci-dessus) ; avertissement
+                // émis une seule fois par processus pour ne pas noyer stderr
+                // (cette fonction sert aussi de sonde d'inventaire).
+                static REPLI_LOGGE: std::sync::Once = std::sync::Once::new();
+                REPLI_LOGGE.call_once(|| {
+                    eprintln!(
+                        "nd-codec : encodeur H.264 matériel indisponible ({e}) ; \
+                         repli sur le MFT logiciel Media Foundation (plan 03/16)."
+                    );
+                });
+                return Ok(Box::new(mediafoundation::MediaFoundationEncoder::new()?));
+            }
+        }
     }
     #[cfg(not(windows))]
     let _ = kind;

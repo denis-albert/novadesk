@@ -68,6 +68,28 @@ pub fn vers_stereo(echantillons: &[f32], canaux: usize) -> Vec<f32> {
     }
 }
 
+/// Entrelace des canaux **planaires** (non entrelacés, un tampon `f32` par voie)
+/// vers du **stéréo entrelacé** `f32`.
+///
+/// C'est l'agencement livré par ScreenCaptureKit sous macOS (buffers audio
+/// non entrelacés, voir `src/macos.rs`) : chaque voie arrive dans son propre
+/// tampon. Mono → duplication gauche/droite ; deux voies ou plus → seules les
+/// deux premières (avant gauche/droite) sont conservées. Le nombre de frames
+/// retenu est celui du plus court tampon (robustesse). Aucune voie → vide.
+#[must_use]
+pub fn planaire_vers_stereo(canaux: &[&[f32]]) -> Vec<f32> {
+    match canaux {
+        [] => Vec::new(),
+        [mono] => mono.iter().flat_map(|&s| [s, s]).collect(),
+        // `zip` s'arrête au plus court des deux tampons (robustesse).
+        [gauche, droite, ..] => gauche
+            .iter()
+            .zip(droite.iter())
+            .flat_map(|(&g, &d)| [g, d])
+            .collect(),
+    }
+}
+
 /// Déploie un flux **stéréo entrelacé** vers `canaux` voies entrelacées
 /// (chemin de restitution, inverse de [`vers_stereo`]).
 ///
@@ -243,6 +265,50 @@ mod tests {
         // 5.1 tronqué : seules les deux premières voies sont conservées.
         let quad = [1.0, 2.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0];
         assert_eq!(vers_stereo(&quad, 4), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn planaire_mono_duplique() {
+        // Une seule voie planaire → dupliquée en stéréo entrelacé.
+        assert_eq!(
+            planaire_vers_stereo(&[&[0.1, 0.2, 0.3]]),
+            vec![0.1, 0.1, 0.2, 0.2, 0.3, 0.3]
+        );
+    }
+
+    #[test]
+    fn planaire_stereo_entrelace() {
+        // Deux voies planaires (gauche/droite) → entrelacées L,R,L,R.
+        let gauche = [1.0f32, 3.0, 5.0];
+        let droite = [2.0f32, 4.0, 6.0];
+        assert_eq!(
+            planaire_vers_stereo(&[&gauche, &droite]),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn planaire_multivoies_tronque_a_stereo() {
+        // 5.1 planaire : seules les deux premières voies (L/R) sont retenues.
+        let voies: [&[f32]; 3] = [&[1.0, 2.0], &[3.0, 4.0], &[9.0, 9.0]];
+        assert_eq!(planaire_vers_stereo(&voies), vec![1.0, 3.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn planaire_longueurs_inegales_prend_le_min() {
+        // Tampons de longueurs différentes : on s'aligne sur le plus court.
+        let gauche = [1.0f32, 2.0, 3.0];
+        let droite = [10.0f32, 20.0];
+        assert_eq!(
+            planaire_vers_stereo(&[&gauche, &droite]),
+            vec![1.0, 10.0, 2.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn planaire_vide() {
+        let vide: [&[f32]; 0] = [];
+        assert!(planaire_vers_stereo(&vide).is_empty());
     }
 
     #[test]

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Métadonnées AppStream NovaDesk (requises pour Flathub / GNOME Logiciels). -->
+<component type="desktop-application">
+  <id>com.novadesk.NovaDesk</id>
+  <name>NovaDesk</name>
+  <summary>Bureau à distance rapide et chiffré</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <developer_name>Équipe NovaDesk</developer_name>
+  <description>
+    <p>
+      NovaDesk est une solution de bureau à distance : un cœur Rust (réseau,
+      cryptographie, média chiffré de bout en bout) piloté par une interface
+      Flutter. Sous Wayland, la capture d'écran passe par le portail
+      xdg-desktop-portal et PipeWire.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.novadesk.NovaDesk.desktop</launchable>
+  <url type="homepage">https://novadesk.example</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-07-04" />
+  </releases>
+</component>

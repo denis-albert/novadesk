@@ -1,0 +1,22 @@
+#!/bin/sh
+# postinst NovaDesk (.deb) : rafraîchit les caches bureau et recharge systemd.
+# Le service d'accès non surveillé N'est PAS activé automatiquement (choix admin).
+set -e
+
+case "$1" in
+    configure)
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications || true
+        fi
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        echo "NovaDesk installé. Accès non surveillé (optionnel) :"
+        echo "  sudo systemctl enable --now novadesk.service"
+        ;;
+esac
+
+exit 0

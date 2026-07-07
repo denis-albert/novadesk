@@ -3,9 +3,14 @@
 /// façade (mock `MockNativeApi`).
 library;
 
+import 'dart:async';
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart' show TextField;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:novadesk_ui/bridge/mock_api.dart';
+import 'package:novadesk_ui/bridge/native_api.dart';
 import 'package:novadesk_ui/main.dart';
 
 void main() {
@@ -34,21 +39,29 @@ void main() {
 
     await tester.enterText(find.byType(TextField).first, '421887330');
     await tester.tap(find.text('Se connecter'));
-    // Déroule la machine à états simulée (résolution → … → active).
-    await tester.pumpAndSettle();
+    // La session live du mock émet un flux vidéo continu (~30 IPS) : on pompe
+    // par durées bornées (pas de pumpAndSettle tant que la session est ouverte,
+    // sinon l'animation perpétuelle ne « settle » jamais). Le flux d'états du
+    // mock atteint « active » en ~1,3 s.
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 120));
+    }
 
     // Onglet de session + bloc pair de la barre d'outils flottante.
     expect(find.text('poste-bureau'), findsWidgets);
     expect(find.text('active'), findsOneWidget); // badge de la barre d'état
     expect(find.byTooltip('Terminer'), findsOneWidget);
 
-    // Terminer : état « terminée » puis retour à l'accueil (350 ms).
+    // Terminer : arrêt du moteur puis retour à l'accueil.
     // (La barre d'outils défile horizontalement si la fenêtre est étroite.)
     await tester.ensureVisible(find.byTooltip('Terminer'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Terminer'));
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400));
+    await tester.tap(find.byTooltip('Terminer'));
+    // Le dispose annule les flux : une fois de retour à l'accueil, plus
+    // d'animation → pumpAndSettle peut de nouveau se stabiliser.
+    for (var i = 0; i < 8; i++) {
+      await tester.pump(const Duration(milliseconds: 150));
+    }
     await tester.pumpAndSettle();
     expect(find.text('POSTE DISTANT'), findsOneWidget);
   });
@@ -82,5 +95,46 @@ void main() {
     await tester.tap(find.text('Accès non surveillé'));
     await tester.pumpAndSettle();
     expect(find.text("Autoriser l'accès non-surveillé"), findsOneWidget);
+  });
+
+  testWidgets('le flux vidéo du mock se décode en ui.Image (rendu pur Dart)',
+      (tester) async {
+    final api = MockNativeApi();
+    final id = await api.startSession(
+      config: SessionConfigDto(
+        role: SessionRoleDto.controller,
+        localId: 1,
+        peerId: 2,
+        permissions: PermissionsDto.full(),
+      ),
+      endpoint: const SessionEndpointLoopback(),
+    );
+
+    // Le mock émet une mire 320×180 en RGBA (4 octets/pixel).
+    final trames = await api.collectVideoFrames(id, maxFrames: 1, timeoutMs: 100);
+    expect(trames, isNotEmpty);
+    final trame = trames.first;
+    expect(trame.width, 320);
+    expect(trame.height, 180);
+    expect(trame.rgba.length, 320 * 180 * 4);
+
+    // Chemin exact du rendu de la surface : RGBA → ui.Image via
+    // decodeImageFromPixels (runAsync car le décodage natif sort du FakeAsync).
+    await tester.runAsync(() async {
+      final completer = Completer<ui.Image>();
+      ui.decodeImageFromPixels(
+        trame.rgba,
+        trame.width,
+        trame.height,
+        ui.PixelFormat.rgba8888,
+        completer.complete,
+      );
+      final image = await completer.future;
+      expect(image.width, 320);
+      expect(image.height, 180);
+      image.dispose();
+    });
+
+    await api.stopSession(id);
   });
 }
