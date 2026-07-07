@@ -4,6 +4,26 @@
 //!
 //! Règle transverse : les permissions sont **toujours appliquées côté machine
 //! contrôlée** (défense en profondeur), jamais seulement dans l'UI du contrôleur.
+//!
+//! # Points d'intégration pour l'orchestrateur (`nd-core`)
+//!
+//! - **Permissions** : gardes à poser avant chaque action de session —
+//!   [`PermissionBroker::is_allowed`] (chemin chaud, sans journal),
+//!   [`PermissionBroker::authorize`]/[`PermissionBroker::authorize_input`]
+//!   (journalisés), table [`Capability::required_for_input`]. Contrat complet
+//!   en tête de [`permissions`].
+//! - **Enregistrement** : [`Mp4Muxer::record_video_chunk`] consomme les
+//!   `EncodedChunk` H.264 de `nd-codec` et produit un `.mp4` rejouable
+//!   (validé par [`Mp4Reader`]) ; l'archive interne `.ndr`
+//!   ([`IndexedRecorder`]) se convertit via [`ndr_to_mp4`]. Contrat en tête
+//!   de [`recording`].
+//! - **Reconnexion** : [`ReconnectController`] (`on_disconnect` /
+//!   `next_delay` / `reset`) pilote le backoff sans dormir. Contrat en tête
+//!   de [`reconnect`].
+//!
+//! Restent des modèles purs sans effet système, à brancher côté plateforme :
+//! [`privacy`] (exécution des `PrivacyAction`) et [`hotkeys`] (dispatch dans
+//! la boucle d'événements de l'UI) — voir leurs docs de module respectives.
 
 pub mod annotation;
 pub mod hotkeys;
@@ -24,7 +44,8 @@ pub use permissions::{
     PermissionSet,
 };
 pub use privacy::{PrivacyAction, PrivacyState};
-pub use reconnect::{ReconnectPolicy, ReconnectState};
+pub use reconnect::{ReconnectController, ReconnectPolicy, ReconnectState};
+pub use recording::mp4::{ndr_to_mp4, Mp4Muxer, Mp4Reader, Mp4Sample, Mp4ValidationReport};
 pub use recording::{
     IndexedRecorder, KeyframeEntry, RecordedFrame, RecordingMetadata, SessionReader,
     SessionRecorder, ValidationReport,

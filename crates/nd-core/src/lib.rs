@@ -1,14 +1,18 @@
 //! `nd-core` — orchestration d'une session NovaDesk.
 //!
 //! Assemble les composants (transport, session sécurisée, capture/codec/input…) et
-//! porte la **machine à états** de session. À ce stade, seuls la machine à états et le
-//! squelette d'assemblage existent ; le câblage réel des étages arrive en Phase 1
-//! (voir `../../plan-technique/16-roadmap-planning.md`).
+//! porte la **machine à états** de session. Les étages réels (pipelines hôte/viewer,
+//! transport chiffré de bout en bout) sont câblés par l'orchestrateur réutilisable
+//! [`SessionEngine`] (module `session`), qui expose l'état, les frames décodées,
+//! un canal d'entrées et des statistiques continues à un consommateur (future UI,
+//! voir `../../plan-technique/16-roadmap-planning.md`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nd_capture::{CaptureConfig, CapturedFrame, ScreenCapturer};
-use nd_codec::{CodecKind, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder};
+use nd_codec::{CodecKind, DecodedFrame, EncodedChunk, EncoderConfig, VideoDecoder, VideoEncoder};
 use nd_crypto::{HandshakeRole, NoiseHandshake, NoiseSession, PeerFingerprint, SecureSession};
 use nd_features::Permissions;
 use nd_input::{InputInjector, MouseButton};
@@ -16,6 +20,11 @@ use nd_proto::{
     ChannelKind, InputEvent, MonitorId, NdError, NovaId, ProtocolVersion, Reliability, Result,
 };
 use nd_transport::{ChannelHandle, PathEstimate, Transport};
+
+/// Orchestrateur de session réutilisable (threads + canaux). Voir [`SessionEngine`].
+mod session;
+
+pub use session::{SessionEndpoint, SessionEngine, SessionHandle, SessionStats};
 
 /// Rôle du poste local dans la session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +247,56 @@ impl HostPipeline {
         }
         Ok(self.sent)
     }
+
+    /// Mode « flux continu » : capture, encode et envoie jusqu'à la levée du signal
+    /// `stop`. Écran statique : la dernière image disponible est ré-encodée (deltas
+    /// minuscules), comme [`HostPipeline::run`]. La cadence est bornée (~80 img/s)
+    /// pour laisser du temps CPU au reste de la session.
+    ///
+    /// Une erreur d'envoi (pair déconnecté) termine la diffusion **sans** erreur :
+    /// c'est la fin normale d'une session dont l'autre extrémité est partie. Renvoie
+    /// le nombre d'images envoyées par cet appel.
+    pub fn run_streaming(&mut self, stop: Arc<AtomicBool>) -> Result<usize> {
+        let mut envoyees = 0usize;
+        while !stop.load(Ordering::Relaxed) {
+            let frame = self.capturer.next_frame()?;
+            if frame.image.is_some() {
+                if !self.configured {
+                    self.encoder.configure(EncoderConfig {
+                        kind: CodecKind::H264,
+                        width: frame.width,
+                        height: frame.height,
+                        target_bitrate_kbps: 8_000,
+                        max_fps: 60,
+                    })?;
+                    self.configured = true;
+                }
+                self.last_frame = Some(frame);
+            }
+            if !self.configured {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let chunk = {
+                let frame = self
+                    .last_frame
+                    .as_ref()
+                    .expect("configuré implique une image capturée");
+                self.encoder.encode(frame, self.sent == 0)?
+            };
+            if self
+                .transport
+                .send(self.video_channel, chunk.data, Reliability::UnreliableFec)
+                .is_err()
+            {
+                break;
+            }
+            envoyees += 1;
+            self.sent += 1;
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        Ok(envoyees)
+    }
 }
 
 /// Étage **viewer** de la tranche verticale : réception → décodage H.264 (voir plan 01 §2).
@@ -284,6 +343,52 @@ impl ViewerPipeline {
             }
         }
         Ok((self.decoded, self.last_dimensions))
+    }
+
+    /// Draine le transport : décode **tout** ce qui est en attente et renvoie la
+    /// frame la plus récente (les frames en retard d'une même rafale sont décodées
+    /// — le décodeur H.264 a besoin de chaque unité — puis sautées à la livraison).
+    fn drainer_rafale(&mut self) -> Result<Option<DecodedFrame>> {
+        let mut plus_recente = None;
+        while let Some((_canal, donnees)) = self.transport.poll_recv()? {
+            let chunk = EncodedChunk {
+                data: donnees,
+                is_keyframe: false,
+                monitor: MonitorId(0),
+                timestamp_us: 0,
+            };
+            if let Some(frame) = self.decoder.decode(&chunk)? {
+                self.decoded += 1;
+                self.last_dimensions = Some((frame.width, frame.height));
+                plus_recente = Some(frame);
+            }
+        }
+        Ok(plus_recente)
+    }
+
+    /// Mode « flux continu » : reçoit et décode jusqu'à la levée du signal `stop`,
+    /// en passant au callback la frame **la plus récente** de chaque rafale (skip
+    /// des frames en retard, comme la fenêtre de démo `viewer_window`). Le callback
+    /// est le point de branchement du consommateur (UI, canal, enregistreur…).
+    ///
+    /// Renvoie le nombre de frames livrées au callback. [`ViewerPipeline::run`]
+    /// reste disponible pour un décompte borné.
+    pub fn run_streaming(
+        &mut self,
+        mut on_frame: impl FnMut(DecodedFrame),
+        stop: Arc<AtomicBool>,
+    ) -> Result<usize> {
+        let mut livrees = 0usize;
+        while !stop.load(Ordering::Relaxed) {
+            match self.drainer_rafale()? {
+                Some(frame) => {
+                    on_frame(frame);
+                    livrees += 1;
+                }
+                None => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        Ok(livrees)
     }
 }
 

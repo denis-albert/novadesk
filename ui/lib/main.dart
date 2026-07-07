@@ -26,6 +26,7 @@ import 'screens/session_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/unattended_screen.dart';
 import 'state/providers.dart';
+import 'theme/nova_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -82,27 +83,11 @@ String _nomBibliothequeNative() {
   return 'libnd_ffi.so';
 }
 
-/// Racine de l'application : thèmes Material 3 clair/sombre, localisation
-/// française, table des routes.
+/// Racine de l'application : thèmes clair/sombre « parité AnyDesk »
+/// (`theme/nova_theme.dart` — rouge #EF443B en accent parcimonieux, surfaces
+/// neutres à plat), localisation française, table des routes.
 class NovaDeskApp extends ConsumerWidget {
   const NovaDeskApp({super.key});
-
-  /// Thème Material 3 dérivé d'une couleur de base unique
-  /// (design tokens centralisés, plan 10 §10.7.3).
-  static ThemeData _theme(Brightness brightness) {
-    final schema = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF4C5FD5),
-      brightness: brightness,
-    );
-    return ThemeData(
-      useMaterial3: true,
-      colorScheme: schema,
-      visualDensity: VisualDensity.adaptivePlatformDensity,
-      snackBarTheme: const SnackBarThemeData(
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -110,8 +95,8 @@ class NovaDeskApp extends ConsumerWidget {
     return MaterialApp(
       title: 'NovaDesk',
       debugShowCheckedModeBanner: false,
-      theme: _theme(Brightness.light),
-      darkTheme: _theme(Brightness.dark),
+      theme: novaTheme(Brightness.light),
+      darkTheme: novaTheme(Brightness.dark),
       themeMode: modeTheme,
 
       // Langue v1 : français (catalogues ARB multilingues à venir,

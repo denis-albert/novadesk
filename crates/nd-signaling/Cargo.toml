@@ -8,5 +8,12 @@ description = "Client de rendez-vous, ICE/STUN/TURN, mise en relation P2P (voir 
 [dependencies]
 nd-proto = { workspace = true }
 
+# Dépendance de DEV uniquement (sonde examples/p2p_two_process.rs et test
+# d'intégration tests/p2p_quic.rs : porter QUIC sur la socket percée).
+# À l'exécution, nd-signaling reste sans dépendance transport — c'est nd-core
+# qui assemble connecteur (ici) et transport (nd-transport).
+[dev-dependencies]
+nd-transport = { workspace = true }
+
 [lints]
 workspace = true

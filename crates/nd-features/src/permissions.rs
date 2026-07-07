@@ -15,11 +15,40 @@
 //!
 //! Règle transverse (voir `lib.rs`) : ces vérifications s'appliquent côté
 //! machine contrôlée, jamais seulement dans l'interface du contrôleur.
+//!
+//! # Contrat d'intégration (orchestrateur `nd-core`)
+//!
+//! L'application effective des permissions se câble **côté machine
+//! contrôlée**, dans l'orchestrateur, à ces points de passage :
+//!
+//! | Action de session                          | Garde à poser avant l'action                          |
+//! |--------------------------------------------|-------------------------------------------------------|
+//! | injecter un [`InputEvent`] (`apply_input`) | [`Capability::required_for_input`] + garde ci-dessous |
+//! | ouvrir le canal fichiers (envoi)           | [`Capability::FileUpload`]                            |
+//! | ouvrir le canal fichiers (réception)       | [`Capability::FileDownload`]                          |
+//! | démarrer la capture audio                  | [`Capability::Audio`]                                 |
+//! | synchroniser le presse-papiers (lecture)   | [`Capability::ClipboardRead`]                         |
+//! | synchroniser le presse-papiers (écriture)  | [`Capability::ClipboardWrite`]                        |
+//! | ouvrir un enregistreur (`recording`)       | [`Capability::SessionRecording`]                      |
+//! | appliquer un `PrivacyState` (`privacy`)    | [`Capability::PrivacyMode`]                           |
+//! | ouvrir un `LocalForwarder` (`tunnel`)      | [`Capability::TcpTunnel`]                             |
+//! | redémarrer la machine                      | [`Capability::RestartRemote`]                         |
+//!
+//! Deux niveaux de garde, à choisir selon la fréquence :
+//! - [`PermissionBroker::authorize`] (ou [`PermissionBroker::authorize_input`])
+//!   vérifie **et journalise** — à utiliser pour les actions ponctuelles
+//!   (ouverture de canal, démarrage d'enregistrement) et pour tout **refus** ;
+//! - [`PermissionBroker::is_allowed`] vérifie **sans journaliser** — le chemin
+//!   chaud des entrées (des centaines de mouvements de souris par seconde ne
+//!   doivent pas gonfler le journal d'audit). Motif recommandé pour le flux
+//!   d'entrées : `is_allowed` par événement, et `authorize_input` (journalisé)
+//!   au premier événement suivant un changement d'ensemble accordé ou lors
+//!   d'un blocage, pour tracer « qui a été bloqué, quand ».
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nd_proto::{NdError, Result};
+use nd_proto::{InputEvent, NdError, Result};
 
 use crate::Permissions;
 
@@ -89,6 +118,21 @@ impl Capability {
             Capability::SessionRecording => 1 << 9,
             Capability::PrivacyMode => 1 << 10,
             Capability::TcpTunnel => 1 << 11,
+        }
+    }
+
+    /// Capacité requise pour injecter cet événement d'entrée sur la machine
+    /// contrôlée — la table de correspondance que l'orchestrateur applique
+    /// **avant** `nd-core::apply_input` (souris et clavier sont accordés et
+    /// révoqués indépendamment).
+    #[must_use]
+    pub fn required_for_input(event: &InputEvent) -> Capability {
+        match event {
+            InputEvent::MouseMoveAbs { .. }
+            | InputEvent::MouseMoveRel { .. }
+            | InputEvent::MouseButton { .. }
+            | InputEvent::Scroll { .. } => Capability::ControlMouse,
+            InputEvent::Key { .. } | InputEvent::Unicode { .. } => Capability::ControlKeyboard,
         }
     }
 
@@ -460,6 +504,30 @@ impl PermissionBroker {
         autorise
     }
 
+    /// Vérifie qu'`actor` peut injecter cet événement d'entrée, et journalise
+    /// l'issue (voir [`Capability::required_for_input`] pour la table).
+    pub fn authorize_input(&mut self, actor: &str, event: &InputEvent) -> bool {
+        self.authorize(actor, Capability::required_for_input(event))
+    }
+
+    /// La capacité est-elle accordée ? Garde **sans journalisation**, pour le
+    /// chemin chaud (flux d'entrées) — voir le contrat d'intégration en tête
+    /// de module pour l'articulation avec [`PermissionBroker::authorize`].
+    ///
+    /// ```
+    /// use nd_features::{Capability, PermissionBroker, PermissionSet};
+    /// use nd_proto::InputEvent;
+    ///
+    /// let broker = PermissionBroker::with_permissions(PermissionSet::view_only());
+    /// let clic = InputEvent::MouseButton { button: 0, down: true };
+    /// // Session en observation seule : l'injection doit être écartée.
+    /// assert!(!broker.is_allowed(Capability::required_for_input(&clic)));
+    /// ```
+    #[must_use]
+    pub fn is_allowed(&self, cap: Capability) -> bool {
+        self.accordees.allows(cap)
+    }
+
     /// Le journal d'audit, dans l'ordre des événements.
     #[must_use]
     pub fn journal(&self) -> &[AuditEntry] {
@@ -676,6 +744,85 @@ mod tests {
             journal[0].event,
             AuditEvent::ActionAllowed {
                 cap: Capability::ViewScreen
+            }
+        );
+        assert_eq!(
+            journal[1].event,
+            AuditEvent::ActionBlocked {
+                cap: Capability::ControlKeyboard
+            }
+        );
+    }
+
+    #[test]
+    fn mapping_input_vers_capacite_complet() {
+        // Chaque variante du protocole d'entrées a une capacité requise claire.
+        let souris = [
+            InputEvent::MouseMoveAbs {
+                x: 0.5,
+                y: 0.5,
+                monitor: 0,
+            },
+            InputEvent::MouseMoveRel { dx: 1.0, dy: -2.0 },
+            InputEvent::MouseButton {
+                button: 0,
+                down: true,
+            },
+            InputEvent::Scroll { dx: 0.0, dy: 3.0 },
+        ];
+        for evenement in &souris {
+            assert_eq!(
+                Capability::required_for_input(evenement),
+                Capability::ControlMouse,
+                "{evenement:?}"
+            );
+        }
+        let clavier = [
+            InputEvent::Key {
+                scancode: 0x1C,
+                down: true,
+            },
+            InputEvent::Unicode { codepoint: 0xE9 },
+        ];
+        for evenement in &clavier {
+            assert_eq!(
+                Capability::required_for_input(evenement),
+                Capability::ControlKeyboard,
+                "{evenement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_allowed_ne_journalise_pas() {
+        let broker = PermissionBroker::with_permissions(PermissionSet::view_only());
+        assert!(broker.is_allowed(Capability::ViewScreen));
+        assert!(!broker.is_allowed(Capability::ControlMouse));
+        // Garde du chemin chaud : aucune trace dans le journal d'audit.
+        assert!(broker.journal().is_empty());
+    }
+
+    #[test]
+    fn authorize_input_applique_le_mapping_et_journalise() {
+        let mut broker =
+            PermissionBroker::with_permissions([Capability::ControlMouse].into_iter().collect());
+        let clic = InputEvent::MouseButton {
+            button: 0,
+            down: true,
+        };
+        let frappe = InputEvent::Key {
+            scancode: 0x1C,
+            down: true,
+        };
+        assert!(broker.authorize_input("alice", &clic));
+        assert!(!broker.authorize_input("alice", &frappe)); // clavier non accordé
+
+        let journal = broker.journal();
+        assert_eq!(journal.len(), 2);
+        assert_eq!(
+            journal[0].event,
+            AuditEvent::ActionAllowed {
+                cap: Capability::ControlMouse
             }
         );
         assert_eq!(

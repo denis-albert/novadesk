@@ -2,17 +2,15 @@
 //! et lisible que l'utilisateur aidé communique au technicien, avec durée de
 //! vie limitée et option usage unique.
 //!
-//! # Sécurité — AVERTISSEMENT
+//! # Sécurité
 //!
-//! L'aléa des codes est dérivé de sources `std` (horloge nanoseconde, adresse
-//! d'une variable de pile, compteur atomique) mélangées par SplitMix64. C'est
-//! suffisant pour éviter les collisions accidentelles, mais ce n'est **PAS
-//! cryptographique** : un attaquant capable d'estimer l'horloge peut réduire
-//! l'espace de recherche. Un vrai CSPRNG (`OsRng` via `nd-crypto`) remplacera
-//! [`random_code`] avant toute exposition réseau (voir plan 13, §invitations).
+//! Les codes sont tirés du **CSPRNG du système** (`getrandom`, qui s'appuie
+//! sur `ProcessPrng`/`BCryptGenRandom` sous Windows, `getrandom(2)` sous
+//! Linux…) : 45 bits d'entropie par code (9 symboles × 5 bits), sans biais —
+//! l'alphabet de 32 symboles se prête à un tirage exact par groupes de
+//! 5 bits. Aucune source dérivée de l'horloge (voir plan 13, §invitations).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Alphabet des codes : 32 symboles sans caractères ambigus (ni `I`, `O`,
@@ -21,10 +19,6 @@ pub const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// Nombre de symboles utiles d'un code (hors tirets), soit 9 × 5 = 45 bits.
 pub const CODE_SYMBOLS: usize = 9;
-
-/// Compteur global : garantit des graines distinctes même si deux codes sont
-/// générés dans le même quantum d'horloge.
-static COMPTEUR: AtomicU64 = AtomicU64::new(0);
 
 /// Invitation de session éphémère.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,9 +56,12 @@ pub fn unix_now() -> u64 {
 }
 
 /// Génère une invitation valable `ttl_secs` secondes à partir de maintenant.
+/// Le code provient du CSPRNG du système (voir la section Sécurité du module).
 ///
-/// Voir l'avertissement de sécurité du module : le code n'est pas
-/// cryptographique à ce stade.
+/// # Panics
+///
+/// Si la source d'aléa du système est indisponible — situation pathologique
+/// (OS cassé) où il serait dangereux de continuer avec des codes devinables.
 #[must_use]
 pub fn generate_invite(ttl_secs: u64, one_time: bool) -> SessionInvite {
     SessionInvite {
@@ -74,34 +71,22 @@ pub fn generate_invite(ttl_secs: u64, one_time: bool) -> SessionInvite {
     }
 }
 
-/// Finaliseur SplitMix64 : diffuse chaque bit d'entrée sur toute la sortie.
-fn melange64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
-
-/// Tire un code `XXX-XXX-XXX`. **Pas cryptographique** (voir doc du module) :
-/// graine = nanos d'horloge ⊕ adresse de pile (ASLR) ⊕ compteur atomique,
-/// puis un tour de SplitMix64 par symbole.
+/// Tire un code `XXX-XXX-XXX` depuis le CSPRNG du système : 64 bits d'aléa
+/// OS, consommés 5 bits par symbole (l'alphabet compte exactement 32 symboles,
+/// le tirage est donc uniforme, sans biais de modulo).
 fn random_code() -> String {
-    let marqueur = 0u8;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let adresse = std::ptr::addr_of!(marqueur) as usize as u64;
-    let compteur = COMPTEUR.fetch_add(1, Ordering::Relaxed);
-    let mut etat = nanos ^ adresse.rotate_left(32) ^ melange64(compteur);
+    let mut octets = [0u8; 8];
+    getrandom::fill(&mut octets)
+        .expect("source d'aléa du système indisponible : codes d'invitation impossibles");
+    let mut alea = u64::from_le_bytes(octets);
 
     let mut code = String::with_capacity(CODE_SYMBOLS + 2);
     for i in 0..CODE_SYMBOLS {
         if i > 0 && i % 3 == 0 {
             code.push('-');
         }
-        etat = melange64(etat);
-        code.push(char::from(CODE_ALPHABET[(etat & 31) as usize]));
+        code.push(char::from(CODE_ALPHABET[(alea & 31) as usize]));
+        alea >>= 5;
     }
     code
 }
@@ -235,6 +220,42 @@ mod tests {
         let mut vus = std::collections::HashSet::new();
         for _ in 0..100 {
             assert!(vus.insert(generate_invite(60, true).code), "code en double");
+        }
+    }
+
+    #[test]
+    fn csprng_pas_de_collision_sur_un_grand_tirage() {
+        // 45 bits d'entropie : sur 2 000 tirages, la probabilité d'une
+        // collision est ~5,7 × 10⁻⁸ — un doublon signale une régression du
+        // tirage (retour à une graine d'horloge, biais…), pas un hasard.
+        let mut vus = std::collections::HashSet::new();
+        for _ in 0..2_000 {
+            assert!(
+                vus.insert(generate_invite(60, false).code),
+                "collision : le tirage n'est plus cryptographique"
+            );
+        }
+    }
+
+    #[test]
+    fn csprng_couvre_l_alphabet_sur_chaque_position() {
+        // Chaque position du code doit voir passer une vraie diversité de
+        // symboles. Sur 300 tirages uniformes parmi 32 symboles, observer
+        // ≤ 8 symboles distincts à une position donnée est astronomiquement
+        // improbable ; un tirage figé ou fortement biaisé échoue net.
+        let mut par_position: Vec<std::collections::HashSet<u8>> = vec![Default::default(); 9];
+        for _ in 0..300 {
+            let code = generate_invite(60, false).code;
+            for (position, octet) in code.bytes().filter(|o| *o != b'-').enumerate() {
+                par_position[position].insert(octet);
+            }
+        }
+        for (position, symboles) in par_position.iter().enumerate() {
+            assert!(
+                symboles.len() > 8,
+                "position {position} : {} symboles distincts seulement",
+                symboles.len()
+            );
         }
     }
 

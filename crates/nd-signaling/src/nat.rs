@@ -17,16 +17,24 @@
 //!
 //! Avec de simples Binding Requests RFC 5389 on ne teste que le comportement
 //! de **mapping**, pas celui de **filtrage** : distinguer *full cone* /
-//! *restricted* / *port-restricted* exigerait un serveur coopératif répondant
-//! depuis une autre IP/port (CHANGE-REQUEST, RFC 5780), rarement disponible.
-//! [`detect_nat_type`] renvoie donc [`NatType::PortRestricted`] pour tout NAT
-//! cone — l'hypothèse la **plus restrictive**, sûre pour décider du punch ;
-//! [`NatType::FullCone`] et [`NatType::Restricted`] restent dans l'énumération
-//! pour une future détection RFC 5780 ou une configuration manuelle. Autres
-//! angles morts classiques : échantillon unique (un NAT peut changer de
-//! politique sous charge), NAT multiples en cascade, mappings expirés entre
-//! les deux requêtes, réponse d'un seul serveur (comparaison impossible → on
-//! suppose un cone, prudence).
+//! *restricted* / *port-restricted* exige un serveur coopératif répondant
+//! depuis une autre IP/port (CHANGE-REQUEST, RFC 3489/5780), rarement
+//! disponible publiquement. [`detect_nat_type`] renvoie donc
+//! [`NatType::PortRestricted`] pour tout NAT cone — l'hypothèse la **plus
+//! restrictive**, sûre pour décider du punch.
+//!
+//! [`detect_nat_type_rfc5780`] ajoute le test de **filtrage** CHANGE-REQUEST :
+//! face à un serveur qui l'implémente, elle distingue [`NatType::FullCone`] /
+//! [`NatType::Restricted`] / [`NatType::PortRestricted`] ; face à un serveur
+//! muet sur CHANGE-REQUEST (cas des serveurs STUN publics grand public), elle
+//! **dégrade proprement** vers l'hypothèse prudente `PortRestricted` — jamais
+//! vers un résultat optimiste. Prévu pour l'infrastructure NovaDesk (plan 11)
+//! où le serveur STUN sera le nôtre.
+//!
+//! Autres angles morts classiques (les deux détections) : échantillon unique
+//! (un NAT peut changer de politique sous charge), NAT multiples en cascade,
+//! mappings expirés entre les deux requêtes, réponse d'un seul serveur
+//! (comparaison impossible → on suppose un cone, prudence).
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -111,26 +119,112 @@ pub fn detect_nat_type(stun_a: SocketAddr, stun_b: SocketAddr) -> NatType {
 
 /// Cœur de [`detect_nat_type`] avec timeout/tentatives réglables (tests).
 fn detecter(stun_a: SocketAddr, stun_b: SocketAddr, timeout: Duration, tentatives: u32) -> NatType {
-    // Une seule socket pour les deux serveurs : indispensable, deux sockets
-    // auraient deux mappings NAT distincts et la comparaison ne dirait rien.
+    observer_mapping(stun_a, stun_b, timeout, tentatives).1
+}
+
+/// Phase de **mapping** commune aux deux détections : une seule socket
+/// interroge les deux serveurs (indispensable — deux sockets auraient deux
+/// mappings NAT distincts et la comparaison ne dirait rien) puis
+/// [`classifier`] tranche. La socket est rendue pour la phase de filtrage
+/// éventuelle (`None` si le bind a échoué → [`NatType::Blocked`]).
+fn observer_mapping(
+    stun_a: SocketAddr,
+    stun_b: SocketAddr,
+    timeout: Duration,
+    tentatives: u32,
+) -> (Option<UdpSocket>, NatType) {
     let non_specifiee: SocketAddr = match stun_a {
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
     };
     let Ok(socket) = UdpSocket::bind(non_specifiee) else {
-        return NatType::Blocked;
+        return (None, NatType::Blocked);
     };
     let reflexive_a = stun::decouvrir_par_socket(&socket, stun_a, timeout, tentatives).ok();
     let reflexive_b = stun::decouvrir_par_socket(&socket, stun_b, timeout, tentatives).ok();
     let locale = adresse_locale_effective(&socket, stun_a);
-    classifier(locale, reflexive_a, reflexive_b)
+    let nat = classifier(locale, reflexive_a, reflexive_b);
+    (Some(socket), nat)
+}
+
+/// Détection **complète** (mapping + filtrage) du type de NAT, à la
+/// RFC 5780 : comme [`detect_nat_type`], puis, si le mapping est de type
+/// cone, teste le **filtrage** via des CHANGE-REQUEST adressées à `stun_a` :
+///
+/// - réponse reçue depuis une **autre IP** (Test II) → [`NatType::FullCone`] ;
+/// - sinon, réponse reçue depuis un **autre port** (Test III) →
+///   [`NatType::Restricted`] ;
+/// - sinon → [`NatType::PortRestricted`] (hypothèse prudente).
+///
+/// Exige donc un serveur STUN **coopératif** (RFC 3489/5780 : adresse
+/// alternative configurée) : face à un serveur qui ignore CHANGE-REQUEST, le
+/// résultat retombe sur celui de [`detect_nat_type`] — jamais plus optimiste.
+/// Ne renvoie jamais d'erreur (dégradation en classification prudente).
+#[must_use]
+pub fn detect_nat_type_rfc5780(stun_a: SocketAddr, stun_b: SocketAddr) -> NatType {
+    detecter_rfc5780(stun_a, stun_b, TIMEOUT_PAR_DEFAUT, TENTATIVES_PAR_DEFAUT)
+}
+
+/// Cœur de [`detect_nat_type_rfc5780`] avec timeout/tentatives réglables (tests).
+fn detecter_rfc5780(
+    stun_a: SocketAddr,
+    stun_b: SocketAddr,
+    timeout: Duration,
+    tentatives: u32,
+) -> NatType {
+    match observer_mapping(stun_a, stun_b, timeout, tentatives) {
+        // Mapping cone : le test de filtrage peut raffiner la classification.
+        (Some(socket), NatType::PortRestricted) => {
+            classifier_filtrage(&socket, stun_a, timeout, tentatives)
+        }
+        // Open/Symmetric/Blocked : le filtrage n'apporterait rien de plus.
+        (_, autre) => autre,
+    }
+}
+
+/// Tests de filtrage RFC 5780 (§4.4) sur la socket de la phase de mapping.
+///
+/// Une réponse n'est retenue que si sa **source diffère réellement** du
+/// serveur interrogé (un serveur non conforme qui répondrait depuis son
+/// adresse primaire ne prouve rien) : IP différente pour le Test II,
+/// adresse différente (le port suffit) pour le Test III.
+fn classifier_filtrage(
+    socket: &UdpSocket,
+    stun: SocketAddr,
+    timeout: Duration,
+    tentatives: u32,
+) -> NatType {
+    // Test II : réponse demandée depuis une autre IP (et un autre port). La
+    // recevoir prouve que le NAT laisse entrer des sources jamais contactées.
+    if let Ok((_, source)) =
+        stun::decouvrir_change_request(socket, stun, true, true, timeout, tentatives)
+    {
+        if source.ip() != stun.ip() {
+            return NatType::FullCone;
+        }
+    }
+    // Test III : réponse demandée depuis un autre port de la même IP. La
+    // recevoir prouve un filtrage par IP seule (cone restreint).
+    if let Ok((_, source)) =
+        stun::decouvrir_change_request(socket, stun, false, true, timeout, tentatives)
+    {
+        if source != stun {
+            return NatType::Restricted;
+        }
+    }
+    NatType::PortRestricted
 }
 
 /// Adresse locale « effective » de la socket : IP de l'interface de sortie
 /// vers `reference` (découverte par un `connect` UDP sans trafic sur une
 /// socket témoin) + port réellement lié. Nécessaire car la socket est liée à
 /// l'adresse non spécifiée (`0.0.0.0`), inutilisable pour la comparaison.
-fn adresse_locale_effective(socket: &UdpSocket, reference: SocketAddr) -> Option<SocketAddr> {
+/// Réutilisée par le connecteur P2P ([`crate::connect`]) pour construire le
+/// candidat local publié au rendez-vous.
+pub(crate) fn adresse_locale_effective(
+    socket: &UdpSocket,
+    reference: SocketAddr,
+) -> Option<SocketAddr> {
     let port = socket.local_addr().ok()?.port();
     let non_specifiee: SocketAddr = match reference {
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -267,12 +361,33 @@ mod tests {
 
     // --- Détection de bout en bout contre des serveurs STUN simulés -------
 
+    /// Forge une Binding Success Response annonçant `vue` en
+    /// XOR-MAPPED-ADDRESS, avec le transaction ID de la requête reçue.
+    fn reponse_binding(vue: std::net::SocketAddrV4, requete: &[u8]) -> Vec<u8> {
+        const MAGIC_COOKIE: u32 = 0x2112_A442;
+        // Attribut XOR-MAPPED-ADDRESS (IPv4).
+        let mut attrs = Vec::new();
+        attrs.extend_from_slice(&0x0020u16.to_be_bytes());
+        attrs.extend_from_slice(&8u16.to_be_bytes());
+        attrs.push(0);
+        attrs.push(0x01); // famille IPv4
+        attrs.extend_from_slice(&(vue.port() ^ (MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+        attrs.extend_from_slice(&(u32::from(*vue.ip()) ^ MAGIC_COOKIE).to_be_bytes());
+        // En-tête Binding Success Response + transaction ID recopié.
+        let mut rep = Vec::with_capacity(20 + attrs.len());
+        rep.extend_from_slice(&0x0101u16.to_be_bytes());
+        rep.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        rep.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        rep.extend_from_slice(&requete[8..20]);
+        rep.extend_from_slice(&attrs);
+        rep
+    }
+
     /// Serveur STUN simulé en loopback : répond à toute Binding Request par
     /// une réponse XOR-MAPPED-ADDRESS. `reponse` : `None` = renvoyer la
     /// source observée (comportement d'un vrai serveur), `Some(a)` = adresse
     /// forgée (simule la vue publique d'un NAT).
     fn serveur_stun_simule(reponse: Option<SocketAddr>) -> SocketAddr {
-        const MAGIC_COOKIE: u32 = 0x2112_A442;
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let adresse = socket.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -284,22 +399,76 @@ mod tests {
                 let SocketAddr::V4(vue) = reponse.unwrap_or(source) else {
                     continue;
                 };
-                // Attribut XOR-MAPPED-ADDRESS (IPv4).
-                let mut attrs = Vec::new();
-                attrs.extend_from_slice(&0x0020u16.to_be_bytes());
-                attrs.extend_from_slice(&8u16.to_be_bytes());
-                attrs.push(0);
-                attrs.push(0x01); // famille IPv4
-                attrs.extend_from_slice(&(vue.port() ^ (MAGIC_COOKIE >> 16) as u16).to_be_bytes());
-                attrs.extend_from_slice(&(u32::from(*vue.ip()) ^ MAGIC_COOKIE).to_be_bytes());
-                // En-tête Binding Success Response + transaction ID recopié.
-                let mut rep = Vec::with_capacity(20 + attrs.len());
-                rep.extend_from_slice(&0x0101u16.to_be_bytes());
-                rep.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
-                rep.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-                rep.extend_from_slice(&tampon[8..20]);
-                rep.extend_from_slice(&attrs);
-                let _ = socket.send_to(&rep, source);
+                let _ = socket.send_to(&reponse_binding(vue, &tampon[..n]), source);
+            }
+        });
+        adresse
+    }
+
+    /// Extrait les drapeaux CHANGE-REQUEST d'une Binding Request (0 si absent).
+    fn drapeaux_change_request(datagramme: &[u8]) -> u32 {
+        if datagramme.len() < 20 {
+            return 0;
+        }
+        let longueur = usize::from(u16::from_be_bytes([datagramme[2], datagramme[3]]));
+        let Some(attrs) = datagramme.get(20..20 + longueur) else {
+            return 0;
+        };
+        let mut p = 0;
+        while p + 4 <= attrs.len() {
+            let type_attr = u16::from_be_bytes([attrs[p], attrs[p + 1]]);
+            let long_attr = usize::from(u16::from_be_bytes([attrs[p + 2], attrs[p + 3]]));
+            p += 4;
+            let Some(valeur) = attrs.get(p..p + long_attr) else {
+                return 0;
+            };
+            if type_attr == 0x0003 && long_attr == 4 {
+                return u32::from_be_bytes([valeur[0], valeur[1], valeur[2], valeur[3]]);
+            }
+            p += long_attr.next_multiple_of(4);
+        }
+        0
+    }
+
+    /// Serveur STUN simulé **RFC 5780** : dispose d'un autre port
+    /// (`127.0.0.1`) et d'une autre IP (`127.0.0.2`) pour honorer les
+    /// CHANGE-REQUEST — ou les ignorer (`change_*_ok = false`), simulant un
+    /// serveur non coopératif ou un NAT qui filtre la source inconnue.
+    fn serveur_stun_5780(
+        reponse: Option<SocketAddr>,
+        change_ip_ok: bool,
+        change_port_ok: bool,
+    ) -> SocketAddr {
+        let primaire = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let adresse = primaire.local_addr().unwrap();
+        // Adresses alternatives : même IP autre port, et autre IP loopback.
+        let alt_port = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let alt_ip = UdpSocket::bind("127.0.0.2:0").unwrap();
+        std::thread::spawn(move || {
+            let mut tampon = [0u8; 1500];
+            while let Ok((n, source)) = primaire.recv_from(&mut tampon) {
+                if n < 20 {
+                    continue;
+                }
+                let drapeaux = drapeaux_change_request(&tampon[..n]);
+                let veut_ip = drapeaux & 0x4 != 0;
+                let veut_port = drapeaux & 0x2 != 0;
+                // Demande non honorée : silence, le client dégradera vers
+                // l'hypothèse prudente.
+                if (veut_ip && !change_ip_ok) || (!veut_ip && veut_port && !change_port_ok) {
+                    continue;
+                }
+                let emettrice = if veut_ip {
+                    &alt_ip
+                } else if veut_port {
+                    &alt_port
+                } else {
+                    &primaire
+                };
+                let SocketAddr::V4(vue) = reponse.unwrap_or(source) else {
+                    continue;
+                };
+                let _ = emettrice.send_to(&reponse_binding(vue, &tampon[..n]), source);
             }
         });
         adresse
@@ -331,6 +500,66 @@ mod tests {
         let b = serveur_stun_simule(Some(adr("203.0.113.9:44777")));
         assert_eq!(
             detecter(a, b, Duration::from_millis(500), 3),
+            NatType::Symmetric
+        );
+    }
+
+    // --- Détection RFC 5780 (mapping + filtrage CHANGE-REQUEST) -----------
+
+    #[test]
+    fn detection_5780_full_cone_avec_serveur_cooperatif() {
+        let publique = adr("203.0.113.9:44000");
+        // Le serveur A honore les CHANGE-REQUEST (autre IP, autre port) : la
+        // réponse du Test II arrive depuis 127.0.0.2 → filtrage ouvert.
+        let a = serveur_stun_5780(Some(publique), true, true);
+        let b = serveur_stun_simule(Some(publique));
+        assert_eq!(
+            detecter_rfc5780(a, b, Duration::from_millis(500), 3),
+            NatType::FullCone
+        );
+    }
+
+    #[test]
+    fn detection_5780_cone_restreint_par_ip() {
+        let publique = adr("203.0.113.9:44000");
+        // Test II (autre IP) silencieux, Test III (autre port) honoré :
+        // filtrage par IP seule → cone restreint.
+        let a = serveur_stun_5780(Some(publique), false, true);
+        let b = serveur_stun_simule(Some(publique));
+        assert_eq!(
+            detecter_rfc5780(a, b, Duration::from_millis(200), 1),
+            NatType::Restricted
+        );
+    }
+
+    #[test]
+    fn detection_5780_degrade_en_port_restricted_sans_cooperation() {
+        let publique = adr("203.0.113.9:44000");
+        // Serveur muet sur tout CHANGE-REQUEST (cas des serveurs STUN publics
+        // ordinaires) : dégradation vers l'hypothèse prudente.
+        let a = serveur_stun_5780(Some(publique), false, false);
+        let b = serveur_stun_simule(Some(publique));
+        assert_eq!(
+            detecter_rfc5780(a, b, Duration::from_millis(200), 1),
+            NatType::PortRestricted
+        );
+    }
+
+    #[test]
+    fn detection_5780_court_circuite_ouvert_et_symetrique() {
+        // Pas de NAT : réflexive = locale, aucun test de filtrage nécessaire.
+        let a = serveur_stun_5780(None, true, true);
+        let b = serveur_stun_simule(None);
+        assert_eq!(
+            detecter_rfc5780(a, b, Duration::from_millis(500), 3),
+            NatType::Open
+        );
+
+        // Mapping symétrique : le filtrage ne changerait rien au verdict.
+        let a = serveur_stun_simule(Some(adr("203.0.113.9:44000")));
+        let b = serveur_stun_simule(Some(adr("203.0.113.9:44777")));
+        assert_eq!(
+            detecter_rfc5780(a, b, Duration::from_millis(500), 3),
             NatType::Symmetric
         );
     }

@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::allocation::IdEmis;
 use crate::groups::Group;
 use crate::rbac::{AttributionMap, Role};
 use crate::sharing::Beneficiaire;
@@ -43,7 +44,7 @@ pub struct Partage {
 /// antérieure (champ manquant) se charge avec la valeur vide correspondante.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EtatPersistant {
-    /// Carnet d'adresses : jeton de session → contacts.
+    /// Carnet d'adresses : compte → contacts.
     #[serde(default)]
     pub carnet: CarnetMap,
     /// Attributions RBAC : compte → (ressource → rôle).
@@ -58,6 +59,15 @@ pub struct EtatPersistant {
     /// Partages d'appareils, triés à l'écriture.
     #[serde(default)]
     pub partages: Vec<Partage>,
+    /// Attribution d'ID : prochain rang du compteur (monotone, jamais rembobiné).
+    #[serde(default)]
+    pub allocation_compteur: u64,
+    /// Attribution d'ID : clé de permutation (hexadécimal ; vide = à régénérer).
+    #[serde(default)]
+    pub allocation_cle_hex: String,
+    /// Attribution d'ID : registre des ID émis, triés par id à l'écriture.
+    #[serde(default)]
+    pub ids_emis: Vec<IdEmis>,
 }
 
 /// Stockage fichier : un chemin + un verrou d'écriture.
@@ -173,6 +183,13 @@ mod tests {
                 appareil: 100,
                 beneficiaire: Beneficiaire::Groupe(1),
                 role: Role::Operator,
+            }],
+            allocation_compteur: 3,
+            allocation_cle_hex: "aa".repeat(32),
+            ids_emis: vec![IdEmis {
+                id: 123_456_789,
+                compte: "alice".into(),
+                cle_client_hex: "bb".repeat(32),
             }],
         }
     }

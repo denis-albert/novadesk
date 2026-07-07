@@ -10,6 +10,15 @@ nd-proto = { workspace = true }
 # Persistance légère (storage.rs) : état JSON écrit de façon atomique.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Autorité de signature (auth.rs) : jetons applicatifs, jetons d'enregistrement
+# d'ID et tickets de relais — Ed25519 pur Rust (plan 11).
+ed25519-dalek = "2"
+# Encodage hexadécimal des clés et jetons (pur Rust, déjà dans l'arbre).
+hex = "0.4"
+# Graine aléatoire des clés éphémères et de la permutation d'IDs (allocation.rs).
+getrandom = { version = "0.3", features = ["std"] }
+# Fonction de ronde (PRF) de la permutation d'IDs (allocation.rs) — pur Rust.
+sha2 = "0.10"
 
 [lints]
 workspace = true

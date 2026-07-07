@@ -49,12 +49,16 @@ class SessionStateBadge extends StatelessWidget {
             decoration: BoxDecoration(color: couleur, shape: BoxShape.circle),
           ),
           const SizedBox(width: 6),
-          Text(
-            etat.label,
-            style: TextStyle(
-              color: couleur,
-              fontWeight: FontWeight.w600,
-              fontSize: dense ? 12 : 13,
+          Flexible(
+            child: Text(
+              etat.label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: couleur,
+                fontWeight: FontWeight.w600,
+                fontSize: dense ? 12 : 13,
+              ),
             ),
           ),
         ],

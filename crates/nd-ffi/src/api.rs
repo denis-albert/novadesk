@@ -1,11 +1,14 @@
 //! Façade d'API orientée UI — contrat stable pour l'application Flutter (plan 10).
 //!
-//! # Intégration Flutter à venir
+//! # Intégration Flutter
 //!
-//! Lors du câblage `flutter_rust_bridge` (plan 10 — interface client), les types et
-//! fonctions publics de ce module seront annotés `#[flutter_rust_bridge::frb]` et les
-//! flux d'événements passeront par des `StreamSink`. En attendant, tout ici est du
-//! **Rust pur**, synchrone et testable, sans aucune dépendance à Flutter.
+//! Ce module est le **périmètre scanné** par `flutter_rust_bridge_codegen`
+//! (`rust_input: crate::api` dans `ui/flutter_rust_bridge.yaml`) : chaque fonction
+//! publique ici devient une fonction Dart, les paramètres `StreamSink<T>` devenant
+//! des `Stream<T>`. Outre les helpers purs historiques, la façade pilote désormais
+//! le moteur réel : voir « Session live » plus bas ([`start_session`],
+//! [`session_video_stream`]…). La commande de régénération du pont est documentée
+//! en tête de `lib.rs`.
 //!
 //! # Principes du contrat
 //!
@@ -17,9 +20,12 @@
 //! * Les conversions vers/depuis les types internes (`nd_core`, `nd_proto`,
 //!   `nd_features`) vivent ici : l'UI ne manipule jamais les types internes.
 
-use nd_core::{SessionConfig, SessionRole, SessionState};
+use nd_codec::DecodedFrame;
+use nd_core::{SessionConfig, SessionRole, SessionState, SessionStats};
 use nd_features::Permissions;
 use nd_proto::{InputEvent, NovaId};
+
+use crate::frb_generated::StreamSink;
 
 // ---------------------------------------------------------------------------
 // Informations générales
@@ -388,4 +394,187 @@ pub fn decode_input_event(data: &[u8]) -> Result<InputEventDto, String> {
                 data.len()
             )
         })
+}
+
+// ---------------------------------------------------------------------------
+// Session live : DTO
+// ---------------------------------------------------------------------------
+
+/// Image décodée prête à afficher, poussée par [`session_video_stream`]
+/// (miroir plat de `nd_codec::DecodedFrame`).
+///
+/// L'ordre des champs est aussi l'ordre d'encodage sur le pont : ne pas le changer
+/// sans régénérer le binding Dart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoFrameDto {
+    /// Largeur en pixels.
+    pub width: u32,
+    /// Hauteur en pixels.
+    pub height: u32,
+    /// Pixels RGBA (largeur × hauteur × 4 octets), ordre R, G, B, A.
+    pub rgba: Vec<u8>,
+}
+
+impl From<DecodedFrame> for VideoFrameDto {
+    fn from(frame: DecodedFrame) -> Self {
+        VideoFrameDto {
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.rgba,
+        }
+    }
+}
+
+/// Instantané des statistiques d'une session (miroir plat de
+/// [`nd_core::SessionStats`], rafraîchies en continu par le moteur).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionStatsDto {
+    /// Images décodées par seconde, fenêtre glissante d'une seconde (contrôleur).
+    pub fps: f64,
+    /// RTT du chemin réseau en microsecondes.
+    pub rtt_us: u64,
+    /// Octets utiles reçus (après déchiffrement, hors handshake).
+    pub bytes_in: u64,
+    /// Octets utiles émis (avant chiffrement, hors handshake).
+    pub bytes_out: u64,
+    /// Frames décodées livrées depuis le début de la session (contrôleur).
+    pub frames: u64,
+}
+
+impl From<SessionStats> for SessionStatsDto {
+    fn from(stats: SessionStats) -> Self {
+        SessionStatsDto {
+            // Le cœur mesure en `f32` ; le pont Dart ne connaît que le `f64`.
+            fps: f64::from(stats.fps),
+            rtt_us: stats.rtt_us,
+            bytes_in: stats.bytes_in,
+            bytes_out: stats.bytes_out,
+            frames: stats.frames_decoded,
+        }
+    }
+}
+
+/// Point de contact réseau d'une session (miroir plat de
+/// [`nd_core::SessionEndpoint`]).
+///
+/// Couvre la mise en relation testable dès maintenant (loopback/LAN). La résolution
+/// par ID via le serveur de rendez-vous (STUN, hole punching, relais — lot 05)
+/// s'ajoutera ici comme nouvelle variante sans casser les existantes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEndpointDto {
+    /// La session lie un écouteur QUIC local (`127.0.0.1`, port éphémère) et
+    /// **accepte** la connexion entrante (rôle hôte typique). L'adresse et le
+    /// certificat à transmettre au pair se relisent via [`session_listen_info`].
+    Loopback,
+    /// La session **se connecte** directement à `addr` (format « ip:port ») avec le
+    /// certificat auto-signé (DER) épinglé du pair (rôle contrôleur typique).
+    Direct {
+        /// Adresse QUIC (UDP) du pair, ex. « 127.0.0.1:53211 ».
+        addr: String,
+        /// Certificat DER du pair, épinglé à la connexion.
+        cert_der: Vec<u8>,
+    },
+}
+
+/// Coordonnées d'écoute d'une session hôte démarrée en
+/// [`SessionEndpointDto::Loopback`] : à transmettre au pair pour qu'il se connecte
+/// en [`SessionEndpointDto::Direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenInfoDto {
+    /// Adresse d'écoute effective (« 127.0.0.1:port », port éphémère résolu).
+    pub addr: String,
+    /// Certificat auto-signé (DER) à épingler côté pair.
+    pub cert_der: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Session live : cycle de vie et flux
+// ---------------------------------------------------------------------------
+
+/// Démarre une session réelle ([`nd_core::SessionEngine`] : QUIC → Noise →
+/// capture/codec/entrées) et renvoie son **identifiant opaque**.
+///
+/// L'identifiant indexe une table statique interne : toutes les autres fonctions de
+/// session (`session_*`, [`send_input`], [`stop_session`]) le prennent en premier
+/// argument. La session vit jusqu'à [`stop_session`], même si elle se clôt
+/// d'elle-même entre-temps (les statistiques et [`session_last_error`] restent
+/// consultables).
+pub fn start_session(
+    config: SessionConfigDto,
+    endpoint: SessionEndpointDto,
+) -> Result<u64, String> {
+    crate::flux::demarrer_session(config, endpoint)
+}
+
+/// Adresse et certificat d'écoute d'une session démarrée en
+/// [`SessionEndpointDto::Loopback`] (erreur pour les autres endpoints).
+pub fn session_listen_info(id: u64) -> Result<ListenInfoDto, String> {
+    crate::flux::info_ecoute(id)
+}
+
+/// Pousse chaque transition d'état de la session dans `sink`
+/// (`Resolving` → `Connecting` → `Handshaking` → `Active` → … → `Closed`).
+///
+/// Les transitions déjà émises avant l'abonnement sont conservées et livrées
+/// d'emblée (canal tamponné). Un seul consommateur d'états par session : ce flux
+/// **ou** [`wait_session_state`]. Le drain s'arrête à la fin de la session ou à
+/// l'annulation du `Stream` côté Dart.
+pub fn session_state_stream(id: u64, sink: StreamSink<SessionStateDto>) -> Result<(), String> {
+    crate::flux::flux_etats(id, sink)
+}
+
+/// Pousse chaque frame vidéo décodée de la session (rôle contrôleur) dans `sink`.
+///
+/// **C'est la fonction clé du rendu UI** : l'interface peint chaque
+/// [`VideoFrameDto`] reçue. Le moteur saute les frames en retard (file bornée) :
+/// un consommateur lent ne bloque jamais le décodage. Un seul consommateur vidéo
+/// par session : ce flux **ou** [`collect_video_frames`].
+pub fn session_video_stream(id: u64, sink: StreamSink<VideoFrameDto>) -> Result<(), String> {
+    crate::flux::flux_video(id, sink)
+}
+
+/// Attend (au plus `timeout_ms`, écrêté à une heure) la prochaine transition d'état.
+///
+/// Renvoie `Ok(None)` si aucune transition n'arrive dans le délai ou si la session
+/// est terminée (l'état final `Closed` aura été livré auparavant). Lecture
+/// synchrone de repli : mutuellement exclusive avec [`session_state_stream`].
+pub fn wait_session_state(id: u64, timeout_ms: u64) -> Result<Option<SessionStateDto>, String> {
+    crate::flux::attendre_etat(id, timeout_ms)
+}
+
+/// Collecte jusqu'à `max_frames` frames décodées (au plus `timeout_ms`, écrêté à
+/// une heure) et les renvoie d'un bloc.
+///
+/// Lecture synchrone de repli (tests, sondes) : mutuellement exclusive avec
+/// [`session_video_stream`]. Renvoie ce qui a été reçu (possiblement moins que
+/// `max_frames` si le délai expire ou si la session se termine).
+pub fn collect_video_frames(
+    id: u64,
+    max_frames: u32,
+    timeout_ms: u64,
+) -> Result<Vec<VideoFrameDto>, String> {
+    crate::flux::collecter_frames(id, max_frames, timeout_ms)
+}
+
+/// Instantané des statistiques de la session (fps, RTT, octets, frames).
+pub fn session_stats(id: u64) -> Result<SessionStatsDto, String> {
+    crate::flux::statistiques(id)
+}
+
+/// Dernière erreur d'exécution du moteur (`None` tant que la session vit ou si
+/// elle s'est close proprement). À afficher quand l'état passe à `Closed`.
+pub fn session_last_error(id: u64) -> Result<Option<String>, String> {
+    crate::flux::derniere_erreur(id)
+}
+
+/// Pousse un événement d'entrée vers le pair (rôle contrôleur) : l'événement part
+/// sur le canal `Input` chiffré du moteur.
+pub fn send_input(id: u64, event: InputEventDto) -> Result<(), String> {
+    crate::flux::envoyer_entree(id, event.into())
+}
+
+/// Arrête la session et la retire de la table : lève le signal d'arrêt du moteur
+/// puis attend la fin de ses threads (au plus ~5 s). L'identifiant devient invalide.
+pub fn stop_session(id: u64) -> Result<(), String> {
+    crate::flux::arreter_session(id)
 }

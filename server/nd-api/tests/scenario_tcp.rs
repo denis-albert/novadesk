@@ -1,11 +1,14 @@
 //! Tests d'intégration TCP de `nd-api` : un serveur réel dans un thread, un
 //! client TCP qui déroule un scénario réaliste bout en bout par le protocole
-//! (trames `u32` BE), puis la persistance : rouvrir le fichier d'état et
-//! retrouver tout ce qui a été écrit.
+//! (trames `u32` BE) — **jetons applicatifs signés** et RBAC appliqué —, puis
+//! la persistance : rouvrir le fichier d'état et retrouver tout ce qui a été
+//! écrit (carnet, groupes, partages, rôles, ID alloués).
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::time::Duration;
 
+use nd_api::auth::{JetonEnregistrement, SigningKey};
 use nd_api::protocol::{read_frame, write_frame, Request, Response};
 use nd_api::rbac::{Permission, Role};
 use nd_api::services::{serve, Services};
@@ -13,8 +16,8 @@ use nd_api::sharing::Beneficiaire;
 use nd_api::update::{ReleaseChannel, UpdateDecision, UpdateManifest, Version};
 use nd_api::Contact;
 
-/// Jeton de session des tests (tout jeton non vide est accepté pour ce jet).
-const JETON: &str = "jeton-integration";
+/// Durée de vie des jetons de test.
+const UNE_HEURE: Duration = Duration::from_secs(3600);
 
 /// Démarre un serveur `nd-api` sur un port éphémère et renvoie son adresse.
 fn demarrer_serveur(services: Services) -> SocketAddr {
@@ -38,6 +41,17 @@ fn attendre_ok(adresse: SocketAddr, requete: &Request) {
     assert_eq!(aller_retour(adresse, requete), Response::Ok, "{requete:?}");
 }
 
+/// Raccourci : requête dont on attend un refus d'accès (RBAC).
+fn attendre_acces_refuse(adresse: SocketAddr, requete: &Request) {
+    assert_eq!(
+        aller_retour(adresse, requete),
+        Response::Erreur {
+            message: "accès refusé".into()
+        },
+        "{requete:?}"
+    );
+}
+
 /// Chemin d'état unique dans le répertoire temporaire du système.
 fn chemin_etat(nom: &str) -> PathBuf {
     std::env::temp_dir().join(format!("nd-api-int-{}-{nom}.json", std::process::id()))
@@ -45,14 +59,44 @@ fn chemin_etat(nom: &str) -> PathBuf {
 
 #[test]
 fn scenario_complet_par_le_protocole() {
-    let adresse = demarrer_serveur(Services::new());
-    let appareil = 555_000_111;
+    let services = Services::new().avec_compte_racine("racine");
+    let racine = services.emettre_jeton("racine", UNE_HEURE).expect("jeton");
+    let alice = services.emettre_jeton("alice", UNE_HEURE).expect("jeton");
+    let bob = services.emettre_jeton("bob", UNE_HEURE).expect("jeton");
+    let cle_autorite = services.cle_publique_autorite_hex();
+    let adresse = demarrer_serveur(services);
 
-    // 1. Créer un groupe.
+    // 0. Alice provisionne son appareil : allocation d'un ID NovaDesk lié à sa
+    //    clé statique, avec le jeton d'enregistrement pour le rendez-vous.
+    let cle_appareil = SigningKey::from_bytes(&[21u8; 32]);
+    let (appareil, jeton_enregistrement) = match aller_retour(
+        adresse,
+        &Request::AllocateId {
+            jeton: alice.clone(),
+            cle_client: cle_appareil.verifying_key().to_bytes(),
+        },
+    ) {
+        Response::IdAlloue {
+            id,
+            jeton_enregistrement,
+        } => (id, jeton_enregistrement),
+        autre => panic!("IdAlloue attendu, obtenu {autre:?}"),
+    };
+    assert!(
+        (100_000_000..1_000_000_000).contains(&appareil),
+        "{appareil}"
+    );
+    let jeton_enr =
+        JetonEnregistrement::from_bytes(&jeton_enregistrement).expect("jeton décodable");
+    assert_eq!(jeton_enr.id, appareil);
+    let cle = nd_api::auth::cle_publique_depuis_hex(&cle_autorite).expect("clé autorité");
+    assert!(jeton_enr.verifier(&cle), "jeton d'enregistrement signé");
+
+    // 1. Alice crée un groupe (elle en devient l'administratrice).
     let groupe = match aller_retour(
         adresse,
         &Request::CreateGroup {
-            jeton: JETON.into(),
+            jeton: alice.clone(),
             nom: "Support".into(),
         },
     ) {
@@ -60,34 +104,53 @@ fn scenario_complet_par_le_protocole() {
         autre => panic!("GroupeCree attendu, obtenu {autre:?}"),
     };
 
-    // 2. Ajouter un membre.
+    // 2. Ajouter un membre : bob (sans rôle sur le groupe) est refusé, la
+    //    créatrice passe.
+    attendre_acces_refuse(
+        adresse,
+        &Request::AddMember {
+            jeton: bob.clone(),
+            groupe,
+            compte: "bob".into(),
+        },
+    );
     attendre_ok(
         adresse,
         &Request::AddMember {
-            jeton: JETON.into(),
+            jeton: alice.clone(),
             groupe,
             compte: "alice".into(),
         },
     );
 
-    // 3. Partager un appareil au groupe (rôle Operator).
+    // 3. Partager l'appareil au groupe (rôle Operator) : réservé au
+    //    propriétaire de l'ID — bob est refusé, alice passe.
+    attendre_acces_refuse(
+        adresse,
+        &Request::ShareDevice {
+            jeton: bob.clone(),
+            appareil,
+            beneficiaire: Beneficiaire::Groupe(groupe),
+            role: Role::Operator,
+        },
+    );
     attendre_ok(
         adresse,
         &Request::ShareDevice {
-            jeton: JETON.into(),
+            jeton: alice.clone(),
             appareil,
             beneficiaire: Beneficiaire::Groupe(groupe),
             role: Role::Operator,
         },
     );
 
-    // 4. Lister les appareils partagés d'un membre : alice hérite du groupe,
-    //    bob (non membre) ne voit rien.
+    // 4. Lister les appareils partagés : alice hérite du groupe (elle demande
+    //    pour elle-même), bob (non membre) ne voit rien.
     assert_eq!(
         aller_retour(
             adresse,
             &Request::DevicesSharedWith {
-                jeton: JETON.into(),
+                jeton: alice.clone(),
                 compte: "alice".into(),
             },
         ),
@@ -97,11 +160,19 @@ fn scenario_complet_par_le_protocole() {
         aller_retour(
             adresse,
             &Request::DevicesSharedWith {
-                jeton: JETON.into(),
+                jeton: bob.clone(),
                 compte: "bob".into(),
             },
         ),
         Response::Appareils(Vec::new())
+    );
+    // ... et bob ne peut pas espionner les partages d'alice.
+    attendre_acces_refuse(
+        adresse,
+        &Request::DevicesSharedWith {
+            jeton: bob.clone(),
+            compte: "alice".into(),
+        },
     );
 
     // 5. Vérifier le rôle effectif (hérité de l'appartenance au groupe).
@@ -109,7 +180,7 @@ fn scenario_complet_par_le_protocole() {
         aller_retour(
             adresse,
             &Request::EffectiveRole {
-                jeton: JETON.into(),
+                jeton: alice.clone(),
                 compte: "alice".into(),
                 appareil,
             },
@@ -121,7 +192,7 @@ fn scenario_complet_par_le_protocole() {
     match aller_retour(
         adresse,
         &Request::ListGroups {
-            jeton: JETON.into(),
+            jeton: alice.clone(),
             compte: "alice".into(),
         },
     ) {
@@ -134,11 +205,21 @@ fn scenario_complet_par_le_protocole() {
         autre => panic!("Groupes attendus, obtenu {autre:?}"),
     }
 
-    // RBAC : attribution d'un rôle puis vérification des permissions dérivées.
+    // RBAC : alice ne peut pas s'auto-attribuer un rôle sur org-1 ; la racine
+    // le fait, puis les permissions dérivées répondent.
+    attendre_acces_refuse(
+        adresse,
+        &Request::AssignRole {
+            jeton: alice.clone(),
+            compte: "alice".into(),
+            ressource: "org-1".into(),
+            role: Role::Admin,
+        },
+    );
     attendre_ok(
         adresse,
         &Request::AssignRole {
-            jeton: JETON.into(),
+            jeton: racine.clone(),
             compte: "alice".into(),
             ressource: "org-1".into(),
             role: Role::Admin,
@@ -148,7 +229,7 @@ fn scenario_complet_par_le_protocole() {
         aller_retour(
             adresse,
             &Request::HasPermission {
-                jeton: JETON.into(),
+                jeton: alice.clone(),
                 compte: "alice".into(),
                 ressource: "org-1".into(),
                 permission: Permission::ManageMembers,
@@ -161,7 +242,7 @@ fn scenario_complet_par_le_protocole() {
         aller_retour(
             adresse,
             &Request::HasPermission {
-                jeton: JETON.into(),
+                jeton: bob.clone(),
                 compte: "bob".into(),
                 ressource: "org-1".into(),
                 permission: Permission::ViewScreen,
@@ -170,11 +251,11 @@ fn scenario_complet_par_le_protocole() {
         Response::Booleen(false)
     );
 
-    // Le carnet d'adresses fonctionne toujours par le même protocole.
+    // Le carnet d'adresses est celui du compte agissant (dérivé du jeton).
     attendre_ok(
         adresse,
         &Request::AddContact {
-            jeton: JETON.into(),
+            jeton: alice.clone(),
             id: 42,
             alias: "PC bureau".into(),
         },
@@ -183,7 +264,7 @@ fn scenario_complet_par_le_protocole() {
         aller_retour(
             adresse,
             &Request::ListContacts {
-                jeton: JETON.into(),
+                jeton: alice.clone(),
             },
         ),
         Response::Contacts(vec![Contact {
@@ -191,9 +272,13 @@ fn scenario_complet_par_le_protocole() {
             alias: "PC bureau".into(),
         }])
     );
+    assert_eq!(
+        aller_retour(adresse, &Request::ListContacts { jeton: bob.clone() }),
+        Response::Contacts(Vec::new())
+    );
 
-    // Mises à jour : publier un manifeste puis l'interroger (CheckUpdate est
-    // anonyme : pas de jeton).
+    // Mises à jour : publier un manifeste est une opération racine ; alice est
+    // refusée. CheckUpdate reste anonyme (pas de jeton).
     let manifeste = UpdateManifest {
         channel: ReleaseChannel::Stable,
         latest: Version::new(2, 1, 0),
@@ -202,10 +287,17 @@ fn scenario_complet_par_le_protocole() {
         sha256: "cafebabe".repeat(8),
         delta_from: Some(Version::new(2, 0, 0)),
     };
+    attendre_acces_refuse(
+        adresse,
+        &Request::PublishManifest {
+            jeton: alice.clone(),
+            manifeste: manifeste.clone(),
+        },
+    );
     attendre_ok(
         adresse,
         &Request::PublishManifest {
-            jeton: JETON.into(),
+            jeton: racine.clone(),
             manifeste: manifeste.clone(),
         },
     );
@@ -231,11 +323,22 @@ fn scenario_complet_par_le_protocole() {
         Response::MiseAJour(UpdateDecision::ForcedUpdate(manifeste))
     );
 
-    // Configuration : surcharge d'organisation puis configuration effective.
+    // Configuration : la politique d'organisation est une opération de
+    // gestion (bob est refusé, la racine passe) ; la lecture de configuration
+    // effective est ouverte aux comptes authentifiés.
+    attendre_acces_refuse(
+        adresse,
+        &Request::SetPolicy {
+            jeton: bob.clone(),
+            org: "acme".into(),
+            cle: "require_2fa".into(),
+            valeur: "true".into(),
+        },
+    );
     attendre_ok(
         adresse,
         &Request::SetPolicy {
-            jeton: JETON.into(),
+            jeton: racine,
             org: "acme".into(),
             cle: "require_2fa".into(),
             valeur: "true".into(),
@@ -244,7 +347,7 @@ fn scenario_complet_par_le_protocole() {
     match aller_retour(
         adresse,
         &Request::EffectiveConfig {
-            jeton: JETON.into(),
+            jeton: alice,
             org: "acme".into(),
         },
     ) {
@@ -268,33 +371,54 @@ fn scenario_complet_par_le_protocole() {
         autre => panic!("Config attendue, obtenu {autre:?}"),
     }
 
-    // Jeton vide : refusé par le protocole sur une requête authentifiée.
-    assert_eq!(
-        aller_retour(
-            adresse,
-            &Request::CreateGroup {
-                jeton: "  ".into(),
-                nom: "X".into(),
-            },
-        ),
-        Response::Erreur {
-            message: "jeton invalide ou absent".into()
-        }
-    );
+    // Jeton vide ou forgé : refusé par le protocole sur une requête
+    // authentifiée (aucun jeton non signé n'est accepté).
+    for mauvais in ["  ", "jeton-opaque", "nda1.00.00"] {
+        assert_eq!(
+            aller_retour(
+                adresse,
+                &Request::CreateGroup {
+                    jeton: mauvais.into(),
+                    nom: "X".into(),
+                },
+            ),
+            Response::Erreur {
+                message: "jeton invalide ou absent".into()
+            }
+        );
+    }
 }
 
 #[test]
 fn persistance_rouverte_depuis_le_fichier() {
     let chemin = chemin_etat("persistance");
     let _ = std::fs::remove_file(&chemin);
-    let appareil = 777_000_042;
 
     // Premier serveur : état durable, toutes les mutations par le protocole.
-    let adresse = demarrer_serveur(Services::open(&chemin).expect("ouverture"));
+    let services = Services::open(&chemin)
+        .expect("ouverture")
+        .avec_compte_racine("racine");
+    let racine = services.emettre_jeton("racine", UNE_HEURE).expect("jeton");
+    let carol = services.emettre_jeton("carol", UNE_HEURE).expect("jeton");
+    let adresse = demarrer_serveur(services);
+
+    // Carol provisionne son appareil (ID alloué, lié à son compte).
+    let cle_appareil = SigningKey::from_bytes(&[22u8; 32]);
+    let appareil = match aller_retour(
+        adresse,
+        &Request::AllocateId {
+            jeton: carol.clone(),
+            cle_client: cle_appareil.verifying_key().to_bytes(),
+        },
+    ) {
+        Response::IdAlloue { id, .. } => id,
+        autre => panic!("IdAlloue attendu, obtenu {autre:?}"),
+    };
+
     let groupe = match aller_retour(
         adresse,
         &Request::CreateGroup {
-            jeton: JETON.into(),
+            jeton: carol.clone(),
             nom: "Infra".into(),
         },
     ) {
@@ -304,7 +428,7 @@ fn persistance_rouverte_depuis_le_fichier() {
     attendre_ok(
         adresse,
         &Request::AddMember {
-            jeton: JETON.into(),
+            jeton: carol.clone(),
             groupe,
             compte: "carol".into(),
         },
@@ -312,7 +436,7 @@ fn persistance_rouverte_depuis_le_fichier() {
     attendre_ok(
         adresse,
         &Request::ShareDevice {
-            jeton: JETON.into(),
+            jeton: carol.clone(),
             appareil,
             beneficiaire: Beneficiaire::Groupe(groupe),
             role: Role::Viewer,
@@ -321,7 +445,7 @@ fn persistance_rouverte_depuis_le_fichier() {
     attendre_ok(
         adresse,
         &Request::AssignRole {
-            jeton: JETON.into(),
+            jeton: racine,
             compte: "carol".into(),
             ressource: "org-2".into(),
             role: Role::Operator,
@@ -330,7 +454,7 @@ fn persistance_rouverte_depuis_le_fichier() {
     attendre_ok(
         adresse,
         &Request::AddContact {
-            jeton: JETON.into(),
+            jeton: carol,
             id: 1234,
             alias: "Baie serveur".into(),
         },
@@ -344,9 +468,11 @@ fn persistance_rouverte_depuis_le_fichier() {
     );
 
     // Réouverture depuis le fichier : tout l'état durable est là.
-    let rouvert = Services::open(&chemin).expect("réouverture");
+    let rouvert = Services::open(&chemin)
+        .expect("réouverture")
+        .avec_compte_racine("racine");
     assert_eq!(
-        rouvert.carnet.list_contacts(JETON).expect("carnet"),
+        rouvert.carnet.list_contacts("carol").expect("carnet"),
         vec![Contact {
             id: 1234,
             alias: "Baie serveur".into(),
@@ -363,17 +489,31 @@ fn persistance_rouverte_depuis_le_fichier() {
         rouvert.roles.role_of("carol", "org-2"),
         Some(Role::Operator)
     );
+    // La créatrice reste administratrice de son groupe après réouverture.
+    assert_eq!(
+        rouvert.roles.role_of("carol", &format!("groupe:{groupe}")),
+        Some(Role::Admin)
+    );
     // Le compteur d'ids de groupe est lui aussi durable : pas de réutilisation.
     let nouveau = rouvert.groupes.create_group("Nouveau").expect("création");
     assert!(nouveau > groupe, "id réutilisé : {nouveau} <= {groupe}");
+    // L'attribution d'ID est durable : propriétaire retrouvé, jamais réémis.
+    assert!(rouvert.alloc.est_proprietaire(appareil, "carol"));
+    let nouvel_id = rouvert
+        .alloc
+        .allouer("dave", &[9u8; 32])
+        .expect("allocation");
+    assert_ne!(nouvel_id, appareil, "ID réattribué après redémarrage");
 
-    // Et un second serveur branché sur l'état rouvert répond par le protocole.
+    // Et un second serveur branché sur l'état rouvert répond par le protocole
+    // (nouvelle autorité éphémère : on émet un jeton frais pour carol).
+    let carol_bis = rouvert.emettre_jeton("carol", UNE_HEURE).expect("jeton");
     let adresse2 = demarrer_serveur(rouvert);
     assert_eq!(
         aller_retour(
             adresse2,
             &Request::DevicesSharedWith {
-                jeton: JETON.into(),
+                jeton: carol_bis,
                 compte: "carol".into(),
             },
         ),

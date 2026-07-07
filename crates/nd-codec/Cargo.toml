@@ -11,6 +11,9 @@ nd-capture = { workspace = true }
 # Encodeur H.264 logiciel (repli du plan 03). Backends matériels (NVENC / Media
 # Foundation) ajoutés ultérieurement derrière le même trait VideoEncoder.
 openh264 = "0.6"
+# FFI openh264 (mêmes version/lock que la dépendance de `openh264`) : nécessaire au
+# réglage de débit à chaud (ENCODER_OPTION_BITRATE + SBitrateInfo, voir software.rs).
+openh264-sys2 = { version = "0.6", default-features = false }
 
 # Backend Windows Media Foundation (plan 03 « matériel d'abord ») : MFT H.264 via
 # IMFTransform (voir src/mediafoundation.rs).

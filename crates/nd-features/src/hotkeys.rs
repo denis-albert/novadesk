@@ -6,6 +6,22 @@
 //! - en-tête : magic `NDHK` (4 octets) puis version `u16` ;
 //! - puis `u32 nombre_de_liens`, et pour chaque lien :
 //!   `[u8 modificateurs][u32 touche][u32 code_action]`.
+//!
+//! # Intégration — le dispatch N'EST PAS implémenté ici
+//!
+//! Ce module fournit la table et sa persistance ; il n'écoute aucun clavier.
+//! Le branchement attendu, côté **contrôleur** (fenêtre de session de l'UI) :
+//! 1. dans la boucle d'événements clavier de la fenêtre, normaliser
+//!    l'événement en [`Hotkey`] (mêmes bits de modificateurs, code de touche
+//!    du protocole d'entrées `nd-proto`) ;
+//! 2. si [`HotkeyMap::lookup`] rend une [`HostAction`], **consommer**
+//!    l'événement localement (ne pas l'envoyer au poste distant) et exécuter
+//!    l'action via l'orchestrateur — `SendCtrlAltDel` et `ToggleInputBlock`
+//!    repassent par les permissions ([`crate::Capability`]) côté contrôlé ;
+//! 3. sinon, laisser l'événement suivre le chemin normal d'injection.
+//!
+//! TODO(nd-core/UI) : point de branchement du lookup dans la boucle
+//! d'événements de la fenêtre de session — rien n'est câblé ici.
 
 use std::collections::BTreeMap;
 

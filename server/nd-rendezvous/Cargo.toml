@@ -3,11 +3,14 @@ name = "nd-rendezvous"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Serveur de signalisation / rendez-vous (par ID). Voir plan 05/11."
+description = "Serveur de signalisation / rendez-vous (par ID), avec preuve de possession d'ID. Voir plan 05/11."
 
 [dependencies]
 nd-proto = { workspace = true }
 nd-signaling = { workspace = true }
+# Formats signés partagés (jeton d'enregistrement d'ID, Ed25519) : l'autorité
+# vit dans nd-api, le rendez-vous ne fait que vérifier (plan 11).
+nd-api = { path = "../nd-api" }
 
 [lints]
 workspace = true

@@ -18,6 +18,11 @@
 //!    avec des rôles opposés — voir [`punch`] pour la théorie des NAT et
 //!    [`nat::detect_nat_type`] pour anticiper le repli relais (`nd-relay`).
 //!
+//! Le module [`connect`] câble ces étapes en un **connecteur de bout en
+//! bout** : [`establish_p2p`] (appelant) / [`await_p2p`] (appelé) rendent un
+//! socket UDP percé prêt à porter QUIC (via `nd-transport`), ou signalent le
+//! repli relais.
+//!
 //! Implémentation std pure (TCP bloquant, un thread par connexion). Le serveur de
 //! production sera asynchrone et à l'échelle (voir plan 11).
 //!
@@ -36,12 +41,19 @@ use std::time::{Duration, Instant};
 
 use nd_proto::{NdError, NovaId, Result};
 
+/// Connecteur P2P de bout en bout : STUN + candidats + punch coordonnés.
+pub mod connect;
 /// Détection best-effort du type de NAT (comparaison de deux serveurs STUN).
 pub mod nat;
 /// UDP hole punching coordonné par le rendez-vous (théorie des NAT incluse).
 pub mod punch;
 /// Client STUN (RFC 5389) : découverte de l'adresse réflexive publique.
 pub mod stun;
+
+pub use connect::{
+    await_p2p, await_p2p_with_timeout, establish_p2p, establish_p2p_with_timeout, ConnAttempt,
+    DirectPath, IncomingPath, P2pIncoming,
+};
 
 /// Enregistrement d'un pair résolu par son ID.
 #[derive(Debug, Clone)]
@@ -709,6 +721,14 @@ impl RendezvousClient {
     #[must_use]
     pub fn new(server: SocketAddr) -> Self {
         Self { server }
+    }
+
+    /// Adresse du serveur de rendez-vous interrogé par ce client. Sert de
+    /// référence de routage au connecteur ([`connect`]) pour déterminer
+    /// l'interface de sortie du candidat local.
+    #[must_use]
+    pub fn server_addr(&self) -> SocketAddr {
+        self.server
     }
 
     fn round_trip(&self, req: &Request) -> Result<Response> {

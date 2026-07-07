@@ -61,9 +61,28 @@ pub trait VideoEncoder: Send {
     /// (Re)configure l'encodeur (résolution, débit, codec).
     fn configure(&mut self, cfg: EncoderConfig) -> Result<()>;
     /// Encode une frame capturée. `force_keyframe` impose un point de resynchro.
+    ///
+    /// En mode delta ([`Self::set_delta_mode`]), une frame sans région modifiée
+    /// (`CapturedFrame::dirty` vide, pixels facultatifs) produit une **trame de
+    /// répétition** : un [`EncodedChunk`] à données vides, que le décodeur traite
+    /// comme « pas de nouvelle image » ([`VideoDecoder::decode`] → `Ok(None)`).
     fn encode(&mut self, frame: &CapturedFrame, force_keyframe: bool) -> Result<EncodedChunk>;
-    /// Ajuste le débit cible à chaud (appelé par l'ABR).
+    /// Ajuste le débit cible à chaud (appelé par l'ABR — voir [`RateController`]).
     fn set_target_bitrate(&mut self, kbps: u32);
+    /// Active/désactive l'**encodage delta** : exploitation des régions modifiées
+    /// (`CapturedFrame::dirty`) — saut des trames inchangées, conversion couleur
+    /// restreinte aux régions annoncées, image-clé adaptative (voir le module
+    /// `delta` pour la politique et les limites).
+    ///
+    /// **Opt-in** : ne l'activer que si la source de capture renseigne
+    /// **fidèlement** `dirty` (toutes les régions modifiées, déplacements/scroll
+    /// inclus). `dirty` vide signifie alors « rien n'a changé » ; chez une source
+    /// qui ne suit pas les régions, il signifie « inconnu » et activer ce mode
+    /// gèlerait l'image. Par défaut (implémentation fournie) : ignoré —
+    /// comportement plein cadre historique.
+    fn set_delta_mode(&mut self, actif: bool) {
+        let _ = actif;
+    }
 }
 
 /// Image décodée : dimensions + pixels RGBA prêts pour l'affichage (voir plan 10).
@@ -93,6 +112,13 @@ mod mediafoundation;
 /// Négociation de codec entre pairs et échelle de débit adaptatif (ABR). Voir plan 03.
 mod negotiation;
 
+/// Encodage delta : exploitation des régions modifiées (`CapturedFrame::dirty`) —
+/// saut de trames, conversion partielle, image-clé adaptative. Voir plan 03.
+mod delta;
+
+/// Contrôleur ABR : boucle fermée estimations réseau → `set_target_bitrate`.
+mod rate;
+
 /// Mesure de qualité pour le banc de test (PSNR/MSE/SSIM, export Y4M). Voir plan 14.
 /// 100 % portable : aucune FFI, aucune dépendance plateforme.
 mod metrics;
@@ -101,6 +127,7 @@ pub use metrics::{mse_rgba, psnr_luma, psnr_par_canal_rgba, psnr_rgba, ssim_luma
 pub use negotiation::{
     available_encoders, negotiate, BitrateLadder, ContentProfile, NetworkEstimate,
 };
+pub use rate::RateController;
 
 /// Crée l'encodeur pour le codec demandé.
 ///
@@ -123,6 +150,13 @@ pub fn create_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
 /// Autres plateformes ou codecs : `NdError::NotImplemented`. Ce chemin s'ajoute à
 /// [`create_encoder`] (repli logiciel openh264) sans le remplacer : l'appelant
 /// tente d'abord le matériel puis se replie (plan 03/16).
+///
+/// TODO(NVENC, plan 03/16 — lot ultérieur, hors périmètre du lot « boucle de
+/// performance ») : le backend matériel NVIDIA (nvEncodeAPI ou MFT matériel
+/// asynchrone) s'insérera **ici**, derrière une feature `nvenc`, en tête des
+/// candidats — même trait [`VideoEncoder`], mêmes appelants. Il devra honorer
+/// `set_target_bitrate` (reconfiguration NVENC sans image-clé) et le mode delta
+/// (au moins le saut de trames ; le vrai ROI matériel devient alors possible).
 pub fn create_hardware_encoder(kind: CodecKind) -> Result<Box<dyn VideoEncoder>> {
     #[cfg(windows)]
     if kind == CodecKind::H264 {

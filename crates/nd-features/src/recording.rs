@@ -24,9 +24,26 @@
 //!
 //! Le contenu des images est opaque : l'enregistreur ne décode rien, il
 //! archive fidèlement ce que le codec lui donne (voir plan 13, §enregistrement).
+//!
+//! # Produire une vidéo lisible par un lecteur standard
+//!
+//! Le `.ndr` est un format d'archive interne. Pour un fichier **rejouable
+//! dans VLC/ffmpeg**, utiliser le sous-module [`mp4`] :
+//! - en direct : [`mp4::Mp4Muxer`] accepte les [`nd_codec::EncodedChunk`]
+//!   H.264 via [`mp4::Mp4Muxer::record_video_chunk`] et produit un `.mp4`
+//!   standard (avcC réelle, index d'images-clés `stss`, intégrité BLAKE3) ;
+//! - après coup : [`mp4::ndr_to_mp4`] convertit une archive `.ndr` v2 en MP4.
+//!
+//! Contrat côté orchestrateur (nd-core) : vérifier
+//! [`crate::Capability::SessionRecording`] via le [`crate::PermissionBroker`]
+//! **avant** d'ouvrir un enregistreur, et forcer une image-clé à l'encodeur au
+//! démarrage (le premier échantillon d'un MP4 doit être une image-clé).
+
+pub mod mp4;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use nd_codec::EncodedChunk;
 use nd_proto::{NdError, Result};
 
 /// Magic en tête d'un enregistrement NovaDesk v1 (séquentiel).
@@ -151,6 +168,13 @@ impl<W: Write> SessionRecorder<W> {
         self.sortie.write_all(data)?;
         self.images += 1;
         Ok(())
+    }
+
+    /// Archive une unité encodée telle que produite par `nd-codec`
+    /// (horodatage et drapeau image-clé repris du chunk ; le champ `monitor`
+    /// est ignoré — un enregistrement par moniteur).
+    pub fn record_video_chunk(&mut self, chunk: &EncodedChunk) -> Result<()> {
+        self.record(chunk.timestamp_us, chunk.is_keyframe, &chunk.data)
     }
 
     /// Nombre d'images écrites depuis l'ouverture.
@@ -288,6 +312,13 @@ impl<W: Write> IndexedRecorder<W> {
         self.images += 1;
         self.dernier_ts = Some(timestamp_us);
         Ok(())
+    }
+
+    /// Archive une unité encodée telle que produite par `nd-codec`
+    /// (horodatage et drapeau image-clé repris du chunk ; le champ `monitor`
+    /// est ignoré — un enregistrement par moniteur).
+    pub fn record_video_chunk(&mut self, chunk: &EncodedChunk) -> Result<()> {
+        self.record(chunk.timestamp_us, chunk.is_keyframe, &chunk.data)
     }
 
     /// Nombre d'images écrites depuis l'ouverture.
@@ -1222,5 +1253,31 @@ mod tests_v2 {
         octets.extend_from_slice(MAGIC_V2);
         octets.extend_from_slice(&1u16.to_le_bytes());
         assert!(SessionReader::new(octets.as_slice()).is_err());
+    }
+
+    #[test]
+    fn record_video_chunk_reprend_les_champs_du_chunk() {
+        use nd_proto::MonitorId;
+
+        let chunk = EncodedChunk {
+            data: b"unite-h264-opaque".to_vec(),
+            is_keyframe: true,
+            monitor: MonitorId(3), // ignoré : enregistrement mono-piste
+            timestamp_us: 12_345,
+        };
+        let mut enregistreur = IndexedRecorder::new(Vec::new(), meta_de_test(), false).unwrap();
+        enregistreur.record_video_chunk(&chunk).unwrap();
+        let octets = enregistreur.finish().unwrap();
+
+        let mut lecteur = SessionReader::new(octets.as_slice()).unwrap();
+        let image = lecteur.next_frame().unwrap().unwrap();
+        assert_eq!(image.timestamp_us, 12_345);
+        assert!(image.keyframe);
+        assert_eq!(image.data, chunk.data);
+
+        // Même comportement pour le format séquentiel v1.
+        let mut v1 = SessionRecorder::new(Vec::new()).unwrap();
+        v1.record_video_chunk(&chunk).unwrap();
+        assert_eq!(v1.frames_written(), 1);
     }
 }

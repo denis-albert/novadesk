@@ -11,7 +11,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nd_proto::{NdError, Result};
 
@@ -23,6 +23,14 @@ const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
 /// Attribut XOR-MAPPED-ADDRESS (RFC 5389 §15.2).
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// Attribut CHANGE-REQUEST (RFC 3489 §11.2.4, repris par RFC 5780 §7.2) :
+/// demande au serveur de répondre depuis une autre IP et/ou un autre port —
+/// c'est la brique du test de **filtrage** NAT (voir [`crate::nat`]).
+const ATTR_CHANGE_REQUEST: u16 = 0x0003;
+/// Drapeau CHANGE-REQUEST « changer d'adresse IP ».
+const CHANGE_IP: u32 = 0x4;
+/// Drapeau CHANGE-REQUEST « changer de port ».
+const CHANGE_PORT: u32 = 0x2;
 /// Taille de l'en-tête STUN (type + longueur + cookie + transaction ID).
 const HEADER_LEN: usize = 20;
 /// Famille d'adresse IPv4 dans un attribut d'adresse.
@@ -77,6 +85,33 @@ fn construire_binding_request(transaction_id: &[u8; 12]) -> [u8; HEADER_LEN] {
     // req[2..4] : longueur des attributs = 0 (déjà à zéro).
     req[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
     req[8..20].copy_from_slice(transaction_id);
+    req
+}
+
+/// Construit une Binding Request portant un attribut CHANGE-REQUEST : le
+/// serveur (s'il implémente RFC 3489/5780) répondra depuis une autre IP
+/// et/ou un autre port selon les drapeaux.
+fn construire_binding_request_change(
+    transaction_id: &[u8; 12],
+    change_ip: bool,
+    change_port: bool,
+) -> Vec<u8> {
+    let mut drapeaux = 0u32;
+    if change_ip {
+        drapeaux |= CHANGE_IP;
+    }
+    if change_port {
+        drapeaux |= CHANGE_PORT;
+    }
+    let mut req = Vec::with_capacity(HEADER_LEN + 8);
+    req.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    // Longueur des attributs : CHANGE-REQUEST = 4 octets d'en-tête + 4 de valeur.
+    req.extend_from_slice(&8u16.to_be_bytes());
+    req.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    req.extend_from_slice(transaction_id);
+    req.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
+    req.extend_from_slice(&4u16.to_be_bytes());
+    req.extend_from_slice(&drapeaux.to_be_bytes());
     req
 }
 
@@ -250,6 +285,64 @@ pub(crate) fn decouvrir_par_socket(
     Err(derniere)
 }
 
+/// Transaction Binding avec attribut **CHANGE-REQUEST** sur une socket
+/// fournie (test de filtrage NAT, RFC 3489/5780 — voir [`crate::nat`]) : la
+/// réponse attendue provient d'une **autre** adresse que `serveur`, c'est tout
+/// l'objet du test. Renvoie `(adresse mappée, source de la réponse)` — c'est à
+/// l'appelant de vérifier que la source a bien changé.
+///
+/// Les datagrammes dont le transaction ID ne correspond pas (réponses
+/// tardives d'une transaction précédente sur la même socket, parasites) sont
+/// ignorés sans consommer la tentative. Laisse le timeout de lecture de la
+/// socket positionné.
+pub(crate) fn decouvrir_change_request(
+    socket: &UdpSocket,
+    serveur: SocketAddr,
+    change_ip: bool,
+    change_port: bool,
+    timeout: Duration,
+    tentatives: u32,
+) -> Result<(SocketAddr, SocketAddr)> {
+    let transaction_id = nouveau_transaction_id();
+    let requete = construire_binding_request_change(&transaction_id, change_ip, change_port);
+    let mut tampon = [0u8; 1500];
+    let mut derniere = erreur("aucune réponse au CHANGE-REQUEST");
+    for _ in 0..tentatives {
+        socket.send_to(&requete, serveur)?;
+        // Fenêtre d'écoute de la tentative : bornée par `timeout` global.
+        let echeance = Instant::now() + timeout;
+        loop {
+            let Some(restant) = echeance
+                .checked_duration_since(Instant::now())
+                .filter(|r| !r.is_zero())
+            else {
+                break; // fenêtre écoulée : retransmission
+            };
+            socket.set_read_timeout(Some(restant))?;
+            match socket.recv_from(&mut tampon) {
+                Ok((n, source)) => {
+                    match analyser_binding_response(&tampon[..n], &transaction_id) {
+                        Ok(mappee) => return Ok((mappee, source)),
+                        // Parasite ou transaction périmée : on continue d'écouter.
+                        Err(e) => derniere = e,
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                // ICMP « port unreachable » remonté par Windows : on continue.
+                Err(_) => {}
+            }
+        }
+    }
+    Err(derniere)
+}
+
 /// Découvre l'adresse réflexive publique via le serveur STUN donné.
 ///
 /// Raccourci : `StunClient::new(stun_server).discover()`.
@@ -315,6 +408,30 @@ mod tests {
     #[test]
     fn transaction_ids_distincts() {
         assert_ne!(nouveau_transaction_id(), nouveau_transaction_id());
+    }
+
+    #[test]
+    fn requete_change_request_bien_formee() {
+        let req = construire_binding_request_change(&TID, true, false);
+        assert_eq!(req.len(), HEADER_LEN + 8);
+        assert_eq!(u16::from_be_bytes([req[0], req[1]]), BINDING_REQUEST);
+        // Longueur des attributs : 8 (en-tête TLV + valeur u32).
+        assert_eq!(u16::from_be_bytes([req[2], req[3]]), 8);
+        // Attribut CHANGE-REQUEST avec le seul drapeau « change IP ».
+        assert_eq!(u16::from_be_bytes([req[20], req[21]]), ATTR_CHANGE_REQUEST);
+        assert_eq!(u16::from_be_bytes([req[22], req[23]]), 4);
+        let drapeaux = u32::from_be_bytes([req[24], req[25], req[26], req[27]]);
+        assert_eq!(drapeaux, CHANGE_IP);
+
+        // Les deux drapeaux combinés.
+        let req = construire_binding_request_change(&TID, true, true);
+        let drapeaux = u32::from_be_bytes([req[24], req[25], req[26], req[27]]);
+        assert_eq!(drapeaux, CHANGE_IP | CHANGE_PORT);
+
+        // Aucun drapeau : l'attribut reste présent, valeur nulle.
+        let req = construire_binding_request_change(&TID, false, false);
+        let drapeaux = u32::from_be_bytes([req[24], req[25], req[26], req[27]]);
+        assert_eq!(drapeaux, 0);
     }
 
     #[test]

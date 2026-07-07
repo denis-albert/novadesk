@@ -1,17 +1,16 @@
-/// Fenêtre de session (plan 10 §10.4.2) : surface vidéo distante, barre
-/// d'outils (moniteurs, qualité, plein écran, Ctrl+Alt+Suppr, chat,
-/// fichiers, fin de session) et barre d'état.
+/// Fenêtre de session — vue « En session » de la maquette
+/// `anydesk-reference.html` : surface vidéo plein cadre sur fond noir,
+/// **barre d'outils flottante sombre** centrée en haut (pair, sécurité,
+/// affichage, entrées, outils, permissions, actions, « Terminer » rouge),
+/// chrome (onglets + barre d'état) masqué en plein écran.
 ///
 /// Rendu vidéo (plan 10 §10.3) : la trame décodée reste en mémoire GPU ; le
-/// cœur Rust enregistre une **texture externe** auprès de l'embedder Flutter
-/// (crate `irondash_texture`) et publiera un `textureId` entier. Ici, tant
-/// que le pont réel n'est pas branché, `_textureId` reste `null` et un
-/// panneau d'attente est affiché à la place du widget [Texture].
+/// cœur Rust publiera un `textureId` entier. Tant que le pont réel n'est pas
+/// branché, `_textureId` reste `null` et un aperçu simulé est affiché.
 ///
 /// Capture des entrées : la surface écoute souris ([Listener]) et clavier
 /// ([Focus]) ; chaque geste devient un `InputEventDto` sérialisé par
-/// `encode_input_event` (façade `nd-ffi`) — les octets produits partiront
-/// sur le canal `Input` une fois le transport branché.
+/// `encode_input_event` (façade `nd-ffi`).
 library;
 
 import 'dart:async';
@@ -27,6 +26,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../bridge/native_api.dart';
 import '../platform/window_shim.dart';
 import '../state/providers.dart';
+import '../theme/nova_theme.dart';
+import '../widgets/app_frame.dart';
+import '../widgets/nova_icons.dart';
 import '../widgets/session_state_badge.dart';
 
 /// Arguments de navigation vers la fenêtre de session.
@@ -57,8 +59,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   final TextEditingController _chatController = TextEditingController();
 
   /// Identifiant de texture GPU externe fourni par le cœur Rust.
-  /// `null` tant que le pont réel n'est pas branché (plan 10 §10.3) ;
-  /// il sera alors assigné à réception de l'événement `Streaming`.
+  /// `null` tant que le pont réel n'est pas branché (plan 10 §10.3).
   // ignore: prefer_final_fields
   int? _textureId;
 
@@ -68,8 +69,21 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
 
   // Barre d'outils.
   int _moniteur = 0;
-  String _qualite = 'Auto';
+  String _qualite = 'Équilibré';
   bool _pleinEcran = false;
+  bool _enregistre = false;
+  bool _favori = false;
+  String _dispositionClavier = 'Auto';
+  bool _transmettreRaccourcis = true;
+
+  // Permissions commutables en cours de session (habillage : l'application
+  // réelle des bascules passera par le canal contrôle du cœur, lot 04).
+  late bool _permAudio = _permissions.audio;
+  late bool _permClavierSouris =
+      _permissions.keyboard && !_permissions.viewOnly;
+  late bool _permPressePapiers = _permissions.clipboard;
+  bool _permBloquerEntree = false;
+  bool _permConfidentialite = false;
 
   // Compteurs d'entrées encodées (HUD honnête, plan 10 §10.6.2).
   int _evenementsEnvoyes = 0;
@@ -103,6 +117,20 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
       _etat == SessionStateDto.active &&
       !_permissions.viewOnly &&
       _permissions.keyboard;
+
+  /// Initiales du pair pour l'avatar de la barre d'outils (« PB »).
+  String get _initialesPair {
+    final mots = widget.args.libellePair
+        .split(RegExp(r'[\s\-_.]+'))
+        .where((m) => m.isNotEmpty)
+        .toList();
+    if (mots.isEmpty) return '?';
+    if (mots.length == 1) {
+      return mots.first.substring(0, math.min(2, mots.first.length))
+          .toUpperCase();
+    }
+    return (mots[0][0] + mots[1][0]).toUpperCase();
+  }
 
   @override
   void initState() {
@@ -312,6 +340,8 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     );
   }
 
+  void _aVenir(String fonction) => _informer('$fonction — à venir (lot 04).');
+
   void _ouvrirTransferts() {
     showModalBottomSheet<void>(
       context: context,
@@ -338,95 +368,59 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     final theme = Theme.of(context);
     return Scaffold(
       key: _cleScaffold,
-      appBar: _pleinEcran ? null : _barreOutils(theme),
       endDrawer: _panneauChat(theme),
-      body: Column(
-        children: [
-          Expanded(child: _surfaceDistante(theme)),
-          _barreEtat(theme),
-        ],
+      body: NovaAppFrame(
+        ongletActif: NovaOnglet.session,
+        libelleSession: widget.args.libellePair,
+        masquerChrome: _pleinEcran,
+        etatGauche: _etatSession(),
+        corps: Stack(
+          children: [
+            Positioned.fill(child: _surfaceDistante()),
+            // Barre d'outils flottante, centrée en haut (maquette .toolbar).
+            Positioned(
+              top: 14,
+              left: 12,
+              right: 12,
+              child: Center(child: _barreOutils()),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  PreferredSizeWidget _barreOutils(ThemeData theme) {
-    return AppBar(
-      title: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.cast_connected, size: 20),
-          const SizedBox(width: 10),
-          Text(widget.args.libellePair),
-        ],
-      ),
-      actions: [
-        // Sélecteur de moniteur distant (plan 13 : multi-moniteur).
-        PopupMenuButton<int>(
-          tooltip: 'Moniteur distant',
-          icon: const Icon(Icons.monitor_outlined),
-          initialValue: _moniteur,
-          onSelected: (valeur) {
-            setState(() => _moniteur = valeur);
-            _informer('Affichage de l’écran distant ${valeur + 1}.');
-          },
-          itemBuilder: (context) => [
-            for (var i = 0; i < 2; i++)
-              PopupMenuItem(value: i, child: Text('Écran ${i + 1}')),
-          ],
-        ),
-        // Politique de qualité : la boucle d'adaptation reste côté cœur
-        // (plans 03/04) ; l'UI n'envoie qu'une intention.
-        PopupMenuButton<String>(
-          tooltip: 'Qualité',
-          icon: const Icon(Icons.tune),
-          initialValue: _qualite,
-          onSelected: (valeur) {
-            setState(() => _qualite = valeur);
-            _informer('Politique de qualité : $valeur.');
-          },
-          itemBuilder: (context) => const [
-            PopupMenuItem(value: 'Auto', child: Text('Auto (adaptatif)')),
-            PopupMenuItem(value: 'Fluidité', child: Text('Fluidité')),
-            PopupMenuItem(value: 'Netteté', child: Text('Netteté')),
-          ],
-        ),
-        IconButton(
-          tooltip: _pleinEcran ? 'Quitter le plein écran (F11)'
-              : 'Plein écran (F11)',
-          icon: Icon(
-            _pleinEcran ? Icons.fullscreen_exit : Icons.fullscreen,
+  /// Contenu session de la barre d'état basse (discrète, doc 03 §3).
+  Widget _etatSession() {
+    final t = NovaTokens.of(context);
+    final peer = _statut?.peer;
+    return Row(
+      children: [
+        Flexible(child: SessionStateBadge(etat: _etat, dense: true)),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            [
+              if (peer != null) 'Pair : $peer',
+              'Qualité : $_qualite',
+              _moniteur == 2 ? 'Tous les écrans' : 'Écran ${_moniteur + 1}',
+              'Entrées : $_evenementsEnvoyes évt ($_octetsEnvoyes o)',
+            ].join(' · '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 11, color: t.texte3),
           ),
-          onPressed: _basculerPleinEcran,
         ),
-        IconButton(
-          tooltip: 'Envoyer Ctrl+Alt+Suppr',
-          icon: const Icon(Icons.keyboard_command_key),
-          onPressed:
-              _etat == SessionStateDto.active ? _envoyerCtrlAltSuppr : null,
-        ),
-        IconButton(
-          tooltip: 'Discussion',
-          icon: const Icon(Icons.chat_bubble_outline),
-          onPressed: () => _cleScaffold.currentState?.openEndDrawer(),
-        ),
-        IconButton(
-          tooltip: 'Transfert de fichiers',
-          icon: const Icon(Icons.folder_open_outlined),
-          onPressed: _permissions.files ? _ouvrirTransferts : null,
-        ),
-        const SizedBox(width: 8),
-        IconButton(
-          tooltip: 'Terminer la session',
-          icon: Icon(Icons.call_end, color: theme.colorScheme.error),
-          onPressed: _terminerSession,
-        ),
-        const SizedBox(width: 4),
       ],
     );
   }
 
-  /// Surface distante : capture souris/clavier + rendu vidéo.
-  Widget _surfaceDistante(ThemeData theme) {
+  // ---------------------------------------------------------------------------
+  // Surface distante
+  // ---------------------------------------------------------------------------
+
+  /// Surface distante : capture souris/clavier + rendu vidéo sur fond noir.
+  Widget _surfaceDistante() {
     return LayoutBuilder(
       builder: (context, contraintes) {
         return Listener(
@@ -447,7 +441,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
               // chrome, et inversement (plan 10 §10.6.3).
               child: RepaintBoundary(
                 child: Container(
-                  color: const Color(0xFF101014),
+                  color: const Color(0xFF000000),
                   alignment: Alignment.center,
                   child: _textureId != null
                       // Composition zéro-copie de la trame GPU décodée
@@ -456,7 +450,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                           textureId: _textureId!,
                           filterQuality: FilterQuality.medium,
                         )
-                      : _panneauAttente(theme),
+                      : _apercuSimule(),
                 ),
               ),
             ),
@@ -466,8 +460,10 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     );
   }
 
-  /// Panneau affiché tant qu'aucune texture n'est publiée par le cœur.
-  Widget _panneauAttente(ThemeData theme) {
+  /// Aperçu simulé du bureau distant (maquette `.screen`) tant qu'aucune
+  /// texture n'est publiée par le cœur : dégradé sombre, résumé de session,
+  /// barre des tâches esquissée.
+  Widget _apercuSimule() {
     final enEtablissement = switch (_etat) {
       SessionStateDto.resolving ||
       SessionStateDto.connecting ||
@@ -476,76 +472,225 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
         true,
       _ => false,
     };
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (enEtablissement)
-          const SizedBox(
-            width: 36,
-            height: 36,
-            child: CircularProgressIndicator(strokeWidth: 3),
-          )
-        else
-          Icon(
-            _etat == SessionStateDto.closed
-                ? Icons.link_off
-                : Icons.desktop_windows_outlined,
-            size: 56,
-            color: Colors.white38,
-          ),
-        const SizedBox(height: 16),
-        Text(
-          switch (_etat) {
-            SessionStateDto.active => 'Surface vidéo distante',
-            SessionStateDto.closed => 'Session terminée',
-            _ => 'Session ${_etat.label}…',
-          },
-          style: theme.textTheme.titleMedium?.copyWith(color: Colors.white70),
+    final peer = _statut?.peer;
+
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: RadialGradient(
+          center: Alignment(-0.36, -0.48),
+          radius: 1.25,
+          colors: [Color(0xFF223052), Color(0xFF16182A), Color(0xFF0C0E16)],
+          stops: [0.0, 0.62, 1.0],
         ),
-        if (_etat == SessionStateDto.active) ...[
-          const SizedBox(height: 8),
-          const Text(
-            'La trame décodée sera composée ici via une texture GPU externe\n'
-            'publiée par le cœur Rust (widget Texture, zéro copie — plan 10 §10.3).',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white38, fontSize: 12),
+      ),
+      child: Stack(
+        children: [
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (enEtablissement)
+                  const SizedBox(
+                    width: 34,
+                    height: 34,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      color: Color(0xFF7F88B3),
+                    ),
+                  )
+                else
+                  NovaIcone(
+                    _etat == SessionStateDto.closed
+                        ? NovaIcones.lienCoupe
+                        : NovaIcones.moniteur,
+                    taille: 54,
+                    couleur: const Color(0xFF7F88B3),
+                  ),
+                const SizedBox(height: 12),
+                Text.rich(
+                  TextSpan(
+                    text: switch (_etat) {
+                      SessionStateDto.active => 'Écran distant — ',
+                      SessionStateDto.closed => 'Session terminée — ',
+                      _ => 'Session ${_etat.label}… — ',
+                    },
+                    children: [
+                      TextSpan(
+                        text: peer == null
+                            ? widget.args.libellePair
+                            : '${widget.args.libellePair} · $peer',
+                        style: const TextStyle(
+                          color: Color(0xFFCFD6F2),
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                  style: const TextStyle(
+                      fontSize: 13, color: Color(0xFF9AA3C8)),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  _etat == SessionStateDto.active
+                      ? '1920 × 1080 · 60 IPS · latence 12 ms · '
+                          'chiffré (Noise XX) — la trame décodée sera '
+                          'composée ici (texture GPU, plan 10 §10.3)'
+                      : 'Chiffrement TLS 1.3 + Noise_IK',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    color: const Color(0xFF9AA3C8).withValues(alpha: 0.72),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Barre des tâches esquissée (maquette `.taskbar`).
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: 40,
+            child: Container(
+              color: const Color(0xFF0A0C14).withValues(alpha: 0.66),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(
+                children: [
+                  _pastilleTache(const Color(0xFF3A63D0)),
+                  const SizedBox(width: 9),
+                  _pastilleTache(Colors.white.withValues(alpha: 0.10)),
+                  const SizedBox(width: 9),
+                  _pastilleTache(Colors.white.withValues(alpha: 0.10)),
+                  const SizedBox(width: 9),
+                  _pastilleTache(Colors.white.withValues(alpha: 0.10)),
+                  const Spacer(),
+                  const Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text('14:07',
+                          style: TextStyle(
+                              fontSize: 11.5, color: Color(0xFFC3C9DF))),
+                      Text('lun. 7 juil.',
+                          style: TextStyle(
+                              fontSize: 10, color: Color(0x99C3C9DF))),
+                    ],
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
-      ],
+      ),
     );
   }
 
-  /// Barre d'état : badge d'état, sécurité, pair, compteurs d'entrées.
-  Widget _barreEtat(ThemeData theme) {
-    final peer = _statut?.peer;
-    return Material(
-      color: theme.colorScheme.surfaceContainerHighest,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+  Widget _pastilleTache(Color couleur) {
+    return Container(
+      width: 24,
+      height: 24,
+      decoration: BoxDecoration(
+        color: couleur,
+        borderRadius: BorderRadius.circular(5),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Barre d'outils flottante
+  // ---------------------------------------------------------------------------
+
+  static const Color _iconeBarre = Color(0xFFCFD3DA);
+
+  Widget _barreOutils() {
+    final actif = _etat == SessionStateDto.active;
+    return Container(
+      padding: const EdgeInsets.all(5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1C21).withValues(alpha: 0.94),
+        borderRadius: BorderRadius.circular(11),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.09)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.5),
+            blurRadius: 34,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
         child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            SessionStateBadge(etat: _etat, dense: true),
-            const SizedBox(width: 12),
-            Icon(Icons.lock_outline,
-                size: 14, color: theme.colorScheme.outline),
-            const SizedBox(width: 4),
-            Text(
-              'Chiffré — TLS 1.3 + Noise_IK',
-              style: theme.textTheme.bodySmall,
+            _blocPair(),
+            _separateur(),
+            // Sécurité / empreinte (indicateur en barre d'outils, doc 03 §3).
+            _menuSecurite(),
+            _separateur(),
+            // Affichage.
+            _menuMoniteurs(),
+            _menuQualite(),
+            _BoutonBarre(
+              icone: _pleinEcran
+                  ? NovaIcones.quitterPleinEcran
+                  : NovaIcones.pleinEcran,
+              infobulle: _pleinEcran
+                  ? 'Quitter le plein écran (F11)'
+                  : 'Plein écran (F11)',
+              onTap: () => unawaited(_basculerPleinEcran()),
             ),
-            if (_etat == SessionStateDto.active) ...[
-              const SizedBox(width: 12),
-              Text('SAS 47-19-83', style: theme.textTheme.bodySmall),
-            ],
-            if (peer != null) ...[
-              const SizedBox(width: 12),
-              Text('Pair : $peer', style: theme.textTheme.bodySmall),
-            ],
-            const Spacer(),
-            Text(
-              'Entrées : $_evenementsEnvoyes évt ($_octetsEnvoyes o) · '
-              'Qualité : $_qualite · Écran ${_moniteur + 1}',
-              style: theme.textTheme.bodySmall,
+            _separateur(),
+            // Entrées.
+            _menuClavier(),
+            _BoutonBarre(
+              icone: NovaIcones.ctrlAltSuppr,
+              infobulle: 'Ctrl+Alt+Suppr',
+              onTap: actif ? () => unawaited(_envoyerCtrlAltSuppr()) : null,
+            ),
+            _menuPressePapiers(),
+            _separateur(),
+            // Outils.
+            _BoutonBarre(
+              icone: NovaIcones.dossier,
+              infobulle: 'Transfert de fichiers',
+              onTap: _permissions.files ? _ouvrirTransferts : null,
+            ),
+            _BoutonBarre(
+              icone: NovaIcones.discussion,
+              infobulle: 'Discussion',
+              onTap: () => _cleScaffold.currentState?.openEndDrawer(),
+            ),
+            _BoutonBarre(
+              icone: NovaIcones.enregistrer,
+              infobulle: _enregistre
+                  ? "Arrêter l'enregistrement"
+                  : 'Enregistrer la session',
+              actif: _enregistre,
+              pastilleRouge: _enregistre,
+              onTap: () {
+                setState(() => _enregistre = !_enregistre);
+                _informer(_enregistre
+                    ? 'Enregistrement démarré (démo — moteur au lot 04).'
+                    : 'Enregistrement arrêté.');
+              },
+            ),
+            _separateur(),
+            // Permissions, favori, actions.
+            _menuPermissions(),
+            _BoutonBarre(
+              icone: _favori ? NovaIcones.etoilePleine : NovaIcones.etoile,
+              infobulle:
+                  _favori ? 'Retirer des favoris' : 'Ajouter aux favoris',
+              onTap: () => setState(() => _favori = !_favori),
+            ),
+            _menuActions(),
+            _separateur(),
+            _BoutonBarre(
+              icone: NovaIcones.fermer,
+              infobulle: 'Terminer',
+              fermeture: true,
+              onTap: () => unawaited(_terminerSession()),
             ),
           ],
         ),
@@ -553,9 +698,415 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     );
   }
 
-  /// Panneau latéral de discussion (contenu local ; le canal réel viendra
-  /// du cœur via un Stream FRB).
+  /// Identité du pair : avatar rouge (maquette `.peer .av`) + nom + latence.
+  Widget _blocPair() {
+    final sousTitre = _etat == SessionStateDto.active
+        ? 'connecté · 12 ms'
+        : _etat.label;
+    return Padding(
+      padding: const EdgeInsets.only(left: 3, right: 12),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 26,
+            height: 26,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: kNovaRouge,
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Text(
+              _initialesPair,
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(width: 9),
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.args.libellePair,
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+              Text(
+                sousTitre,
+                style:
+                    const TextStyle(fontSize: 10.5, color: Color(0xFF8B929C)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _separateur() {
+    return Container(
+      width: 1,
+      height: 24,
+      margin: const EdgeInsets.symmetric(horizontal: 5),
+      color: Colors.white.withValues(alpha: 0.12),
+    );
+  }
+
+  /// Item informatif (non cliquable mais lisible) pour les menus.
+  PopupMenuItem<T> _itemInfo<T>(String texte, {NovaIconeData? icone}) {
+    return PopupMenuItem<T>(
+      enabled: false,
+      height: 32,
+      child: Row(
+        children: [
+          if (icone != null) ...[
+            NovaIcone(icone, taille: 14),
+            const SizedBox(width: 8),
+          ],
+          Expanded(
+            child: Text(
+              texte,
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurface,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _menuSecurite() {
+    return PopupMenuButton<void>(
+      tooltip: 'Sécurité de la connexion',
+      offset: const Offset(0, 42),
+      itemBuilder: (context) => [
+        PopupMenuItem<void>(
+          enabled: false,
+          height: 34,
+          child: Row(
+            children: [
+              const NovaIcone(NovaIcones.bouclierCoche,
+                  taille: 15, couleur: kNovaVert),
+              const SizedBox(width: 8),
+              Text(
+                'Connexion vérifiée',
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        _itemInfo<void>('Transport : P2P direct (QUIC)',
+            icone: NovaIcones.globe),
+        _itemInfo<void>('Chiffrement : TLS 1.3 + Noise_IK',
+            icone: NovaIcones.cadenas),
+        _itemInfo<void>('Empreinte : 9A:F2:04:6B:D8:33:71:CE',
+            icone: NovaIcones.cle),
+        _itemInfo<void>('SAS : 47-19-83', icone: NovaIcones.coche),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.cadenas,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  Widget _menuMoniteurs() {
+    return PopupMenuButton<int>(
+      tooltip: 'Moniteurs',
+      offset: const Offset(0, 42),
+      initialValue: _moniteur,
+      onSelected: (valeur) {
+        setState(() => _moniteur = valeur);
+        _informer(valeur == 2
+            ? 'Affichage de tous les écrans distants.'
+            : "Affichage de l'écran distant ${valeur + 1}.");
+      },
+      itemBuilder: (context) => [
+        for (var i = 0; i < 2; i++)
+          PopupMenuItem(value: i, height: 34, child: Text('Écran ${i + 1}')),
+        const PopupMenuItem(
+            value: 2, height: 34, child: Text('Tous les écrans')),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.moniteurs,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  Widget _menuQualite() {
+    const politiques = [
+      'Meilleure qualité',
+      'Équilibré',
+      'Meilleures performances',
+    ];
+    return PopupMenuButton<String>(
+      tooltip: 'Qualité / vitesse',
+      offset: const Offset(0, 42),
+      initialValue: _qualite,
+      onSelected: (valeur) {
+        setState(() => _qualite = valeur);
+        _informer('Politique de qualité : $valeur.');
+      },
+      itemBuilder: (context) => [
+        for (final politique in politiques)
+          PopupMenuItem(
+            value: politique,
+            height: 34,
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 20,
+                  child: politique == _qualite
+                      ? const NovaIcone(NovaIcones.coche, taille: 13)
+                      : null,
+                ),
+                Text(politique),
+              ],
+            ),
+          ),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.qualite,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  Widget _menuClavier() {
+    return PopupMenuButton<String>(
+      tooltip: 'Clavier et saisie',
+      offset: const Offset(0, 42),
+      onSelected: (valeur) {
+        if (valeur == 'raccourcis') {
+          setState(() => _transmettreRaccourcis = !_transmettreRaccourcis);
+        } else {
+          setState(() => _dispositionClavier = valeur);
+          _informer('Disposition clavier : $valeur.');
+        }
+      },
+      itemBuilder: (context) => [
+        _itemInfo<String>('Mode de transmission des touches'),
+        for (final disposition in const ['Auto', 'AZERTY (fr)', 'QWERTY (us)'])
+          PopupMenuItem(
+            value: disposition,
+            height: 34,
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 20,
+                  child: disposition == _dispositionClavier
+                      ? const NovaIcone(NovaIcones.coche, taille: 13)
+                      : null,
+                ),
+                Text(disposition),
+              ],
+            ),
+          ),
+        const PopupMenuDivider(),
+        CheckedPopupMenuItem(
+          value: 'raccourcis',
+          height: 34,
+          checked: _transmettreRaccourcis,
+          child: const Text('Transmettre les raccourcis système'),
+        ),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.clavier,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  Widget _menuPressePapiers() {
+    return PopupMenuButton<String>(
+      tooltip: 'Presse-papiers',
+      offset: const Offset(0, 42),
+      onSelected: (valeur) => _aVenir(valeur == 'envoyer'
+          ? 'Envoi du presse-papiers'
+          : 'Récupération du presse-papiers distant'),
+      itemBuilder: (context) => const [
+        PopupMenuItem(
+            value: 'envoyer',
+            height: 34,
+            child: Text('Envoyer le presse-papiers')),
+        PopupMenuItem(
+            value: 'recuperer',
+            height: 34,
+            child: Text('Récupérer le presse-papiers distant')),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.pressePapiers,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  /// Permissions commutables (menu à cases — doc 03 §3 item 10).
+  Widget _menuPermissions() {
+    return PopupMenuButton<String>(
+      tooltip: 'Permissions',
+      offset: const Offset(0, 42),
+      onSelected: (valeur) => setState(() {
+        switch (valeur) {
+          case 'audio':
+            _permAudio = !_permAudio;
+          case 'entrees':
+            _permClavierSouris = !_permClavierSouris;
+          case 'presse':
+            _permPressePapiers = !_permPressePapiers;
+          case 'bloquer':
+            _permBloquerEntree = !_permBloquerEntree;
+          case 'confidentialite':
+            _permConfidentialite = !_permConfidentialite;
+        }
+      }),
+      itemBuilder: (context) => [
+        _itemInfo<String>('Permissions de la session'),
+        CheckedPopupMenuItem(
+          value: 'audio',
+          height: 34,
+          checked: _permAudio,
+          child: const Text('Transmettre le son'),
+        ),
+        CheckedPopupMenuItem(
+          value: 'entrees',
+          height: 34,
+          checked: _permClavierSouris,
+          child: const Text('Clavier et souris'),
+        ),
+        CheckedPopupMenuItem(
+          value: 'presse',
+          height: 34,
+          checked: _permPressePapiers,
+          child: const Text('Presse-papiers'),
+        ),
+        const PopupMenuDivider(),
+        CheckedPopupMenuItem(
+          value: 'bloquer',
+          height: 34,
+          checked: _permBloquerEntree,
+          child: const Text("Bloquer l'entrée distante"),
+        ),
+        CheckedPopupMenuItem(
+          value: 'confidentialite',
+          height: 34,
+          checked: _permConfidentialite,
+          child: const Text('Mode confidentialité'),
+        ),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.bouclier,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  /// Actions à distance (menu groupé — doc 03 §3 item 8).
+  Widget _menuActions() {
+    return PopupMenuButton<String>(
+      tooltip: 'Actions',
+      offset: const Offset(0, 42),
+      onSelected: (valeur) {
+        switch (valeur) {
+          case 'cad':
+            unawaited(_envoyerCtrlAltSuppr());
+          case 'elevation':
+            _aVenir("Demande d'élévation (UAC)");
+          case 'verrouiller':
+            _aVenir('Verrouillage du poste distant');
+          case 'redemarrer':
+            _aVenir('Redémarrage du poste distant');
+          case 'capture':
+            _aVenir("Capture d'écran");
+          case 'tunnel':
+            _aVenir('Tunnel TCP');
+        }
+      },
+      itemBuilder: (context) => [
+        _itemInfo<String>('Actions à distance'),
+        const PopupMenuItem(
+          value: 'elevation',
+          height: 34,
+          child: Row(children: [
+            NovaIcone(NovaIcones.eclair, taille: 14),
+            SizedBox(width: 8),
+            Text("Demander l'élévation (UAC)"),
+          ]),
+        ),
+        const PopupMenuItem(
+          value: 'cad',
+          height: 34,
+          child: Row(children: [
+            NovaIcone(NovaIcones.ctrlAltSuppr, taille: 14),
+            SizedBox(width: 8),
+            Text('Envoyer Ctrl+Alt+Suppr'),
+          ]),
+        ),
+        const PopupMenuItem(
+          value: 'verrouiller',
+          height: 34,
+          child: Row(children: [
+            NovaIcone(NovaIcones.cadenas, taille: 14),
+            SizedBox(width: 8),
+            Text('Verrouiller le poste distant'),
+          ]),
+        ),
+        const PopupMenuItem(
+          value: 'redemarrer',
+          height: 34,
+          child: Row(children: [
+            NovaIcone(NovaIcones.alimentation, taille: 14),
+            SizedBox(width: 8),
+            Text('Redémarrer le poste distant'),
+          ]),
+        ),
+        const PopupMenuItem(
+          value: 'capture',
+          height: 34,
+          child: Row(children: [
+            NovaIcone(NovaIcones.capture, taille: 14),
+            SizedBox(width: 8),
+            Text("Capture d'écran"),
+          ]),
+        ),
+        const PopupMenuItem(
+          value: 'tunnel',
+          height: 34,
+          child: Row(children: [
+            NovaIcone(NovaIcones.terminal, taille: 14),
+            SizedBox(width: 8),
+            Text('Tunnel TCP…'),
+          ]),
+        ),
+      ],
+      child: const _CorpsBoutonBarre(
+        icone: NovaIcones.troisPoints,
+        onTapGere: true,
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Panneau de discussion (contenu local ; canal réel via Stream FRB, lot 04)
+  // ---------------------------------------------------------------------------
+
   Widget _panneauChat(ThemeData theme) {
+    final t = theme.extension<NovaTokens>()!;
     return Drawer(
       child: SafeArea(
         child: Column(
@@ -564,7 +1115,8 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
               padding: const EdgeInsets.all(16),
               child: Row(
                 children: [
-                  const Icon(Icons.chat_bubble_outline),
+                  NovaIcone(NovaIcones.discussion,
+                      taille: 16, couleur: t.texte2),
                   const SizedBox(width: 8),
                   Text('Discussion', style: theme.textTheme.titleMedium),
                 ],
@@ -586,12 +1138,12 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                       padding: const EdgeInsets.symmetric(
                           horizontal: 12, vertical: 8),
                       decoration: BoxDecoration(
-                        color: message.deMoi
-                            ? theme.colorScheme.primaryContainer
-                            : theme.colorScheme.surfaceContainerHighest,
-                        borderRadius: BorderRadius.circular(12),
+                        color: message.deMoi ? t.champ : t.panneau,
+                        border: Border.all(color: t.filet),
+                        borderRadius: BorderRadius.circular(9),
                       ),
-                      child: Text(message.texte),
+                      child: Text(message.texte,
+                          style: const TextStyle(fontSize: 12.5)),
                     ),
                   );
                 },
@@ -607,22 +1159,161 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                       controller: _chatController,
                       decoration: const InputDecoration(
                         hintText: 'Écrire un message…',
-                        border: OutlineInputBorder(),
-                        isDense: true,
                       ),
                       onSubmitted: (_) => _envoyerMessageChat(),
                     ),
                   ),
                   const SizedBox(width: 8),
-                  IconButton.filled(
-                    tooltip: 'Envoyer',
-                    icon: const Icon(Icons.send),
-                    onPressed: _envoyerMessageChat,
+                  SizedBox(
+                    height: 38,
+                    child: FilledButton(
+                      onPressed: _envoyerMessageChat,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: t.texte,
+                        foregroundColor: t.fenetre,
+                        padding:
+                            const EdgeInsets.symmetric(horizontal: 12),
+                      ),
+                      child: const Text('Envoyer'),
+                    ),
                   ),
                 ],
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boutons de la barre d'outils
+// ---------------------------------------------------------------------------
+
+/// Bouton 38×36 de la barre flottante : survol blanc translucide,
+/// « Terminer » vire au rouge (usage réservé autorisé).
+class _BoutonBarre extends StatefulWidget {
+  const _BoutonBarre({
+    required this.icone,
+    required this.infobulle,
+    this.onTap,
+    this.fermeture = false,
+    this.actif = false,
+    this.pastilleRouge = false,
+  });
+
+  final NovaIconeData icone;
+  final String infobulle;
+  final VoidCallback? onTap;
+  final bool fermeture;
+
+  /// État enclenché (fond marqué en continu, ex. enregistrement).
+  final bool actif;
+
+  /// Point rouge « REC » en surimpression.
+  final bool pastilleRouge;
+
+  @override
+  State<_BoutonBarre> createState() => _BoutonBarreState();
+}
+
+class _BoutonBarreState extends State<_BoutonBarre> {
+  bool _survole = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final desactive = widget.onTap == null;
+    final Color fond = widget.fermeture && _survole
+        ? kNovaRouge
+        : (_survole || widget.actif) && !desactive
+            ? Colors.white.withValues(alpha: 0.10)
+            : Colors.transparent;
+    final Color couleur = desactive
+        ? _SessionScreenState._iconeBarre.withValues(alpha: 0.35)
+        : _survole
+            ? Colors.white
+            : _SessionScreenState._iconeBarre;
+
+    return Tooltip(
+      message: widget.infobulle,
+      child: MouseRegion(
+        cursor: desactive ? MouseCursor.defer : SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _survole = true),
+        onExit: (_) => setState(() => _survole = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: Container(
+            width: 38,
+            height: 36,
+            decoration: BoxDecoration(
+              color: fond,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                NovaIcone(widget.icone, taille: 19, couleur: couleur),
+                if (widget.pastilleRouge)
+                  Positioned(
+                    top: 5,
+                    right: 6,
+                    child: Container(
+                      width: 7,
+                      height: 7,
+                      decoration: const BoxDecoration(
+                        color: kNovaRouge,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Corps visuel d'un bouton de barre destiné à être enveloppé dans un
+/// [PopupMenuButton] (qui gère lui-même le tap et l'infobulle).
+class _CorpsBoutonBarre extends StatefulWidget {
+  const _CorpsBoutonBarre({required this.icone, this.onTapGere = false});
+
+  final NovaIconeData icone;
+
+  /// Présent uniquement pour documenter que le parent gère le tap.
+  final bool onTapGere;
+
+  @override
+  State<_CorpsBoutonBarre> createState() => _CorpsBoutonBarreState();
+}
+
+class _CorpsBoutonBarreState extends State<_CorpsBoutonBarre> {
+  bool _survole = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _survole = true),
+      onExit: (_) => setState(() => _survole = false),
+      child: Container(
+        width: 38,
+        height: 36,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: _survole
+              ? Colors.white.withValues(alpha: 0.10)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: NovaIcone(
+          widget.icone,
+          taille: 19,
+          couleur:
+              _survole ? Colors.white : _SessionScreenState._iconeBarre,
         ),
       ),
     );
@@ -671,7 +1362,7 @@ class _FeuilleTransferts extends StatelessWidget {
             'File d’attente fictive : le moteur de transfert (plan 09) '
             'alimentera cette vue via un flux de progression FRB.',
             style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.outline,
+              color: theme.extension<NovaTokens>()!.texte3,
             ),
           ),
         ],
@@ -696,11 +1387,12 @@ class _LigneTransfert extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final t = theme.extension<NovaTokens>()!;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Row(
         children: [
-          const Icon(Icons.insert_drive_file_outlined, size: 20),
+          NovaIcone(NovaIcones.dossier, taille: 18, couleur: t.texte2),
           const SizedBox(width: 10),
           SizedBox(width: 110, child: Text(nom, overflow: TextOverflow.ellipsis)),
           SizedBox(width: 70, child: Text(direction,

@@ -333,6 +333,10 @@ pub enum Request {
         cle: String,
         valeur: String,
     },
+    /// Tag 15 — alloue un nouvel ID NovaDesk lié au compte du jeton et à la
+    /// clé statique du client (32 octets), renvoie [`Response::IdAlloue`]
+    /// (l'ID et le jeton d'enregistrement exigé par le rendez-vous).
+    AllocateId { jeton: String, cle_client: [u8; 32] },
 }
 
 impl Request {
@@ -352,7 +356,8 @@ impl Request {
             | Request::EffectiveRole { jeton, .. }
             | Request::PublishManifest { jeton, .. }
             | Request::EffectiveConfig { jeton, .. }
-            | Request::SetPolicy { jeton, .. } => Some(jeton),
+            | Request::SetPolicy { jeton, .. }
+            | Request::AllocateId { jeton, .. } => Some(jeton),
             Request::CheckUpdate { .. } => None,
         }
     }
@@ -469,6 +474,11 @@ impl Request {
                 put_bytes(&mut out, org.as_bytes());
                 put_bytes(&mut out, cle.as_bytes());
                 put_bytes(&mut out, valeur.as_bytes());
+            }
+            Request::AllocateId { jeton, cle_client } => {
+                out.push(15);
+                put_bytes(&mut out, jeton.as_bytes());
+                out.extend_from_slice(cle_client);
             }
         }
         out
@@ -587,6 +597,13 @@ impl Request {
                     valeur,
                 })
             }
+            15 => {
+                let jeton = read_string(d, &mut p)?;
+                let cle_client: [u8; 32] = d.get(p..p + 32)?.try_into().ok()?;
+                p += 32;
+                // La clé statique clôt la charge : rien ne doit suivre.
+                (p == d.len()).then_some(Request::AllocateId { jeton, cle_client })
+            }
             _ => None,
         }
     }
@@ -620,6 +637,12 @@ pub enum Response {
     MiseAJour(UpdateDecision),
     /// Tag 9 — configuration effective : paires (clé, valeur) triées par clé.
     Config(Vec<(String, String)>),
+    /// Tag 10 — ID NovaDesk alloué + jeton d'enregistrement sérialisé
+    /// (voir [`crate::auth::JetonEnregistrement`]), à présenter au rendez-vous.
+    IdAlloue {
+        id: u64,
+        jeton_enregistrement: Vec<u8>,
+    },
 }
 
 impl Response {
@@ -696,6 +719,14 @@ impl Response {
                     put_bytes(&mut out, valeur.as_bytes());
                 }
             }
+            Response::IdAlloue {
+                id,
+                jeton_enregistrement,
+            } => {
+                out.push(10);
+                out.extend_from_slice(&id.to_be_bytes());
+                put_bytes(&mut out, jeton_enregistrement);
+            }
         }
         out
     }
@@ -768,6 +799,15 @@ impl Response {
                     paires.push((cle, valeur));
                 }
                 Some(Response::Config(paires))
+            }
+            10 => {
+                let id = read_u64(d, &mut p)?;
+                let longueur = read_u32(d, &mut p)? as usize;
+                let jeton_enregistrement = d.get(p..p + longueur)?.to_vec();
+                Some(Response::IdAlloue {
+                    id,
+                    jeton_enregistrement,
+                })
             }
             _ => None,
         }
@@ -867,6 +907,10 @@ mod tests {
                 cle: "require_2fa".into(),
                 valeur: "true".into(),
             },
+            Request::AllocateId {
+                jeton: jeton(),
+                cle_client: [7u8; 32],
+            },
         ];
         for requete in requetes {
             let octets = requete.to_bytes();
@@ -912,6 +956,10 @@ mod tests {
                 ("allow_file_transfer".into(), "true".into()),
                 ("require_2fa".into(), "false".into()),
             ]),
+            Response::IdAlloue {
+                id: 123_456_789,
+                jeton_enregistrement: vec![1, 2, 3, 4, 5],
+            },
         ];
         for reponse in reponses {
             assert_eq!(

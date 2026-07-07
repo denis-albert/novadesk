@@ -47,6 +47,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 
+use crate::delta::{aire_totale, rects_pairs_bornes, RectPair, SuiviDelta};
 use crate::{CodecCaps, CodecKind, EncodedChunk, EncoderConfig, VideoEncoder};
 
 /// Convertit une erreur `windows` en `NdError::Codec` avec un contexte lisible.
@@ -110,21 +111,36 @@ fn initialiser_com() -> Result<()> {
 fn bgra_vers_nv12(bgra: &[u8], stride: usize, w: usize, h: usize, nv12: &mut Vec<u8>) {
     nv12.clear();
     nv12.resize(w * h + w * h / 2, 0);
+    bgra_vers_nv12_rect(bgra, stride, w, h, nv12, RectPair::plein(w, h));
+}
+
+/// Convertit le rectangle `r` (aligné pair, borné — contrat [`RectPair`]) du tampon
+/// BGRA vers le tampon NV12 persistant `nv12` (déjà dimensionné à `w*h*3/2`).
+/// C'est le cœur de la **conversion partielle** du mode delta : seule la surface
+/// annoncée modifiée est reconvertie, le reste du plan NV12 est conservé tel quel.
+fn bgra_vers_nv12_rect(
+    bgra: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    nv12: &mut [u8],
+    r: RectPair,
+) {
     let (plan_y, plan_uv) = nv12.split_at_mut(w * h);
 
-    for y in 0..h {
-        let ligne = &bgra[y * stride..y * stride + w * 4];
-        let dst = &mut plan_y[y * w..(y + 1) * w];
+    for y in r.y..r.y + r.h {
+        let ligne = &bgra[y * stride + r.x * 4..y * stride + (r.x + r.w) * 4];
+        let dst = &mut plan_y[y * w + r.x..y * w + r.x + r.w];
         for (px, dy) in ligne.chunks_exact(4).zip(dst.iter_mut()) {
-            let (b, g, r) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
-            *dy = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+            let (b, g, rr) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
+            *dy = (((66 * rr + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
         }
     }
 
     // Chroma : moyenne RGB de chaque bloc 2×2, puis U/V (un couple par bloc).
-    for by in 0..h / 2 {
+    for by in r.y / 2..(r.y + r.h) / 2 {
         let dst = &mut plan_uv[by * w..(by + 1) * w];
-        for bx in 0..w / 2 {
+        for bx in r.x / 2..(r.x + r.w) / 2 {
             let (mut sb, mut sg, mut sr) = (0i32, 0i32, 0i32);
             for dy in 0..2 {
                 let off = (by * 2 + dy) * stride + bx * 2 * 4;
@@ -135,9 +151,9 @@ fn bgra_vers_nv12(bgra: &[u8], stride: usize, w: usize, h: usize, nv12: &mut Vec
                     sr += i32::from(px[2]);
                 }
             }
-            let (b, g, r) = (sb / 4, sg / 4, sr / 4);
-            dst[bx * 2] = ((((-38 * r - 74 * g + 112 * b) + 128) >> 8) + 128) as u8;
-            dst[bx * 2 + 1] = ((((112 * r - 94 * g - 18 * b) + 128) >> 8) + 128) as u8;
+            let (b, g, rr) = (sb / 4, sg / 4, sr / 4);
+            dst[bx * 2] = ((((-38 * rr - 74 * g + 112 * b) + 128) >> 8) + 128) as u8;
+            dst[bx * 2 + 1] = ((((112 * rr - 94 * g - 18 * b) + 128) >> 8) + 128) as u8;
         }
     }
 }
@@ -162,7 +178,14 @@ pub struct MediaFoundationEncoder {
     /// Nombre de frames soumises (horodatages d'entrée monotones réguliers).
     frames_soumises: u64,
     /// Tampon NV12 réutilisé entre les frames (évite une allocation par frame).
+    /// En mode delta, il sert de **canevas persistant** : seules les régions
+    /// modifiées sont reconverties (voir [`bgra_vers_nv12_rect`]).
     nv12: Vec<u8>,
+    /// Vrai si `nv12` contient une image complète de la configuration courante
+    /// (une conversion pleine a eu lieu depuis le dernier `configure`).
+    nv12_valide: bool,
+    /// État du mode delta (saut de trames, image-clé après repos) — voir `delta`.
+    suivi: SuiviDelta,
 }
 
 // SAFETY : le MFT H.264 logiciel de Microsoft est un objet COM « both/free-threaded »
@@ -186,6 +209,8 @@ impl MediaFoundationEncoder {
             fournit_echantillons: false,
             frames_soumises: 0,
             nv12: Vec::new(),
+            nv12_valide: false,
+            suivi: SuiviDelta::new(),
         })
     }
 
@@ -370,6 +395,10 @@ impl VideoEncoder for MediaFoundationEncoder {
         self.mft = None;
         self.codec_api = None;
         self.frames_soumises = 0;
+        // Nouveau flux : canevas NV12 invalide (conversion pleine exigée) et
+        // compteurs delta remis à zéro (le mode actif est conservé).
+        self.nv12_valide = false;
+        self.suivi.reinitialiser();
 
         initialiser_com()?;
 
@@ -489,9 +518,6 @@ impl VideoEncoder for MediaFoundationEncoder {
             .clone(); // clone COM (AddRef) pour libérer l'emprunt sur `self`
         let cfg = self.cfg.expect("cfg présent si mft présent");
 
-        let Some(FrameImage::Cpu { data, stride }) = frame.image.as_ref() else {
-            return Err(NdError::Codec("frame sans pixels CPU à encoder".into()));
-        };
         if frame.width != cfg.width || frame.height != cfg.height {
             return Err(NdError::Codec(format!(
                 "frame {}x{} ≠ configuration {}x{} (reconfigurer l'encodeur)",
@@ -499,6 +525,24 @@ impl VideoEncoder for MediaFoundationEncoder {
             )));
         }
         let (w, h) = (frame.width as usize, frame.height as usize);
+        let compatible = self.nv12_valide && self.nv12.len() == w * h + w * h / 2;
+
+        // Saut d'encodage (mode delta) : rien n'a changé → trame de répétition à
+        // données vides, sans conversion ni passage par le MFT (le décodeur la
+        // traite comme « pas de nouvelle image », voir `software::Openh264Decoder`).
+        if self.suivi.doit_sauter(frame, force_keyframe, compatible) {
+            self.suivi.note_saut();
+            return Ok(EncodedChunk {
+                data: Vec::new(),
+                is_keyframe: false,
+                monitor: frame.monitor,
+                timestamp_us: frame.timestamp_us,
+            });
+        }
+
+        let Some(FrameImage::Cpu { data, stride }) = frame.image.as_ref() else {
+            return Err(NdError::Codec("frame sans pixels CPU à encoder".into()));
+        };
         if *stride < w * 4 || data.len() < *stride * h {
             return Err(NdError::Codec(
                 "taille de frame incohérente (attendu stride ≥ largeur*4 et stride*hauteur octets)"
@@ -506,12 +550,29 @@ impl VideoEncoder for MediaFoundationEncoder {
             ));
         }
 
-        // BGRA → NV12 dans le tampon réutilisable, puis échantillon d'entrée.
+        // BGRA → NV12 dans le canevas persistant : conversion restreinte aux
+        // régions modifiées si le mode delta est actif et le canevas à jour,
+        // pleine sinon (voir module `delta`).
         let mut nv12 = std::mem::take(&mut self.nv12);
-        bgra_vers_nv12(data, *stride, w, h, &mut nv12);
+        let aire_image = (w * h) as u64;
+        let mut aire_modifiee = aire_image;
+        if self.suivi.actif() && compatible {
+            let rects = rects_pairs_bornes(&frame.dirty, frame.width, frame.height);
+            aire_modifiee = aire_totale(&rects, aire_image);
+            for r in &rects {
+                bgra_vers_nv12_rect(data, *stride, w, h, &mut nv12, *r);
+            }
+        } else {
+            bgra_vers_nv12(data, *stride, w, h, &mut nv12);
+        }
         self.nv12 = nv12;
+        self.nv12_valide = true;
 
-        if force_keyframe {
+        // Image-clé : demandée par l'appelant, ou resynchronisation adaptative
+        // après une longue période statique (voir `delta`).
+        let force_cle = force_keyframe
+            || (self.suivi.actif() && self.suivi.keyframe_apres_repos(aire_modifiee, aire_image));
+        if force_cle {
             // Meilleur effort : s'applique à la prochaine frame soumise.
             self.regler_codec_api(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32));
         }
@@ -540,6 +601,8 @@ impl VideoEncoder for MediaFoundationEncoder {
             unsafe { mft.ProcessInput(0, &sample, 0) }.map_err(|e| mf_err("ProcessInput", e))?;
         };
 
+        self.suivi.note_encodage();
+
         Ok(EncodedChunk {
             data: donnees,
             is_keyframe: image_cle,
@@ -548,15 +611,30 @@ impl VideoEncoder for MediaFoundationEncoder {
         })
     }
 
+    /// Mise à jour du débit à chaud, **meilleur effort consolidé** (pilotée par
+    /// l'ABR, plan 03/04) :
+    ///
+    /// - la consigne (bornée à 1 kbit/s minimum) est d'abord mémorisée dans la
+    ///   configuration — une reconfiguration ultérieure (`configure`) et
+    ///   l'observabilité la voient donc toujours ;
+    /// - puis appliquée via `ICodecAPI::SetValue(AVEncCommonMeanBitRate)` si le
+    ///   MFT l'expose. Le MFT H.264 logiciel de Microsoft accepte ce réglage en
+    ///   cours de flux (mode CBR posé à `configure`) ; un MFT qui l'ignore reste
+    ///   fonctionnel au débit précédent — c'est la **limite documentée** de ce
+    ///   backend, sans équivalent du retour d'état d'openh264.
     fn set_target_bitrate(&mut self, kbps: u32) {
+        let kbps = kbps.max(1);
         if let Some(cfg) = self.cfg.as_mut() {
             cfg.target_bitrate_kbps = kbps;
         }
-        // Mise à jour à chaud (meilleur effort) — pilotée par l'ABR (plan 03/04).
         self.regler_codec_api(
             &CODECAPI_AVEncCommonMeanBitRate,
             &VARIANT::from(kbps.saturating_mul(1000)),
         );
+    }
+
+    fn set_delta_mode(&mut self, actif: bool) {
+        self.suivi.set_actif(actif);
     }
 }
 
@@ -651,5 +729,59 @@ mod tests {
         }
         assert!(cle_vue);
         assert!(decodees > 0, "aucune frame re-décodée");
+    }
+
+    /// Mode delta : une frame sans région modifiée est sautée (trame de répétition
+    /// à données vides) ; une frame avec régions est encodée normalement, en ne
+    /// reconvertissant que la surface annoncée. Sans mode delta (défaut), rien ne
+    /// change (comportement historique).
+    #[test]
+    fn delta_saut_et_conversion_partielle() {
+        let (w, h) = (320u32, 240u32);
+        let cfg = EncoderConfig {
+            kind: CodecKind::H264,
+            width: w,
+            height: h,
+            target_bitrate_kbps: 2_000,
+            max_fps: 30,
+        };
+
+        let mut enc = MediaFoundationEncoder::new().expect("init Media Foundation");
+        enc.set_delta_mode(true);
+        enc.configure(cfg).expect("configure MFT H.264");
+
+        // Frame 1 : conversion pleine + image-clé.
+        let mut pleine = frame_test(w, h, 0);
+        pleine.dirty = vec![nd_capture::Rect { x: 0, y: 0, w, h }];
+        let premiere = enc.encode(&pleine, true).expect("première frame");
+        assert!(!premiere.data.is_empty());
+
+        // Frame 2 : aucune région modifiée → trame de répétition, MFT non sollicité.
+        let mut statique = frame_test(w, h, 0);
+        statique.dirty = Vec::new();
+        let saut = enc.encode(&statique, false).expect("saut");
+        assert!(saut.data.is_empty(), "trame de répétition attendue");
+        assert!(!saut.is_keyframe);
+
+        // Frame 3 : une région annoncée → trame réelle (conversion partielle).
+        let mut bouge = frame_test(w, h, 64);
+        bouge.dirty = vec![nd_capture::Rect {
+            x: 0,
+            y: 0,
+            w,
+            h: 16,
+        }];
+        let chunk = enc.encode(&bouge, false).expect("frame delta");
+        assert!(!chunk.data.is_empty());
+
+        // Sans mode delta : la frame statique est ré-encodée plein cadre.
+        let mut enc_plein = MediaFoundationEncoder::new().expect("init Media Foundation");
+        enc_plein.configure(cfg).expect("configure MFT H.264");
+        enc_plein.encode(&pleine, true).expect("première");
+        let chunk = enc_plein.encode(&statique, false).expect("re-encode");
+        assert!(
+            !chunk.data.is_empty(),
+            "sans mode delta, la frame est ré-encodée plein cadre"
+        );
     }
 }

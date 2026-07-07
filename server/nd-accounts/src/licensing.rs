@@ -30,6 +30,28 @@ impl Plan {
             Plan::Entreprise => None,
         }
     }
+
+    /// Nom stable du plan (persistance, protocole, claims des jetons
+    /// applicatifs) — voir [`Self::depuis_nom`].
+    #[must_use]
+    pub fn nom(self) -> &'static str {
+        match self {
+            Plan::Free => "free",
+            Plan::Pro => "pro",
+            Plan::Entreprise => "entreprise",
+        }
+    }
+
+    /// Plan désigné par son nom stable (`None` si inconnu).
+    #[must_use]
+    pub fn depuis_nom(nom: &str) -> Option<Self> {
+        match nom {
+            "free" => Some(Plan::Free),
+            "pro" => Some(Plan::Pro),
+            "entreprise" => Some(Plan::Entreprise),
+            _ => None,
+        }
+    }
 }
 
 /// Licence d'un compte : plan en vigueur et sessions actuellement ouvertes.
@@ -129,6 +151,15 @@ mod tests {
         assert_eq!(Plan::Pro.max_sessions(), Some(10));
         assert_eq!(Plan::Entreprise.max_sessions(), None);
         assert_eq!(Plan::default(), Plan::Free);
+    }
+
+    #[test]
+    fn noms_de_plans_aller_retour() {
+        for plan in [Plan::Free, Plan::Pro, Plan::Entreprise] {
+            assert_eq!(Plan::depuis_nom(plan.nom()), Some(plan));
+        }
+        assert_eq!(Plan::depuis_nom("premium"), None);
+        assert_eq!(Plan::depuis_nom(""), None);
     }
 
     #[test]

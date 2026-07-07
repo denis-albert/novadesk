@@ -38,8 +38,8 @@ use std::time::Duration;
 
 use nd_proto::{ChannelKind, MonitorId, NdError, Reliability, Result};
 use quinn::{
-    Connection, ConnectionStats, Endpoint, IdleTimeout, RecvStream, SendDatagramError, SendStream,
-    TransportConfig, VarInt,
+    Connection, ConnectionStats, Endpoint, EndpointConfig, IdleTimeout, RecvStream,
+    SendDatagramError, SendStream, TokioRuntime, TransportConfig, VarInt,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
@@ -52,7 +52,7 @@ use crate::{ChannelHandle, PathEstimate, Transport};
 /// Préfixe écrit en tête de chaque flux pour valider l'appairage.
 const MAGIC: &[u8; 4] = b"NDQ1";
 /// Nom de serveur présenté au handshake TLS (doit figurer dans le SAN du certificat).
-const SERVER_NAME: &str = "novadesk";
+pub(crate) const SERVER_NAME: &str = "novadesk";
 /// Taille max d'une charge utile de trame (garde-fou anti-abus).
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -71,17 +71,119 @@ const FENETRE_PERTE: u64 = 32;
 const LISSAGE_PERTE: f32 = 0.3;
 
 /// Runtime Tokio partagé par tout le transport (créé à la première utilisation).
-fn runtime() -> &'static Runtime {
+pub(crate) fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| Runtime::new().expect("création du runtime Tokio"))
 }
 
 /// Installe un fournisseur cryptographique par défaut pour rustls (une seule fois).
-fn ensure_provider() {
+pub(crate) fn ensure_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
+}
+
+/// Identité TLS auto-signée **réutilisable** : certificat (DER) + clé privée
+/// (PKCS#8). Permet de présenter le *même* certificat sur plusieurs points
+/// d'entrée QUIC — l'écouteur principal ([`bind_with_identity`]), les sockets
+/// percées par le hole punching ([`accept_over_socket`]) et le repli relais
+/// ([`crate::accept_via_relay`]).
+///
+/// C'est ce certificat que le pair contrôlé publie au rendez-vous
+/// (`nd-signaling::RendezvousClient::register`) et que l'appelant épingle
+/// après `lookup` : l'identité doit donc être **unique et stable** pour tous
+/// les chemins d'un même pair, sans quoi l'épinglage échoue.
+#[derive(Clone)]
+pub struct ServerIdentity {
+    cert_der: Vec<u8>,
+    key_pkcs8_der: Vec<u8>,
+}
+
+impl ServerIdentity {
+    /// Génère une identité auto-signée neuve (SAN : nom de serveur NovaDesk).
+    ///
+    /// # Errors
+    /// Erreur si la génération du certificat échoue.
+    pub fn generate() -> Result<Self> {
+        let ck = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
+            .map_err(|e| NdError::Transport(format!("génération du certificat : {e}")))?;
+        Ok(Self {
+            cert_der: ck.cert.der().as_ref().to_vec(),
+            key_pkcs8_der: ck.key_pair.serialize_der(),
+        })
+    }
+
+    /// Reconstruit une identité depuis ses octets DER (persistance : garder la
+    /// même identité — donc le même certificat épinglable — entre démarrages).
+    #[must_use]
+    pub fn from_der_parts(cert_der: Vec<u8>, key_pkcs8_der: Vec<u8>) -> Self {
+        Self {
+            cert_der,
+            key_pkcs8_der,
+        }
+    }
+
+    /// Certificat auto-signé (DER) — celui à publier au rendez-vous.
+    #[must_use]
+    pub fn cert_der(&self) -> &[u8] {
+        &self.cert_der
+    }
+
+    /// Clé privée (PKCS#8 DER), pour la persistance. **Secret** : à stocker
+    /// protégé (DPAPI/keychain, voir plan 06) ; ne jamais journaliser.
+    #[must_use]
+    pub fn key_pkcs8_der(&self) -> &[u8] {
+        &self.key_pkcs8_der
+    }
+}
+
+impl std::fmt::Debug for ServerIdentity {
+    /// N'expose jamais la clé privée (ni le certificat complet) dans les logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerIdentity")
+            .field("cert_der_len", &self.cert_der.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configuration TLS serveur (certificat épinglable + réglages de transport).
+pub(crate) fn server_config(identity: &ServerIdentity) -> Result<quinn::ServerConfig> {
+    let cert = CertificateDer::from(identity.cert_der.clone());
+    let key = PrivateKeyDer::Pkcs8(identity.key_pkcs8_der.clone().into());
+    let mut cfg = quinn::ServerConfig::with_single_cert(vec![cert], key)
+        .map_err(|e| NdError::Transport(format!("config serveur TLS : {e}")))?;
+    cfg.transport_config(transport_tuning());
+    Ok(cfg)
+}
+
+/// Configuration TLS client : épingle le certificat exact du serveur.
+pub(crate) fn client_config(server_cert_der: &[u8]) -> Result<quinn::ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(server_cert_der.to_vec()))
+        .map_err(|e| NdError::Transport(format!("ajout du certificat racine : {e}")))?;
+    let mut cfg = quinn::ClientConfig::with_root_certificates(Arc::new(roots))
+        .map_err(|e| NdError::Transport(format!("config client TLS : {e}")))?;
+    cfg.transport_config(transport_tuning());
+    Ok(cfg)
+}
+
+/// Endpoint quinn sur une **socket std déjà liée** (quinn accepte une socket
+/// existante via [`Endpoint::new`] — c'est le cœur des points d'entrée
+/// `*_over_socket` et du tunnel relais). À appeler dans le contexte du
+/// runtime Tokio ; quinn passe lui-même la socket en non-bloquant.
+pub(crate) fn endpoint_sur_socket(
+    socket: std::net::UdpSocket,
+    server_cfg: Option<quinn::ServerConfig>,
+) -> Result<Endpoint> {
+    Endpoint::new(
+        EndpointConfig::default(),
+        server_cfg,
+        socket,
+        Arc::new(TokioRuntime),
+    )
+    .map_err(|e| NdError::Transport(format!("endpoint sur socket existante : {e}")))
 }
 
 /// Réglages de transport communs client/serveur : keepalive et délai d'inactivité.
@@ -142,16 +244,20 @@ impl Listener {
 }
 
 /// Ouvre un écouteur QUIC sur l'adresse donnée (génère un certificat auto-signé).
+///
+/// Pour partager le certificat avec d'autres points d'entrée (sockets percées,
+/// relais), préférer [`bind_with_identity`] avec une [`ServerIdentity`] commune.
 pub fn bind(addr: SocketAddr) -> Result<Listener> {
-    ensure_provider();
-    let ck = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
-        .map_err(|e| NdError::Transport(format!("génération du certificat : {e}")))?;
-    let cert_der: CertificateDer<'static> = ck.cert.der().clone();
-    let key = PrivateKeyDer::Pkcs8(ck.key_pair.serialize_der().into());
+    bind_with_identity(addr, &ServerIdentity::generate()?)
+}
 
-    let mut server_cfg = quinn::ServerConfig::with_single_cert(vec![cert_der.clone()], key)
-        .map_err(|e| NdError::Transport(format!("config serveur TLS : {e}")))?;
-    server_cfg.transport_config(transport_tuning());
+/// Comme [`bind`], mais avec une identité TLS **fournie** : l'écouteur, les
+/// acceptations sur socket percée ([`accept_over_socket`]) et le repli relais
+/// ([`crate::accept_via_relay`]) présentent alors le même certificat — celui
+/// que le pair publie au rendez-vous et que l'appelant épingle.
+pub fn bind_with_identity(addr: SocketAddr, identity: &ServerIdentity) -> Result<Listener> {
+    ensure_provider();
+    let server_cfg = server_config(identity)?;
 
     // La création de l'endpoint (socket UDP + reactor) doit avoir lieu dans le
     // contexte du runtime Tokio.
@@ -166,7 +272,7 @@ pub fn bind(addr: SocketAddr) -> Result<Listener> {
 
     Ok(Listener {
         endpoint,
-        cert_der: cert_der.as_ref().to_vec(),
+        cert_der: identity.cert_der().to_vec(),
         local_addr,
     })
 }
@@ -183,29 +289,138 @@ pub fn connect(remote: SocketAddr, server_cert_der: &[u8]) -> Result<Box<dyn Tra
 /// connexion ([`QuicTransport::is_connected`]) et au rappel de coupure.
 pub fn connect_quic(remote: SocketAddr, server_cert_der: &[u8]) -> Result<QuicTransport> {
     ensure_provider();
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(server_cert_der.to_vec()))
-        .map_err(|e| NdError::Transport(format!("ajout du certificat racine : {e}")))?;
-    let mut client_cfg = quinn::ClientConfig::with_root_certificates(Arc::new(roots))
-        .map_err(|e| NdError::Transport(format!("config client TLS : {e}")))?;
-    client_cfg.transport_config(transport_tuning());
+    let client_cfg = client_config(server_cert_der)?;
 
     let (endpoint, conn, send, recv) = runtime().block_on(async move {
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("adresse de bind valide");
         let mut endpoint = Endpoint::client(bind_addr)
             .map_err(|e| NdError::Transport(format!("endpoint client : {e}")))?;
         endpoint.set_default_client_config(client_cfg);
-        let conn = endpoint
-            .connect(remote, SERVER_NAME)
-            .map_err(|e| NdError::Transport(format!("connexion : {e}")))?
-            .await
-            .map_err(|e| NdError::Transport(format!("handshake : {e}")))?;
-        let (send, recv) = setup_streams(&conn).await?;
-        Ok::<_, NdError>((endpoint, conn, send, recv))
+        connect_sur_endpoint(endpoint, remote).await
     })?;
 
     Ok(spawn_transport(conn, Some(endpoint), send, recv))
+}
+
+// ---------------------------------------------------------------------------
+// QUIC sur socket UDP existante (plan 05 : porter QUIC sur la socket percée)
+// ---------------------------------------------------------------------------
+
+/// Se connecte à un pair QUIC **sur une socket UDP déjà ouverte** — typiquement
+/// la socket rendue par le hole punching (`nd-signaling` :
+/// `establish_p2p` → `DirectPath { socket, peer_addr, peer_cert_der }`), dont
+/// le mapping NAT est déjà percé. La socket ne doit **pas** être rebindée ni
+/// connectée ; quinn la reprend telle quelle ([`Endpoint::new`]) et la passe
+/// en non-bloquant.
+///
+/// Les sondes de punch résiduelles qui arrivent encore sur la socket ne sont
+/// pas des paquets QUIC valides : quinn les ignore silencieusement.
+///
+/// Côté appelé, le pendant est [`accept_over_socket`] ; l'appelant est le
+/// client QUIC, l'appelé le serveur (il possède l'identité TLS).
+///
+/// # Errors
+/// Erreur de configuration TLS, de création d'endpoint ou de handshake.
+pub fn connect_over_socket(
+    socket: std::net::UdpSocket,
+    peer_addr: SocketAddr,
+    server_cert_der: &[u8],
+) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(connect_quic_over_socket(
+        socket,
+        peer_addr,
+        server_cert_der,
+    )?))
+}
+
+/// Comme [`connect_over_socket`], mais renvoie le type concret.
+///
+/// # Errors
+/// Voir [`connect_over_socket`].
+pub fn connect_quic_over_socket(
+    socket: std::net::UdpSocket,
+    peer_addr: SocketAddr,
+    server_cert_der: &[u8],
+) -> Result<QuicTransport> {
+    ensure_provider();
+    let client_cfg = client_config(server_cert_der)?;
+    let (endpoint, conn, send, recv) = runtime().block_on(async move {
+        let mut endpoint = endpoint_sur_socket(socket, None)?;
+        endpoint.set_default_client_config(client_cfg);
+        connect_sur_endpoint(endpoint, peer_addr).await
+    })?;
+    Ok(spawn_transport(conn, Some(endpoint), send, recv))
+}
+
+/// Accepte **une** connexion QUIC entrante **sur une socket UDP déjà
+/// ouverte** — la socket percée côté appelé (`nd-signaling` : `await_p2p` →
+/// `IncomingPath`). Bloque jusqu'au handshake (l'appelant se connecte sitôt
+/// son punch confirmé ; le délai d'inactivité QUIC borne l'attente d'un
+/// handshake entamé, mais pas l'attente d'un premier paquet — appeler depuis
+/// le thread d'établissement, comme [`Listener::accept`]).
+///
+/// `identity` doit être l'identité dont le **certificat a été publié au
+/// rendez-vous** : l'appelant l'épingle (voir [`ServerIdentity`]).
+/// La socket percée étant dédiée à un seul pair, on n'accepte qu'une
+/// connexion ; l'endpoint vit ensuite avec le transport rendu.
+///
+/// # Errors
+/// Erreur de configuration TLS, de création d'endpoint ou de handshake.
+pub fn accept_over_socket(
+    socket: std::net::UdpSocket,
+    identity: &ServerIdentity,
+) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(accept_quic_over_socket(socket, identity)?))
+}
+
+/// Comme [`accept_over_socket`], mais renvoie le type concret.
+///
+/// # Errors
+/// Voir [`accept_over_socket`].
+pub fn accept_quic_over_socket(
+    socket: std::net::UdpSocket,
+    identity: &ServerIdentity,
+) -> Result<QuicTransport> {
+    ensure_provider();
+    let server_cfg = server_config(identity)?;
+    let (endpoint, conn, send, recv) = runtime().block_on(async move {
+        let endpoint = endpoint_sur_socket(socket, Some(server_cfg))?;
+        accept_sur_endpoint(endpoint).await
+    })?;
+    Ok(spawn_transport(conn, Some(endpoint), send, recv))
+}
+
+/// Handshake **client** sur un endpoint prêt (configuration client posée) puis
+/// ouverture des flux d'appairage. Partagé par [`connect_quic`],
+/// [`connect_quic_over_socket`] et le tunnel relais ([`crate::relay`]).
+pub(crate) async fn connect_sur_endpoint(
+    endpoint: Endpoint,
+    remote: SocketAddr,
+) -> Result<(Endpoint, Connection, SendStream, RecvStream)> {
+    let conn = endpoint
+        .connect(remote, SERVER_NAME)
+        .map_err(|e| NdError::Transport(format!("connexion : {e}")))?
+        .await
+        .map_err(|e| NdError::Transport(format!("handshake : {e}")))?;
+    let (send, recv) = setup_streams(&conn).await?;
+    Ok((endpoint, conn, send, recv))
+}
+
+/// Accepte **une** connexion entrante sur un endpoint serveur puis ouvre les
+/// flux d'appairage. Partagé par [`accept_quic_over_socket`] et le tunnel
+/// relais ([`crate::relay`]).
+pub(crate) async fn accept_sur_endpoint(
+    endpoint: Endpoint,
+) -> Result<(Endpoint, Connection, SendStream, RecvStream)> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| NdError::Transport("endpoint fermé".into()))?;
+    let conn = incoming
+        .await
+        .map_err(|e| NdError::Transport(format!("connexion entrante : {e}")))?;
+    let (send, recv) = setup_streams(&conn).await?;
+    Ok((endpoint, conn, send, recv))
 }
 
 /// Ouvre le flux d'émission, écrit le MAGIC, accepte le flux du pair et valide son MAGIC.
@@ -311,7 +526,7 @@ async fn datagram_reader(conn: Connection, tx: mpsc::UnboundedSender<(ChannelKin
 }
 
 /// Assemble un [`QuicTransport`] et lance les tâches d'E/S (flux + datagrammes).
-fn spawn_transport(
+pub(crate) fn spawn_transport(
     conn: Connection,
     endpoint: Option<Endpoint>,
     send: SendStream,
@@ -395,6 +610,12 @@ pub struct QuicTransport {
 }
 
 impl QuicTransport {
+    /// Clone de la connexion quinn sous-jacente (interne : le tunnel relais
+    /// s'en sert pour attacher la fin de vie du pont à celle de la connexion).
+    pub(crate) fn connection(&self) -> Connection {
+        self.conn.clone()
+    }
+
     /// La connexion est-elle toujours ouverte ?
     ///
     /// Passe à `false` dès que quinn constate la coupure : fermeture par le pair,
@@ -658,6 +879,83 @@ mod tests {
             (0.0..=1.0).contains(&estimation.loss_ratio),
             "taux de perte borné : {estimation:?}"
         );
+    }
+
+    /// QUIC porté sur des sockets UDP **pré-ouvertes** (chemin « socket
+    /// percée » du plan 05) : identité fournie, échange bidirectionnel,
+    /// sondes de punch résiduelles tolérées (quinn les ignore).
+    #[test]
+    fn quic_sur_sockets_preouvertes() {
+        let identite = ServerIdentity::generate().expect("identité");
+        let cert = identite.cert_der().to_vec();
+        let sock_serveur = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind serveur");
+        let sock_client = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind client");
+        let addr_serveur = sock_serveur.local_addr().expect("adresse serveur");
+        let addr_client = sock_client.local_addr().expect("adresse client");
+
+        // Sondes résiduelles du punch, envoyées avant le handshake : pas des
+        // paquets QUIC, elles ne doivent pas gêner l'établissement.
+        sock_client
+            .send_to(b"NDPUNCH1\x01\x00", addr_serveur)
+            .expect("sonde vers serveur");
+        sock_serveur
+            .send_to(b"NDPUNCH1\x02\x01", addr_client)
+            .expect("sonde vers client");
+
+        let serveur = thread::spawn(move || {
+            accept_quic_over_socket(sock_serveur, &identite).expect("accept_over_socket")
+        });
+        let mut client = connect_quic_over_socket(sock_client, addr_serveur, &cert)
+            .expect("connect_over_socket");
+        let mut serveur = serveur.join().expect("thread serveur");
+
+        // Aller : client → serveur.
+        let h = client.open_channel(ChannelKind::Control);
+        client
+            .send(h, b"ping punch".to_vec(), Reliability::Reliable)
+            .expect("send client");
+        let (_, data) =
+            attendre_message(&mut serveur, Duration::from_secs(5)).expect("message aller");
+        assert_eq!(data, b"ping punch");
+
+        // Retour : serveur → client.
+        let h = serveur.open_channel(ChannelKind::Control);
+        serveur
+            .send(h, b"pong punch".to_vec(), Reliability::Reliable)
+            .expect("send serveur");
+        let (_, data) =
+            attendre_message(&mut client, Duration::from_secs(5)).expect("message retour");
+        assert_eq!(data, b"pong punch");
+    }
+
+    /// L'écouteur construit avec une identité fournie présente bien le
+    /// certificat de l'identité (celui que le rendez-vous publiera).
+    #[test]
+    fn identite_partagee_entre_ecouteur_et_pairs() {
+        let identite = ServerIdentity::generate().expect("identité");
+        let listener =
+            bind_with_identity("127.0.0.1:0".parse().expect("adresse"), &identite).expect("bind");
+        assert_eq!(listener.server_cert_der(), identite.cert_der());
+
+        // Un client qui n'épingle que le certificat de l'identité se connecte.
+        let addr = listener.local_addr();
+        let cert = identite.cert_der().to_vec();
+        let client = thread::spawn(move || connect_quic(addr, &cert).expect("connect"));
+        let _serveur = listener.accept_quic().expect("accept");
+        assert!(client.join().expect("thread client").is_connected());
+    }
+
+    /// Une identité persistée (octets DER) reconstruit le même certificat et
+    /// une configuration serveur valide.
+    #[test]
+    fn identite_persistee_reconstruit_le_meme_certificat() {
+        let identite = ServerIdentity::generate().expect("identité");
+        let rechargee = ServerIdentity::from_der_parts(
+            identite.cert_der().to_vec(),
+            identite.key_pkcs8_der().to_vec(),
+        );
+        assert_eq!(rechargee.cert_der(), identite.cert_der());
+        assert!(server_config(&rechargee).is_ok(), "clé privée valide");
     }
 
     #[test]

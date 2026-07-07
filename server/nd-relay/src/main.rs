@@ -1,16 +1,27 @@
 //! Serveur de relais NovaDesk (plans 05/11 — connectivité/NAT, relais géré).
 //!
-//! Achemine le trafic chiffré de bout en bout entre deux pairs quand le P2P échoue
-//! (NAT symétrique/CGNAT). Le relais est un **tuyau aveugle** : chaque client
-//! annonce d'abord un **ticket** (trame `[u32 BE len][ticket]`) ; le premier pair
-//! d'un ticket est mis en attente, et à l'arrivée du second pair porteur du même
-//! ticket, le relais fait transiter les octets dans les deux sens sans jamais les
-//! inspecter (le média est chiffré de bout en bout, voir plan 06).
+//! Achemine le trafic chiffré de bout en bout entre deux pairs quand le P2P
+//! échoue (NAT symétrique/CGNAT). Le relais est un **tuyau aveugle** : chaque
+//! client annonce d'abord un **ticket** (trame `[u32 BE len][ticket]`) ; le
+//! premier pair d'un ticket est mis en attente, et à l'arrivée du second pair
+//! porteur du même ticket, le relais fait transiter les octets dans les deux
+//! sens sans jamais les inspecter (le média est chiffré de bout en bout,
+//! voir plan 06).
 //!
-//! Volet « relais géré » (plan 11) : métriques d'exploitation ([`RelayMetrics`]),
-//! quotas ([`ConfigRelais`] — paires actives simultanées, octets par paire) et
-//! sélection du relais le plus proche côté client ([`select_relay`], exposée ici
-//! via le mode diagnostic `--sonder`). Les tickets signés viendront au plan 11.
+//! **Tickets signés (plan 11)** : le relais n'accepte que des tickets
+//! [`TicketRelais`] signés **Ed25519** par l'autorité du déploiement (clé
+//! publique configurée au démarrage), avec une **portée** (paire d'IDs) et une
+//! **expiration** — tout ticket non signé, altéré ou expiré est refusé.
+//! L'émetteur (le courtier de session, plan 05/09) remet le **même** ticket
+//! aux deux pairs ; le relais les apparie sur ses octets exacts. Le tuyau
+//! reste aveugle : les IDs de la portée engagent l'émetteur et bornent le
+//! rejeu, le relais n'associe jamais les octets relayés aux IDs.
+//!
+//! Volet « relais géré » (plan 11) : métriques d'exploitation
+//! ([`RelayMetrics`]), quotas ([`ConfigRelais`] — paires actives simultanées,
+//! octets par paire **bornés par défaut**, connexions simultanées par IP) et
+//! sélection du relais le plus proche côté client ([`select_relay`], exposée
+//! ici via le mode diagnostic `--sonder`).
 //!
 //! Implémentation std pure (TCP bloquant, threads), dans l'esprit de
 //! `nd-signaling`.
@@ -18,20 +29,31 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nd_api::auth::{cle_publique_depuis_hex, maintenant_unix, TicketRelais, VerifyingKey};
+
 /// Adresse d'écoute par défaut du relais.
 const ADRESSE_DEFAUT: &str = "0.0.0.0:9100";
 
-/// Taille maximale acceptée pour un ticket (une annonce plus grande est rejetée).
+/// Taille maximale acceptée pour une annonce (une annonce plus grande est
+/// rejetée avant même la vérification de signature).
 const TAILLE_TICKET_MAX: usize = 1024;
 
 /// Nombre maximal de paires actives simultanées par défaut.
 const MAX_PAIRES_ACTIVES_DEFAUT: usize = 1000;
+
+/// Quota d'octets relayés par paire, par défaut : 8 Gio (deux sens confondus).
+/// Une session de bureau à distance légitime tient large dessous ; un abus de
+/// bande passante est coupé.
+const QUOTA_OCTETS_PAR_PAIRE_DEFAUT: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Nombre maximal de connexions simultanées par adresse IP, par défaut.
+const MAX_CONNEXIONS_PAR_IP_DEFAUT: usize = 32;
 
 /// Taille des tranches de copie du pipe (comptage local, aucun partage).
 const TAILLE_TRANCHE: usize = 64 * 1024;
@@ -51,14 +73,20 @@ pub struct ConfigRelais {
     pub max_paires_actives: usize,
     /// Quota d'octets relayés par paire (deux sens confondus), `None` =
     /// illimité. Atteint, le pipe est coupé (les deux pairs sont fermés).
+    /// Par défaut : [`QUOTA_OCTETS_PAR_PAIRE_DEFAUT`].
     pub quota_octets_par_paire: Option<u64>,
+    /// Nombre maximal de connexions simultanées depuis une même adresse IP
+    /// (pairs en attente et pairs relayés confondus). Au-delà, la connexion
+    /// est refusée (fermée) et comptée.
+    pub max_connexions_par_ip: usize,
 }
 
 impl Default for ConfigRelais {
     fn default() -> Self {
         Self {
             max_paires_actives: MAX_PAIRES_ACTIVES_DEFAUT,
-            quota_octets_par_paire: None,
+            quota_octets_par_paire: Some(QUOTA_OCTETS_PAR_PAIRE_DEFAUT),
+            max_connexions_par_ip: MAX_CONNEXIONS_PAR_IP_DEFAUT,
         }
     }
 }
@@ -77,8 +105,11 @@ pub struct RelayMetrics {
     octets_relayes: AtomicU64,
     /// Paires servies depuis le démarrage (cumul, paires closes comprises).
     paires_servies: AtomicU64,
-    /// Annonces rejetées : ticket invalide/incomplet ou paire refusée par quota.
+    /// Annonces rejetées : ticket incomplet, non signé, altéré, expiré, ou
+    /// paire refusée par le quota de paires actives.
     tickets_rejetes: AtomicU64,
+    /// Connexions refusées par le quota de connexions par IP.
+    connexions_rejetees: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -108,6 +139,11 @@ impl RelayMetrics {
         self.tickets_rejetes.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Comptabilise une connexion refusée par le quota par IP.
+    fn rejeter_connexion(&self) {
+        self.connexions_rejetees.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Instantané lisible des compteurs, pour le journal d'exploitation et les
     /// tests.
     pub fn snapshot(&self) -> SnapshotMetriques {
@@ -116,6 +152,7 @@ impl RelayMetrics {
             octets_relayes: self.octets_relayes.load(Ordering::SeqCst),
             paires_servies: self.paires_servies.load(Ordering::SeqCst),
             tickets_rejetes: self.tickets_rejetes.load(Ordering::SeqCst),
+            connexions_rejetees: self.connexions_rejetees.load(Ordering::SeqCst),
         }
     }
 }
@@ -129,36 +166,97 @@ pub struct SnapshotMetriques {
     pub octets_relayes: u64,
     /// Paires servies depuis le démarrage (cumul).
     pub paires_servies: u64,
-    /// Annonces rejetées (ticket invalide ou quota atteint).
+    /// Annonces rejetées (ticket invalide/non signé/expiré ou quota atteint).
     pub tickets_rejetes: u64,
+    /// Connexions refusées par le quota de connexions par IP.
+    pub connexions_rejetees: u64,
 }
 
 impl fmt::Display for SnapshotMetriques {
     fn fmt(&self, formateur: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formateur,
-            "paires actives : {}, paires servies : {}, octets relayés : {}, tickets rejetés : {}",
-            self.paires_actives, self.paires_servies, self.octets_relayes, self.tickets_rejetes
+            "paires actives : {}, paires servies : {}, octets relayés : {}, \
+             tickets rejetés : {}, connexions rejetées : {}",
+            self.paires_actives,
+            self.paires_servies,
+            self.octets_relayes,
+            self.tickets_rejetes,
+            self.connexions_rejetees
         )
     }
 }
 
-/// État partagé du relais : table d'appariement, quotas et métriques.
+/// Compteurs de connexions simultanées par adresse IP (quota anti-abus).
+type CompteursIp = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// Garde RAII d'une place de connexion pour une IP : la place est rendue au
+/// `drop` (fin du pipe, fin d'attente ou refus en cours de route).
+struct GardeIp {
+    compteurs: CompteursIp,
+    ip: IpAddr,
+}
+
+impl GardeIp {
+    /// Réserve une place pour `ip` ; `None` si le quota `max` est atteint.
+    fn prendre(compteurs: &CompteursIp, ip: IpAddr, max: usize) -> Option<Self> {
+        let mut table = compteurs.lock().unwrap();
+        let compte = table.entry(ip).or_insert(0);
+        if *compte >= max {
+            return None;
+        }
+        *compte += 1;
+        Some(Self {
+            compteurs: Arc::clone(compteurs),
+            ip,
+        })
+    }
+}
+
+impl Drop for GardeIp {
+    fn drop(&mut self) {
+        let mut table = self.compteurs.lock().unwrap();
+        if let Some(compte) = table.get_mut(&self.ip) {
+            *compte -= 1;
+            if *compte == 0 {
+                table.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Pair en attente d'appariement : sa connexion et sa place de quota IP
+/// (tenue tant que la connexion vit dans la table).
+struct EnAttente {
+    stream: TcpStream,
+    _garde: GardeIp,
+}
+
+/// État partagé du relais : table d'appariement, quotas, clé de vérification
+/// et métriques.
 pub struct Relais {
-    /// Table des pairs en attente d'appariement : ticket → connexion du premier pair.
-    en_attente: Mutex<HashMap<Vec<u8>, TcpStream>>,
-    /// Quotas appliqués aux nouvelles paires.
+    /// Table des pairs en attente d'appariement : octets exacts du ticket →
+    /// premier pair (et sa garde de quota IP).
+    en_attente: Mutex<HashMap<Vec<u8>, EnAttente>>,
+    /// Quotas appliqués aux nouvelles paires et connexions.
     config: ConfigRelais,
+    /// Clé publique de l'autorité qui signe les tickets de relais.
+    cle_autorite: VerifyingKey,
+    /// Connexions simultanées par IP (quota).
+    connexions_par_ip: CompteursIp,
     /// Compteurs d'exploitation.
     metriques: RelayMetrics,
 }
 
 impl Relais {
-    /// Crée l'état d'un relais avec les quotas donnés.
-    fn new(config: ConfigRelais) -> Self {
+    /// Crée l'état d'un relais avec les quotas donnés et la clé publique de
+    /// l'autorité de tickets.
+    fn new(config: ConfigRelais, cle_autorite: VerifyingKey) -> Self {
         Self {
             en_attente: Mutex::default(),
             config,
+            cle_autorite,
+            connexions_par_ip: Arc::default(),
             metriques: RelayMetrics::default(),
         }
     }
@@ -176,18 +274,35 @@ fn main() -> io::Result<()> {
         return sonder_et_afficher(&arguments[1..]);
     }
 
-    // Adresse d'écoute : premier argument CLI, sinon la valeur par défaut.
+    // Usage serveur : `nd-relay <cle-publique-autorite-hex> [adresse:port]`.
+    // Sans clé d'autorité, le relais ne démarre pas (fermé par défaut).
+    let cle_hex = arguments.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage : nd-relay <cle-publique-autorite-hex> [adresse:port] | --sonder <adresse>... \
+             (clé affichée par nd-api au démarrage)",
+        )
+    })?;
+    let cle_autorite = cle_publique_depuis_hex(cle_hex).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clé publique d'autorité invalide (64 caractères hexadécimaux attendus)",
+        )
+    })?;
     let adresse = arguments
-        .first()
+        .get(1)
         .cloned()
         .unwrap_or_else(|| ADRESSE_DEFAUT.to_string());
     let listener = TcpListener::bind(&adresse)?;
-    let relais = Arc::new(Relais::new(ConfigRelais::default()));
+    let relais = Arc::new(Relais::new(ConfigRelais::default(), cle_autorite));
     println!(
-        "nd-relay — NovaDesk (protocole v{}) — relais opaque en écoute sur {} (quota : {} paires actives)",
+        "nd-relay — NovaDesk (protocole v{}) — relais opaque à tickets signés en écoute sur {} \
+         (quotas : {} paires actives, {:?} octets/paire, {} connexions/IP)",
         nd_proto::ProtocolVersion::CURRENT,
         listener.local_addr()?,
-        relais.config.max_paires_actives
+        relais.config.max_paires_actives,
+        relais.config.quota_octets_par_paire,
+        relais.config.max_connexions_par_ip
     );
 
     // Journal d'exploitation : publication périodique des métriques.
@@ -245,13 +360,26 @@ fn servir(listener: &TcpListener, relais: &Arc<Relais>) -> io::Result<()> {
     Ok(())
 }
 
-/// Lit la trame d'annonce (`[u32 BE len][ticket]`) et apparie la connexion.
+/// Lit la trame d'annonce (`[u32 BE len][ticket]`), **vérifie le ticket**
+/// (signature de l'autorité, expiration) et apparie la connexion.
 ///
 /// Premier pair d'un ticket : mis en attente dans la table. Second pair : si le
 /// quota de paires actives le permet, le couple est retiré de la table et le
 /// relais bidirectionnel démarre ; sinon la nouvelle connexion est refusée
 /// (fermée et comptée) et le premier pair reste en attente.
 fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
+    // Quota de connexions par IP, avant toute lecture (anti-abus).
+    let ip = stream.peer_addr()?.ip();
+    let Some(garde) = GardeIp::prendre(
+        &relais.connexions_par_ip,
+        ip,
+        relais.config.max_connexions_par_ip,
+    ) else {
+        relais.metriques.rejeter_connexion();
+        let _ = stream.shutdown(Shutdown::Both);
+        return Err(io::Error::other("quota de connexions par IP atteint"));
+    };
+
     let ticket = match lire_ticket(&mut stream) {
         Ok(ticket) => ticket,
         Err(erreur) => {
@@ -259,6 +387,15 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
             return Err(erreur);
         }
     };
+    // Seuls les tickets signés par l'autorité et non expirés entrent.
+    if let Err(refus) = TicketRelais::verifier(&ticket, &relais.cle_autorite, maintenant_unix()) {
+        relais.metriques.rejeter_ticket();
+        let _ = stream.shutdown(Shutdown::Both);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            refus.to_string(),
+        ));
+    }
 
     // Section critique courte : retire le pair en attente ou dépose la
     // connexion. La réservation de quota se fait sous le même verrou, afin que
@@ -271,7 +408,13 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
                     .metriques
                     .ouvrir_paire(relais.config.max_paires_actives)
                 {
-                    Some((premier, stream))
+                    Some((
+                        premier,
+                        EnAttente {
+                            stream,
+                            _garde: garde,
+                        },
+                    ))
                 } else {
                     // Quota de paires atteint : refus propre de la nouvelle
                     // connexion, le premier pair reste en attente de son pair.
@@ -282,7 +425,14 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
                 }
             }
             None => {
-                table.insert(ticket, stream);
+                // Premier arrivé : sa garde IP part avec lui dans la table.
+                table.insert(
+                    ticket,
+                    EnAttente {
+                        stream,
+                        _garde: garde,
+                    },
+                );
                 None
             }
         }
@@ -290,9 +440,17 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
 
     match paire {
         Some((premier, second)) => {
-            // Quelle que soit l'issue du pipe, la place réservée est libérée et
-            // les octets effectivement relayés sont crédités.
-            let octets = relayer(premier, second, relais.config.quota_octets_par_paire);
+            // Quelle que soit l'issue du pipe, les places IP sont rendues puis
+            // la place de paire est libérée et les octets crédités.
+            let (flux_premier, garde_premier) = (premier.stream, premier._garde);
+            let (flux_second, garde_second) = (second.stream, second._garde);
+            let octets = relayer(
+                flux_premier,
+                flux_second,
+                relais.config.quota_octets_par_paire,
+            );
+            drop(garde_premier);
+            drop(garde_second);
             relais
                 .metriques
                 .fermer_paire(octets.as_ref().copied().unwrap_or(0));
@@ -413,26 +571,41 @@ fn sonder_relais(adresse: SocketAddr) -> Option<(Duration, SocketAddr)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nd_api::auth::Autorite;
 
     /// Délai de garde des lectures côté client (évite qu'un test ne bloque).
     const DELAI_TEST: Duration = Duration::from_secs(5);
 
+    /// Autorité de test déterministe qui signe les tickets des tests.
+    fn autorite_test() -> Autorite {
+        Autorite::depuis_graine(&[13u8; 32])
+    }
+
+    /// Ticket signé valide pour la paire (`id_a`, `id_b`), expirant dans 60 s.
+    fn ticket_signe(autorite: &Autorite, id_a: u64, id_b: u64) -> Vec<u8> {
+        autorite
+            .emettre_ticket_relais(id_a, id_b, maintenant_unix() + 60)
+            .to_bytes()
+    }
+
     /// Lance un relais configuré sur `127.0.0.1:0` dans un thread et renvoie
-    /// son adresse ainsi que son état partagé (métriques, table d'attente).
-    fn demarrer_relais_configure(config: ConfigRelais) -> (SocketAddr, Arc<Relais>) {
+    /// son adresse, son état partagé et l'autorité qui signe ses tickets.
+    fn demarrer_relais_configure(config: ConfigRelais) -> (SocketAddr, Arc<Relais>, Autorite) {
+        let autorite = autorite_test();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind relais");
         let adresse = listener.local_addr().expect("adresse locale");
-        let relais = Arc::new(Relais::new(config));
+        let relais = Arc::new(Relais::new(config, autorite.cle_publique()));
         let pour_service = Arc::clone(&relais);
         thread::spawn(move || {
             let _ = servir(&listener, &pour_service);
         });
-        (adresse, relais)
+        (adresse, relais, autorite)
     }
 
-    /// Lance un relais avec la configuration par défaut et renvoie son adresse.
-    fn demarrer_relais() -> SocketAddr {
-        demarrer_relais_configure(ConfigRelais::default()).0
+    /// Lance un relais avec la configuration par défaut.
+    fn demarrer_relais() -> (SocketAddr, Autorite) {
+        let (adresse, _, autorite) = demarrer_relais_configure(ConfigRelais::default());
+        (adresse, autorite)
     }
 
     /// Connecte un client au relais et envoie sa trame d'annonce de ticket.
@@ -446,6 +619,15 @@ mod tests {
             .expect("préfixe du ticket");
         stream.write_all(ticket).expect("ticket");
         stream
+    }
+
+    /// Vérifie que la connexion a été refusée : fermée sans un octet transmis.
+    fn verifier_refus(stream: &mut TcpStream) {
+        let mut tampon = Vec::new();
+        match stream.read_to_end(&mut tampon) {
+            Ok(0) | Err(_) => {} // Fermée proprement, rien reçu.
+            Ok(n) => panic!("octets inattendus malgré le refus : {n}"),
+        }
     }
 
     /// Lit exactement `attendu.len()` octets et vérifie leur contenu.
@@ -468,6 +650,18 @@ mod tests {
         }
     }
 
+    /// Attend (avec délai de garde) que toutes les places IP soient rendues.
+    fn attendre_places_ip_rendues(relais: &Relais) {
+        let depart = Instant::now();
+        while !relais.connexions_par_ip.lock().unwrap().is_empty() {
+            assert!(
+                depart.elapsed() < DELAI_TEST,
+                "places IP jamais rendues après le délai de garde"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Attend (avec délai de garde) qu'un ticket soit enregistré en attente.
     fn attendre_ticket_en_attente(relais: &Relais, ticket: &[u8]) {
         let depart = Instant::now();
@@ -482,9 +676,10 @@ mod tests {
 
     #[test]
     fn relais_bidirectionnel_par_ticket() {
-        let adresse = demarrer_relais();
-        let mut a = annoncer(adresse, b"ticket-alpha");
-        let mut b = annoncer(adresse, b"ticket-alpha");
+        let (adresse, autorite) = demarrer_relais();
+        let ticket = ticket_signe(&autorite, 111, 222);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
 
         // A → relais → B, puis B → relais → A : les octets arrivent intacts.
         a.write_all(b"bonjour de A \x00\xff").expect("envoi A");
@@ -499,11 +694,13 @@ mod tests {
 
     #[test]
     fn tickets_simultanes_sans_melange() {
-        let adresse = demarrer_relais();
-        let mut a1 = annoncer(adresse, b"ticket-1");
-        let mut a2 = annoncer(adresse, b"ticket-2");
-        let mut b1 = annoncer(adresse, b"ticket-1");
-        let mut b2 = annoncer(adresse, b"ticket-2");
+        let (adresse, autorite) = demarrer_relais();
+        let ticket_1 = ticket_signe(&autorite, 1, 2);
+        let ticket_2 = ticket_signe(&autorite, 3, 4);
+        let mut a1 = annoncer(adresse, &ticket_1);
+        let mut a2 = annoncer(adresse, &ticket_2);
+        let mut b1 = annoncer(adresse, &ticket_1);
+        let mut b2 = annoncer(adresse, &ticket_2);
 
         // Chaque paire ne voit que le trafic de son propre ticket.
         a1.write_all(b"message-paire-1").expect("envoi a1");
@@ -518,9 +715,10 @@ mod tests {
 
     #[test]
     fn deconnexion_d_un_pair_ferme_l_autre() {
-        let adresse = demarrer_relais();
-        let mut a = annoncer(adresse, b"ticket-fin");
-        let mut b = annoncer(adresse, b"ticket-fin");
+        let (adresse, autorite) = demarrer_relais();
+        let ticket = ticket_signe(&autorite, 5, 6);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
 
         // S'assure que la paire est bien établie avant de couper.
         a.write_all(b"ping").expect("envoi a");
@@ -537,8 +735,57 @@ mod tests {
     }
 
     #[test]
+    fn ticket_non_signe_refuse() {
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais::default());
+
+        // Ticket « à l'ancienne » (octets arbitraires, non signés) : refusé.
+        let mut nu = annoncer(adresse, b"ticket-alpha");
+        verifier_refus(&mut nu);
+        // Ticket au bon format mais altéré après signature : refusé.
+        let mut altere = ticket_signe(&autorite, 1, 2);
+        altere[10] ^= 1;
+        let mut falsifie = annoncer(adresse, &altere);
+        verifier_refus(&mut falsifie);
+        // Ticket signé par une autre autorité : refusé.
+        let intrus = Autorite::depuis_graine(&[77u8; 32]);
+        let mut etranger = annoncer(adresse, &ticket_signe(&intrus, 1, 2));
+        verifier_refus(&mut etranger);
+
+        assert_eq!(relais.metriques.snapshot().tickets_rejetes, 3);
+        // Aucun de ces refus n'a mis de pair en attente.
+        assert!(relais.en_attente.lock().unwrap().is_empty());
+
+        // Le relais continue de servir les tickets signés valides.
+        let ticket = ticket_signe(&autorite, 1, 2);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
+        a.write_all(b"toujours vivant").expect("envoi a");
+        verifier_reception(&mut b, b"toujours vivant");
+    }
+
+    #[test]
+    fn ticket_expire_refuse() {
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais::default());
+
+        // Expiré il y a dix secondes : refusé à l'annonce.
+        let perime = autorite
+            .emettre_ticket_relais(1, 2, maintenant_unix() - 10)
+            .to_bytes();
+        let mut refuse = annoncer(adresse, &perime);
+        verifier_refus(&mut refuse);
+        assert_eq!(relais.metriques.snapshot().tickets_rejetes, 1);
+
+        // Un ticket de même portée mais encore valide passe, lui.
+        let valide = ticket_signe(&autorite, 1, 2);
+        let mut a = annoncer(adresse, &valide);
+        let mut b = annoncer(adresse, &valide);
+        a.write_all(b"dans les temps").expect("envoi a");
+        verifier_reception(&mut b, b"dans les temps");
+    }
+
+    #[test]
     fn annonce_invalide_n_empeche_pas_le_service() {
-        let adresse = demarrer_relais();
+        let (adresse, autorite) = demarrer_relais();
 
         // Ticket incomplet : préfixe annonçant 16 octets, mais 4 seulement envoyés.
         let mut incomplet = TcpStream::connect(adresse).expect("connexion");
@@ -556,24 +803,22 @@ mod tests {
         trop_grand
             .write_all(&(1u32 << 20).to_be_bytes())
             .expect("préfixe démesuré");
-        let mut tampon = Vec::new();
-        match trop_grand.read_to_end(&mut tampon) {
-            Ok(0) | Err(_) => {} // Fermé sans avoir été apparié.
-            Ok(n) => panic!("octets inattendus du relais : {n}"),
-        }
+        verifier_refus(&mut trop_grand);
 
         // Le relais continue de servir les annonces valides.
-        let mut a = annoncer(adresse, b"ticket-sain");
-        let mut b = annoncer(adresse, b"ticket-sain");
+        let ticket = ticket_signe(&autorite, 7, 8);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
         a.write_all(b"toujours vivant").expect("envoi a");
         verifier_reception(&mut b, b"toujours vivant");
     }
 
     #[test]
     fn metriques_comptent_paires_et_octets() {
-        let (adresse, relais) = demarrer_relais_configure(ConfigRelais::default());
-        let mut a = annoncer(adresse, b"ticket-metriques");
-        let mut b = annoncer(adresse, b"ticket-metriques");
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais::default());
+        let ticket = ticket_signe(&autorite, 9, 10);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
 
         // Échange vérifié : 5 octets A→B puis 3 octets B→A.
         a.write_all(b"12345").expect("envoi a");
@@ -592,31 +837,30 @@ mod tests {
         assert_eq!(instantane.paires_servies, 1, "une paire servie (cumul)");
         assert_eq!(instantane.octets_relayes, 8, "5 + 3 octets relayés");
         assert_eq!(instantane.tickets_rejetes, 0, "aucune annonce rejetée");
+        assert_eq!(instantane.connexions_rejetees, 0, "aucun refus par IP");
     }
 
     #[test]
     fn quota_de_paires_refuse_la_paire_en_trop() {
-        let (adresse, relais) = demarrer_relais_configure(ConfigRelais {
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais {
             max_paires_actives: 1,
             ..ConfigRelais::default()
         });
 
         // Première paire : occupe l'unique place autorisée.
-        let mut a1 = annoncer(adresse, b"quota-1");
-        let mut b1 = annoncer(adresse, b"quota-1");
+        let ticket_1 = ticket_signe(&autorite, 1, 2);
+        let mut a1 = annoncer(adresse, &ticket_1);
+        let mut b1 = annoncer(adresse, &ticket_1);
         a1.write_all(b"occupe la place").expect("envoi a1");
         verifier_reception(&mut b1, b"occupe la place");
 
         // Seconde paire : le premier pair est mis en attente (ce n'est pas
         // encore une paire), puis la connexion qui la compléterait est refusée.
-        let mut en_attente = annoncer(adresse, b"quota-2");
-        attendre_ticket_en_attente(&relais, b"quota-2");
-        let mut refuse = annoncer(adresse, b"quota-2");
-        let mut tampon = Vec::new();
-        match refuse.read_to_end(&mut tampon) {
-            Ok(0) | Err(_) => {} // Refusée proprement : fermée sans un octet.
-            Ok(n) => panic!("octets inattendus malgré le quota : {n}"),
-        }
+        let ticket_2 = ticket_signe(&autorite, 3, 4);
+        let mut en_attente = annoncer(adresse, &ticket_2);
+        attendre_ticket_en_attente(&relais, &ticket_2);
+        let mut refuse = annoncer(adresse, &ticket_2);
+        verifier_refus(&mut refuse);
         let instantane = relais.metriques.snapshot();
         assert_eq!(instantane.tickets_rejetes, 1, "refus par quota compté");
         assert_eq!(instantane.paires_actives, 1, "la première paire seule");
@@ -625,19 +869,20 @@ mod tests {
         drop(a1);
         drop(b1);
         attendre_paires_actives(&relais, 0);
-        let mut nouveau = annoncer(adresse, b"quota-2");
+        let mut nouveau = annoncer(adresse, &ticket_2);
         nouveau.write_all(b"seconde chance").expect("envoi nouveau");
         verifier_reception(&mut en_attente, b"seconde chance");
     }
 
     #[test]
     fn quota_d_octets_coupe_la_paire() {
-        let (adresse, relais) = demarrer_relais_configure(ConfigRelais {
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais {
             quota_octets_par_paire: Some(8),
             ..ConfigRelais::default()
         });
-        let mut a = annoncer(adresse, b"quota-octets");
-        let mut b = annoncer(adresse, b"quota-octets");
+        let ticket = ticket_signe(&autorite, 11, 12);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
 
         // 8 octets : pile le budget de la paire, tout passe.
         a.write_all(b"12345678").expect("envoi sous quota");
@@ -661,13 +906,44 @@ mod tests {
     }
 
     #[test]
+    fn quota_de_connexions_par_ip_refuse_l_exces_puis_rend_les_places() {
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais {
+            max_connexions_par_ip: 2,
+            ..ConfigRelais::default()
+        });
+
+        // Une paire active occupe les deux places de 127.0.0.1.
+        let ticket = ticket_signe(&autorite, 1, 2);
+        let mut a = annoncer(adresse, &ticket);
+        let mut b = annoncer(adresse, &ticket);
+        a.write_all(b"place 1 et 2").expect("envoi a");
+        verifier_reception(&mut b, b"place 1 et 2");
+
+        // Troisième connexion de la même IP : refusée avant même l'annonce.
+        let mut refuse = annoncer(adresse, &ticket_signe(&autorite, 3, 4));
+        verifier_refus(&mut refuse);
+        assert_eq!(relais.metriques.snapshot().connexions_rejetees, 1);
+
+        // La paire se clôt : les places sont rendues, une nouvelle paire passe.
+        drop(a);
+        drop(b);
+        attendre_paires_actives(&relais, 0);
+        attendre_places_ip_rendues(&relais);
+        let ticket_2 = ticket_signe(&autorite, 5, 6);
+        let mut c = annoncer(adresse, &ticket_2);
+        let mut d = annoncer(adresse, &ticket_2);
+        c.write_all(b"places rendues").expect("envoi c");
+        verifier_reception(&mut d, b"places rendues");
+    }
+
+    #[test]
     fn select_relay_ecarte_l_injoignable_et_choisit_le_joignable() {
         // Adresse injoignable : port réservé puis relâché (plus d'écouteur).
         let injoignable = {
             let ecouteur = TcpListener::bind("127.0.0.1:0").expect("bind temporaire");
             ecouteur.local_addr().expect("adresse locale")
         };
-        let joignable = demarrer_relais();
+        let (joignable, _) = demarrer_relais();
 
         // Le candidat injoignable est écarté, le relais joignable est retenu.
         assert_eq!(select_relay(&[injoignable, joignable]), Some(joignable));

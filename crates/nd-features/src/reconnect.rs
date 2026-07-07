@@ -5,6 +5,21 @@
 //! Le module ne dort jamais lui-même : il calcule des délais ([`Duration`])
 //! que l'appelant applique avec son propre minuteur. Cela rend tout le
 //! comportement testable sans horloge (voir plan 04, §reconnexion).
+//!
+//! # Contrat d'intégration (orchestrateur `nd-core`)
+//!
+//! La boucle de session de `nd-core` pilote un [`ReconnectController`] par
+//! **événements**, sans connaître la politique de backoff :
+//! - à la perte du lien (fermeture QUIC, timeout keepalive) →
+//!   [`ReconnectController::on_disconnect`] ;
+//! - avant chaque tentative → [`ReconnectController::next_delay`], qui rend
+//!   le délai à observer (avec le minuteur de l'appelant) ou `None` quand la
+//!   politique a épuisé ses tentatives (informer l'UI, arrêter la boucle) ;
+//! - dès qu'une connexion aboutit (ou que l'utilisateur annule) →
+//!   [`ReconnectController::reset`].
+//!
+//! Les signaux redondants sont inoffensifs : un second `on_disconnect`
+//! pendant une reconnexion en cours ne remet pas le backoff à zéro.
 
 use std::time::Duration;
 
@@ -157,6 +172,121 @@ impl ReconnectState {
     }
 }
 
+/// Contrôleur de reconnexion orienté événements : enveloppe
+/// [`ReconnectPolicy`] + [`ReconnectState`] derrière l'API que la boucle de
+/// session de `nd-core` consomme (voir le contrat d'intégration en tête de
+/// module). Ne dort jamais : rend des délais, l'appelant tient le minuteur.
+///
+/// ```
+/// use nd_features::ReconnectController;
+///
+/// let mut ctl = ReconnectController::default();
+/// ctl.on_disconnect(); // le lien vient de tomber
+/// let mut tentatives = 0;
+/// while let Some(_delai) = ctl.next_delay() {
+///     // ici : attendre `_delai`, puis tenter la reconnexion…
+///     tentatives += 1;
+///     if tentatives == 3 {
+///         ctl.reset(); // troisième tentative : la connexion a abouti
+///         break;
+///     }
+/// }
+/// assert!(!ctl.is_reconnecting());
+/// assert!(!ctl.has_given_up());
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconnectController {
+    policy: ReconnectPolicy,
+    etat: ReconnectState,
+    /// Délai calculé par le dernier événement et pas encore remis à
+    /// l'appelant par [`ReconnectController::next_delay`].
+    delai_arme: Option<Duration>,
+}
+
+impl ReconnectController {
+    /// Contrôleur au repos, avec la politique donnée.
+    #[must_use]
+    pub fn new(policy: ReconnectPolicy) -> Self {
+        ReconnectController {
+            policy,
+            etat: ReconnectState::Idle,
+            delai_arme: None,
+        }
+    }
+
+    /// Signale la perte du lien : arme la première tentative.
+    ///
+    /// Idempotent : si une reconnexion est déjà en cours (ou déjà abandonnée),
+    /// les signaux redondants — plusieurs canaux constatant la même coupure —
+    /// ne remettent pas la séquence de backoff à zéro.
+    pub fn on_disconnect(&mut self) {
+        if self.etat == ReconnectState::Idle {
+            self.delai_arme = self.etat.on_disconnected(&self.policy);
+        }
+    }
+
+    /// Délai à observer avant la **prochaine** tentative de reconnexion.
+    ///
+    /// Premier appel après [`ReconnectController::on_disconnect`] : délai de
+    /// la tentative 1. Chaque appel suivant acte l'échec de la tentative
+    /// précédente et programme la suivante. Rend `None` quand la politique a
+    /// épuisé `max_attempts` ([`ReconnectController::has_given_up`] devient
+    /// vrai), ou si aucune coupure n'a été signalée.
+    pub fn next_delay(&mut self) -> Option<Duration> {
+        if let Some(delai) = self.delai_arme.take() {
+            return Some(delai);
+        }
+        self.etat.on_attempt_failed(&self.policy)
+    }
+
+    /// Signale une connexion (r)établie ou un abandon utilisateur : retour au
+    /// repos, compteur de tentatives oublié.
+    pub fn reset(&mut self) {
+        self.etat.on_connected();
+        self.delai_arme = None;
+    }
+
+    /// État courant de la machine à états sous-jacente.
+    #[must_use]
+    pub fn state(&self) -> ReconnectState {
+        self.etat
+    }
+
+    /// Numéro (1-indexé) de la tentative en cours de programmation, ou `None`
+    /// au repos / après abandon.
+    #[must_use]
+    pub fn attempt(&self) -> Option<u32> {
+        match self.etat {
+            ReconnectState::Waiting { until_attempt } => Some(until_attempt),
+            ReconnectState::Idle | ReconnectState::GaveUp => None,
+        }
+    }
+
+    /// Une reconnexion automatique est-elle en cours ?
+    #[must_use]
+    pub fn is_reconnecting(&self) -> bool {
+        matches!(self.etat, ReconnectState::Waiting { .. })
+    }
+
+    /// La reconnexion automatique a-t-elle abandonné (`max_attempts` atteint) ?
+    #[must_use]
+    pub fn has_given_up(&self) -> bool {
+        self.etat.has_given_up()
+    }
+
+    /// Politique de backoff appliquée.
+    #[must_use]
+    pub fn policy(&self) -> &ReconnectPolicy {
+        &self.policy
+    }
+}
+
+impl Default for ReconnectController {
+    fn default() -> Self {
+        ReconnectController::new(ReconnectPolicy::default())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +434,73 @@ mod tests {
         let mut etat = ReconnectState::Idle;
         assert_eq!(etat.on_disconnected(&p), None);
         assert!(etat.has_given_up());
+    }
+
+    #[test]
+    fn controleur_cycle_nominal() {
+        let mut ctl = ReconnectController::new(politique_nette());
+        assert!(!ctl.is_reconnecting());
+        assert_eq!(ctl.attempt(), None);
+        // Sans coupure signalée, il n'y a rien à programmer.
+        assert_eq!(ctl.next_delay(), None);
+
+        ctl.on_disconnect();
+        assert!(ctl.is_reconnecting());
+        assert_eq!(ctl.attempt(), Some(1));
+        // Suite exacte de la politique : 100, 200, 400 ms…
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(100)));
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(200)));
+        assert_eq!(ctl.attempt(), Some(2));
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(400)));
+
+        // La connexion aboutit : retour au repos, la séquence repartira de 1.
+        ctl.reset();
+        assert!(!ctl.is_reconnecting());
+        ctl.on_disconnect();
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn controleur_on_disconnect_idempotent() {
+        let mut ctl = ReconnectController::new(politique_nette());
+        ctl.on_disconnect();
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(100)));
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(200)));
+        // Signal redondant en pleine reconnexion : le backoff ne repart pas.
+        ctl.on_disconnect();
+        assert_eq!(ctl.attempt(), Some(2));
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn controleur_abandonne_puis_reset_reamorce() {
+        let mut ctl = ReconnectController::new(ReconnectPolicy {
+            max_attempts: Some(2),
+            ..politique_nette()
+        });
+        ctl.on_disconnect();
+        assert!(ctl.next_delay().is_some()); // tentative 1
+        assert!(ctl.next_delay().is_some()); // tentative 2
+        assert_eq!(ctl.next_delay(), None); // épuisé
+        assert!(ctl.has_given_up());
+        assert_eq!(ctl.attempt(), None);
+        // Abandonné : un nouveau signal de coupure ne relance rien tout seul…
+        ctl.on_disconnect();
+        assert!(ctl.has_given_up());
+        // … c'est reset() (reconnexion manuelle réussie) qui réamorce.
+        ctl.reset();
+        ctl.on_disconnect();
+        assert_eq!(ctl.next_delay(), Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn controleur_zero_tentative_donne_abandon_immediat() {
+        let mut ctl = ReconnectController::new(ReconnectPolicy {
+            max_attempts: Some(0),
+            ..politique_nette()
+        });
+        ctl.on_disconnect();
+        assert_eq!(ctl.next_delay(), None);
+        assert!(ctl.has_given_up());
     }
 }

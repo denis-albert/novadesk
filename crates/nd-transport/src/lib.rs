@@ -6,6 +6,18 @@
 //! fiable ordonné pour l'input/contrôle/fichiers. Congestion, format de trames et
 //! FEC : `../../plan-technique/04-transport-reseau.md`.
 //!
+//! **Points d'entrée connectivité (plan 05)** — même pile QUIC, trois chemins :
+//!
+//! * adresse directe : [`bind`] / [`connect`] (LAN, loopback, IP publique) ;
+//! * socket UDP **percée** par le hole punching (`nd-signaling::connect`) :
+//!   [`connect_over_socket`] / [`accept_over_socket`], quinn reprenant la
+//!   socket déjà ouverte — le mapping NAT percé est conservé ;
+//! * repli **relais** (`nd-relay`, tunnel TCP aveugle) :
+//!   [`connect_via_relay`] / [`accept_via_relay`].
+//!
+//! Le pair contrôlé présente la même [`ServerIdentity`] sur tous les chemins :
+//! le certificat publié au rendez-vous reste épinglable partout.
+//!
 //! Note : l'API du trait reste en `Vec<u8>` ; le passage à `bytes::Bytes` de bout en
 //! bout (zéro-copie) viendra quand `nd-codec` produira ses trames dans des tampons
 //! partagés.
@@ -46,4 +58,13 @@ pub trait Transport: Send {
 mod datagram;
 pub mod fec;
 mod quic;
-pub use quic::{bind, connect, connect_quic, Listener, QuicTransport};
+mod relay;
+
+pub use quic::{
+    accept_over_socket, accept_quic_over_socket, bind, bind_with_identity, connect,
+    connect_over_socket, connect_quic, connect_quic_over_socket, Listener, QuicTransport,
+    ServerIdentity,
+};
+pub use relay::{
+    accept_quic_via_relay, accept_via_relay, connect_quic_via_relay, connect_via_relay,
+};

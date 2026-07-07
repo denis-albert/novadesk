@@ -12,7 +12,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../bridge/native_api.dart';
 import '../state/providers.dart';
+import '../theme/nova_theme.dart';
 import '../widgets/nova_button.dart';
+import '../widgets/nova_icons.dart';
 import '../widgets/nova_id_field.dart';
 
 /// Appareil autorisé à se connecter sans présence.
@@ -78,9 +80,10 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   }
 
   (String, Color) _libelleForce(double force) {
-    if (force < 0.4) return ('faible', Colors.red.shade600);
-    if (force < 0.7) return ('moyenne', Colors.amber.shade800);
-    return ('forte', Colors.green.shade600);
+    // Couleurs sémantiques du doc 03 §1.1 (avertissement #F0A020, vert accès).
+    if (force < 0.4) return ('faible', kNovaRouge);
+    if (force < 0.7) return ('moyenne', const Color(0xFFF0A020));
+    return ('forte', kNovaVert);
   }
 
   /// Ajoute un appareil de confiance : l'ID saisi est validé puis reformaté
@@ -185,7 +188,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           const SizedBox(height: 12),
           Card(
             child: SwitchListTile(
-              secondary: const Icon(Icons.shield_outlined),
+              secondary: const NovaIcone(NovaIcones.bouclier),
               title: const Text("Autoriser l'accès non-surveillé"),
               subtitle: Text(
                 _actif
@@ -208,14 +211,19 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
             onChanged: (_) => setState(() {}),
             decoration: InputDecoration(
               labelText: 'Mot de passe',
-              border: const OutlineInputBorder(),
-              prefixIcon: const Icon(Icons.password_outlined),
+              prefixIcon: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 11),
+                child: NovaIcone(NovaIcones.cle, taille: 16),
+              ),
+              prefixIconConstraints:
+                  const BoxConstraints(minWidth: 38, minHeight: 38),
               suffixIcon: IconButton(
                 tooltip: _motDePasseVisible ? 'Masquer' : 'Afficher',
-                icon: Icon(
+                icon: NovaIcone(
                   _motDePasseVisible
-                      ? Icons.visibility_off_outlined
-                      : Icons.visibility_outlined,
+                      ? NovaIcones.oeilBarre
+                      : NovaIcones.oeil,
+                  taille: 16,
                 ),
                 onPressed: () => setState(
                   () => _motDePasseVisible = !_motDePasseVisible,
@@ -245,14 +253,14 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           const SizedBox(height: 8),
           Align(
             alignment: Alignment.centerLeft,
-            child: FilledButton.tonalIcon(
+            child: OutlinedButton.icon(
               onPressed: _actif
                   ? () => setState(() {
                         _motDePasseController.text = genererMotDePasse(32);
                         _motDePasseVisible = true;
                       })
                   : null,
-              icon: const Icon(Icons.casino_outlined),
+              icon: const NovaIcone(NovaIcones.recharger, taille: 14),
               label: const Text('Générer un mot de passe aléatoire (32 c.)'),
             ),
           ),
@@ -269,7 +277,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
               children: [
                 for (final appareil in _appareils)
                   ListTile(
-                    leading: const Icon(Icons.devices_outlined),
+                    leading: const NovaIcone(NovaIcones.moniteur),
                     title: Text(appareil.idFormate),
                     subtitle: Text(appareil.alias),
                     trailing: Row(
@@ -290,7 +298,8 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
                         ),
                         IconButton(
                           tooltip: 'Retirer',
-                          icon: const Icon(Icons.delete_outline),
+                          icon: const NovaIcone(NovaIcones.corbeille,
+                              taille: 16),
                           onPressed: _actif
                               ? () =>
                                   setState(() => _appareils.remove(appareil))
@@ -305,7 +314,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
                     padding: const EdgeInsets.all(8),
                     child: TextButton.icon(
                       onPressed: _actif ? _ajouterAppareil : null,
-                      icon: const Icon(Icons.add),
+                      icon: const NovaIcone(NovaIcones.plus, taille: 14),
                       label: const Text('Ajouter'),
                     ),
                   ),
@@ -319,14 +328,14 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           Text('3. Sécurité', style: theme.textTheme.titleSmall),
           const SizedBox(height: 8),
           SwitchListTile(
-            secondary: const Icon(Icons.phonelink_lock),
+            secondary: const NovaIcone(NovaIcones.cadenas),
             title: const Text('Double authentification (TOTP)'),
             value: _totp,
             onChanged:
                 _actif ? (valeur) => setState(() => _totp = valeur) : null,
           ),
           SwitchListTile(
-            secondary: const Icon(Icons.receipt_long_outlined),
+            secondary: const NovaIcone(NovaIcones.horloge),
             title: const Text('Journaliser toutes les sessions'),
             value: _journalisation,
             onChanged: _actif
@@ -334,7 +343,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
                 : null,
           ),
           SwitchListTile(
-            secondary: const Icon(Icons.power_settings_new_outlined),
+            secondary: const NovaIcone(NovaIcones.alimentation),
             title: const Text('Autoriser le Wake-on-LAN'),
             subtitle: const Text('Réveiller ce poste à distance (plan 13)'),
             value: _wakeOnLan,
@@ -350,8 +359,8 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
                 padding: const EdgeInsets.all(12),
                 child: Row(
                   children: [
-                    Icon(Icons.warning_amber_rounded,
-                        color: theme.colorScheme.onErrorContainer),
+                    NovaIcone(NovaIcones.avertissement,
+                        couleur: theme.colorScheme.onErrorContainer),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
@@ -379,7 +388,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
               const SizedBox(width: 12),
               NovaButton(
                 libelle: 'Enregistrer',
-                icone: Icons.save_outlined,
+                icone: NovaIcones.coche,
                 onPressed: _enregistrer,
               ),
             ],

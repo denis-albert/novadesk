@@ -9,6 +9,8 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'nova_icons.dart';
+
 /// Formateur : ne garde que les chiffres (9 au plus) et insère un espace
 /// tous les 3 chiffres, en préservant la position du curseur.
 class NovaIdInputFormatter extends TextInputFormatter {
@@ -108,8 +110,12 @@ class NovaIdField extends StatelessWidget {
       decoration: InputDecoration(
         labelText: libelle,
         hintText: indication,
-        prefixIcon: const Icon(Icons.tag),
-        border: const OutlineInputBorder(),
+        prefixIcon: const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 11),
+          child: NovaIcone(NovaIcones.moniteur, taille: 16),
+        ),
+        prefixIconConstraints:
+            const BoxConstraints(minWidth: 38, minHeight: 38),
       ),
       onSubmitted: onSubmitted,
     );

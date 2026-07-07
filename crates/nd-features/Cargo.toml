@@ -7,8 +7,16 @@ description = "Permissions de session et fonctionnalités avancées (voir plan 1
 
 [dependencies]
 nd-proto = { workspace = true }
+# Types d'entrée de l'enregistreur (`EncodedChunk`) — voir `recording.rs`/`recording/mp4.rs`.
+nd-codec = { workspace = true }
 # Hachage d'intégrité des enregistrements de session (voir `recording.rs`).
 blake3 = "1"
+# CSPRNG de l'OS pour les codes d'invitation QuickSupport (voir `invite.rs`).
+getrandom = "0.3"
+
+[dev-dependencies]
+# Frames synthétiques pour les tests/exemples d'enregistrement (encodage réel).
+nd-capture = { workspace = true }
 
 [lints]
 workspace = true

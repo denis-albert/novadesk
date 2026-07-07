@@ -5,33 +5,51 @@
 //! aléatoires, encodés en hexadécimal).
 //!
 //! Persistance (module [`storage`]) : [`AccountStore::open`] attache le
-//! magasin à un fichier JSON (écriture atomique : fichier temporaire +
-//! `rename`) — comptes, secrets 2FA et liens OIDC survivent au redémarrage ;
-//! `register`, `enable_2fa` et `link_oidc` persistent avant de réussir
-//! (« durable ou rien »). Seuls les **hachages PHC Argon2id** sont écrits,
-//! jamais un mot de passe ; les sessions restent volatiles par conception.
-//! [`AccountStore::new`] garde le comportement purement en mémoire (tests).
+//! magasin à une base **redb** transactionnelle — comptes, secrets 2FA, liens
+//! OIDC et plans de licence survivent au redémarrage ; chaque mutation durable
+//! persiste avant de réussir (« durable ou rien »). Seuls les **hachages PHC
+//! Argon2id** sont écrits, jamais un mot de passe ; les **secrets TOTP sont
+//! chiffrés au repos** (module [`chiffre`], clé dérivée du **secret serveur** :
+//! fichier `<base>.cle` auto-généré, ou secret explicite via
+//! [`AccountStore::ouvrir_avec_secret`] / variable `ND_ACCOUNTS_SECRET`). Un
+//! fichier JSON de l'ancien format posé à côté de la base (`comptes.json`
+//! pour `comptes.redb`) est importé à la première ouverture. Les sessions
+//! restent volatiles par conception. [`AccountStore::new`] garde le
+//! comportement purement en mémoire (tests).
 //!
 //! 2FA TOTP (RFC 6238, module [`totp`]) : `enable_2fa(email)` génère et stocke
 //! le secret ; un compte protégé doit passer par `login_2fa(email, password,
 //! code)` — `login` seul renvoie alors `DeuxFacteursRequis`. Les licences et
-//! quotas de sessions vivent dans le module [`licensing`] ; le journal d'audit
-//! (conformité, RGPD) et le registre des sessions actives dans le module
-//! [`audit`] — attacher un journal via [`AccountStore::with_audit`] consigne
-//! créations de compte, connexions et activations 2FA.
+//! quotas de sessions vivent dans le module [`licensing`] (plans persistés via
+//! [`AccountStore::attribuer_plan`]) ; le journal d'audit (conformité, RGPD)
+//! et le registre des sessions actives dans le module [`audit`].
 //!
-//! Fédération OIDC/OAuth2 (module [`oidc`]) : PKCE S256, URL d'autorisation et
-//! validation d'ID token JWT ; [`AccountStore::link_oidc`] rattache un sujet
-//! fédéré à un compte local, [`AccountStore::login_oidc`] ouvre une session
-//! pour un sujet déjà lié (l'authentification — y compris MFA — a eu lieu chez
-//! le fournisseur d'identité : la 2FA locale ne s'applique pas à ce chemin).
+//! Fédération OIDC/OAuth2 (module [`oidc`]) : PKCE S256, URL d'autorisation,
+//! **échange code → jetons** au token endpoint et validation d'ID token
+//! (**RS256/ES256 via JWKS**, module [`jwks`] ; HS256 pour le développement) ;
+//! [`AccountStore::link_oidc`] rattache un sujet fédéré à un compte local,
+//! [`AccountStore::login_oidc`] ouvre une session pour un sujet déjà lié
+//! (l'authentification — y compris MFA — a eu lieu chez le fournisseur : la
+//! 2FA locale ne s'applique pas à ce chemin).
 //! Voir `../../plan-technique/11-backend-infrastructure.md`.
 //!
-//! Serveur TCP optionnel (std pur, un thread par connexion) au même format que
-//! `nd-signaling` : trames à préfixe de longueur `u32` BE.
+//! **Jetons applicatifs** (module [`jeton`]) : après connexion, un jeton de
+//! session s'échange contre un JWS **Ed25519** (`iss`, `sub`, `roles`, `plan`,
+//! `iat`, `exp`) que nd-api (lot 07) vérifie hors ligne avec la clé publique
+//! du service (requête `ClePubliqueJetons`).
 //!
-//! Usage : `nd-accounts [adresse:port] [fichier_comptes.json]`
+//! Serveur TCP (std pur, un thread par connexion, une requête par connexion)
+//! au même format que `nd-signaling` : trames à préfixe de longueur `u32` BE.
+//! Le protocole couvre inscription, connexion, **flux 2FA complet** (login →
+//! challenge TOTP → validation), **flux OIDC** (démarrage / rappel), émission
+//! de jetons applicatifs et licences — voir [`Request`] / [`Response`].
+//!
+//! Usage : `nd-accounts [adresse:port] [base_comptes.redb]`
 //! (défaut `0.0.0.0:9200`, en mémoire si aucun fichier n'est donné).
+//! Environnement : `ND_ACCOUNTS_SECRET` (secret serveur, hexadécimal) ;
+//! `ND_OIDC_ISSUER`, `ND_OIDC_AUTH_ENDPOINT`, `ND_OIDC_TOKEN_ENDPOINT`,
+//! `ND_OIDC_JWKS_URI`, `ND_OIDC_CLIENT_ID`, `ND_OIDC_REDIRECT_URI` et
+//! `ND_OIDC_LIER_PAR_EMAIL=1` pour activer la fédération.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -45,10 +63,15 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 
 pub mod audit;
+pub mod chiffre;
+pub mod jeton;
+pub mod jwks;
 pub mod licensing;
 pub mod oidc;
 pub mod storage;
 pub mod totp;
+
+use licensing::Plan;
 
 /// Adresse d'écoute par défaut (9000 = rendez-vous, 9100 = relais).
 const ADRESSE_DEFAUT: &str = "0.0.0.0:9200";
@@ -72,9 +95,14 @@ pub enum AccountError {
     DeuxFacteursNonActives,
     /// Code TOTP malformé, expiré ou incorrect.
     CodeTotpInvalide,
+    /// La 2FA est déjà active : sa réinitialisation par le réseau est refusée
+    /// (un mot de passe volé ne doit pas suffire à remplacer le second facteur).
+    DeuxFacteursDejaActives,
     /// Compte inconnu (activation 2FA sur un e-mail non enregistré, sujet
     /// OIDC jamais lié, etc.).
     CompteInconnu,
+    /// Jeton de session inconnu ou périmé.
+    SessionInvalide,
     /// Le sujet OIDC est déjà lié à un **autre** compte local.
     SujetOidcDejaLie,
     /// Erreur du stockage persistant (chargement ou sauvegarde du fichier de
@@ -95,7 +123,11 @@ impl fmt::Display for AccountError {
                 write!(f, "la 2FA n'est pas activée sur ce compte")
             }
             AccountError::CodeTotpInvalide => write!(f, "code de vérification invalide"),
+            AccountError::DeuxFacteursDejaActives => {
+                write!(f, "la 2FA est déjà active sur ce compte")
+            }
             AccountError::CompteInconnu => write!(f, "compte inconnu"),
+            AccountError::SessionInvalide => write!(f, "session invalide ou expirée"),
             AccountError::SujetOidcDejaLie => {
                 write!(f, "ce sujet OIDC est déjà lié à un autre compte")
             }
@@ -112,47 +144,28 @@ impl std::error::Error for AccountError {}
 // ---------------------------------------------------------------------------
 
 /// État interne : e-mail → hachage PHC, jeton de session → e-mail,
-/// e-mail → secret TOTP pour les comptes ayant activé la 2FA, et sujet OIDC
-/// (`iss|sub`) → e-mail pour les identités fédérées liées.
+/// e-mail → secret TOTP pour les comptes ayant activé la 2FA, sujet OIDC
+/// (`iss|sub`) → e-mail pour les identités fédérées liées, et e-mail → plan
+/// de licence attribué.
 #[derive(Default)]
 struct Etat {
     comptes: HashMap<String, String>,
     sessions: HashMap<String, String>,
     secrets_2fa: HashMap<String, Vec<u8>>,
     liens_oidc: HashMap<String, String>,
+    licences: HashMap<String, Plan>,
 }
 
 impl Etat {
-    /// Reconstruit l'état durable depuis le fichier de comptes. Les sessions
-    /// repartent vides (volatiles par conception).
-    fn depuis_donnees(donnees: storage::DonneesPersistees) -> Result<Self, AccountError> {
-        let mut secrets_2fa = HashMap::with_capacity(donnees.secrets_2fa.len());
-        for (email, hex) in donnees.secrets_2fa {
-            let secret = storage::hex_vers_octets(&hex).ok_or_else(|| {
-                AccountError::Stockage(format!("secret TOTP corrompu pour {email}"))
-            })?;
-            secrets_2fa.insert(email, secret);
-        }
-        Ok(Self {
-            comptes: donnees.comptes,
+    /// Reconstruit l'état depuis la base (secrets déjà déchiffrés). Les
+    /// sessions repartent vides (volatiles par conception).
+    fn depuis_durable(durable: storage::EtatDurable) -> Self {
+        Self {
+            comptes: durable.comptes,
             sessions: HashMap::new(),
-            secrets_2fa,
-            liens_oidc: donnees.liens_oidc,
-        })
-    }
-
-    /// Instantané durable de l'état (hachages PHC, secrets TOTP en
-    /// hexadécimal, liens OIDC — jamais les sessions ni un mot de passe).
-    fn instantane(&self) -> storage::DonneesPersistees {
-        storage::DonneesPersistees {
-            version: storage::VERSION_FORMAT,
-            comptes: self.comptes.clone(),
-            secrets_2fa: self
-                .secrets_2fa
-                .iter()
-                .map(|(email, secret)| (email.clone(), storage::octets_vers_hex(secret)))
-                .collect(),
-            liens_oidc: self.liens_oidc.clone(),
+            secrets_2fa: durable.secrets_2fa,
+            liens_oidc: durable.liens_oidc,
+            licences: durable.licences,
         }
     }
 }
@@ -160,8 +173,8 @@ impl Etat {
 /// État partagé entre threads de connexion.
 type EtatPartage = Arc<Mutex<Etat>>;
 
-/// Magasin de comptes (thread-safe, clonable), en mémoire ou adossé à un
-/// fichier (voir [`Self::open`]).
+/// Magasin de comptes (thread-safe, clonable), en mémoire ou adossé à une
+/// base redb (voir [`Self::open`]).
 #[derive(Clone)]
 pub struct AccountStore {
     etat: EtatPartage,
@@ -170,7 +183,10 @@ pub struct AccountStore {
     audit: Option<audit::AuditLog>,
     /// Stockage persistant optionnel (voir [`Self::open`]) ; `None` = magasin
     /// purement en mémoire, volatil.
-    stockage: Option<storage::StockageFichier>,
+    stockage: Option<storage::StockageRedb>,
+    /// Émetteur des jetons applicatifs Ed25519 (clé dérivée du secret
+    /// serveur ; volatile pour un magasin en mémoire).
+    jetons: Arc<jeton::EmetteurJetons>,
 }
 
 impl Default for AccountStore {
@@ -186,25 +202,32 @@ impl AccountStore {
         Self::with_argon2(Argon2::default())
     }
 
-    /// Magasin avec une configuration Argon2 personnalisée (tests : paramètres légers).
+    /// Magasin avec une configuration Argon2 personnalisée (tests : paramètres
+    /// légers). En mémoire : le secret serveur (jetons applicatifs) est tiré
+    /// au hasard et meurt avec le processus.
     #[must_use]
     pub fn with_argon2(argon: Argon2<'static>) -> Self {
+        let mut secret = [0u8; 32];
+        OsRng.fill_bytes(&mut secret);
         Self {
             etat: EtatPartage::default(),
             argon,
             audit: None,
             stockage: None,
+            jetons: Arc::new(jeton::EmetteurJetons::depuis_secret(&secret)),
         }
     }
 
-    /// Magasin **persistant** : charge le fichier de comptes s'il existe
-    /// (comptes, secrets 2FA, liens OIDC), puis persiste chaque mutation
-    /// durable (`register`, `enable_2fa`, `link_oidc`) par écriture atomique.
-    /// Les sessions ne sont pas persistées. Paramètres Argon2id par défaut.
+    /// Magasin **persistant** : ouvre (ou crée) la base redb — migrations et
+    /// import de l'ancien JSON compris, voir [`storage`] — puis persiste
+    /// chaque mutation durable (`register`, `enable_2fa`, `link_oidc`,
+    /// `attribuer_plan`) transactionnellement. Les sessions ne sont pas
+    /// persistées. Le **secret serveur** (chiffrement des secrets TOTP, clé
+    /// des jetons applicatifs) est lu dans le fichier `<chemin>.cle`,
+    /// auto-généré au premier lancement. Paramètres Argon2id par défaut.
     ///
     /// # Errors
-    /// `Stockage` si le fichier existe mais est illisible (JSON corrompu,
-    /// version de format plus récente que le service, secret TOTP corrompu).
+    /// `Stockage` si la base ou le fichier de clé sont illisibles.
     pub fn open<P: AsRef<Path>>(chemin: P) -> Result<Self, AccountError> {
         Self::open_with_argon2(chemin, Argon2::default())
     }
@@ -218,19 +241,35 @@ impl AccountStore {
         chemin: P,
         argon: Argon2<'static>,
     ) -> Result<Self, AccountError> {
-        let stockage = storage::StockageFichier::new(chemin.as_ref());
-        let etat = match stockage
+        let secret = secret_serveur_fichier(chemin.as_ref())?;
+        Self::ouvrir_avec_secret(chemin, &secret, argon)
+    }
+
+    /// Magasin persistant avec un **secret serveur explicite** (déploiements :
+    /// variable `ND_ACCOUNTS_SECRET` ; tests). Le secret dérive la clé de
+    /// chiffrement des secrets TOTP et la clé Ed25519 des jetons applicatifs —
+    /// le changer rend les secrets TOTP en base indéchiffrables.
+    ///
+    /// # Errors
+    /// `Stockage` si la base est illisible (corruption, version future,
+    /// import JSON hérité invalide, secret TOTP indéchiffrable).
+    pub fn ouvrir_avec_secret<P: AsRef<Path>>(
+        chemin: P,
+        secret: &[u8],
+        argon: Argon2<'static>,
+    ) -> Result<Self, AccountError> {
+        let chiffreur = chiffre::Chiffreur::depuis_secret(secret);
+        let stockage = storage::StockageRedb::ouvrir(chemin.as_ref(), chiffreur)
+            .map_err(|e| AccountError::Stockage(e.to_string()))?;
+        let durable = stockage
             .charger()
-            .map_err(|e| AccountError::Stockage(e.to_string()))?
-        {
-            Some(donnees) => Etat::depuis_donnees(donnees)?,
-            None => Etat::default(),
-        };
+            .map_err(|e| AccountError::Stockage(e.to_string()))?;
         Ok(Self {
-            etat: Arc::new(Mutex::new(etat)),
+            etat: Arc::new(Mutex::new(Etat::depuis_durable(durable))),
             argon,
             audit: None,
             stockage: Some(stockage),
+            jetons: Arc::new(jeton::EmetteurJetons::depuis_secret(secret)),
         })
     }
 
@@ -251,23 +290,11 @@ impl AccountStore {
         }
     }
 
-    /// Persiste l'état durable si un stockage est attaché. À appeler **sous**
-    /// le verrou d'état : l'instantané est cohérent et les écritures
-    /// concurrentes des clones sont sérialisées. Les mutations sont rares
-    /// (inscription, activation 2FA, lien OIDC) : l'E/S sous verrou est un
-    /// compromis assumé et documenté.
-    fn persister(&self, etat: &Etat) -> Result<(), AccountError> {
-        let Some(stockage) = &self.stockage else {
-            return Ok(());
-        };
-        stockage
-            .sauvegarder(&etat.instantane())
-            .map_err(|e| AccountError::Stockage(e.to_string()))
-    }
-
     /// Crée un compte : le mot de passe est haché en **Argon2id** (sel
-    /// aléatoire). Sur un magasin persistant, le compte est écrit sur disque
-    /// avant que l'appel réussisse (« durable ou rien »).
+    /// aléatoire). Sur un magasin persistant, le compte est écrit en base
+    /// (une transaction) avant que l'appel réussisse (« durable ou rien »).
+    /// L'E/S sous verrou d'état est un compromis assumé : les mutations sont
+    /// rares (inscription, 2FA, lien OIDC, licence) et ainsi sérialisées.
     ///
     /// # Errors
     /// `EntreeInvalide` si e-mail/mot de passe vide, `EmailDejaUtilise` si le
@@ -288,11 +315,13 @@ impl AccountStore {
         if etat.comptes.contains_key(email) {
             return Err(AccountError::EmailDejaUtilise);
         }
-        etat.comptes.insert(email.to_string(), phc);
-        if let Err(e) = self.persister(&etat) {
-            etat.comptes.remove(email); // durable ou rien
-            return Err(e);
+        if let Some(stockage) = &self.stockage {
+            // Durable ou rien : la base d'abord, la mémoire ensuite.
+            stockage
+                .inserer_compte(email, &phc)
+                .map_err(|e| AccountError::Stockage(e.to_string()))?;
         }
+        etat.comptes.insert(email.to_string(), phc);
         drop(etat); // audit hors verrou
         self.auditer(audit::AuditEvent::AccountCreated {
             email: email.to_string(),
@@ -368,10 +397,11 @@ impl AccountStore {
 
     /// Active la 2FA TOTP sur un compte : génère un secret de 20 octets, le
     /// stocke et le renvoie (à présenter une seule fois à l'utilisateur, p. ex.
-    /// sous forme d'URI `otpauth://` en QR code). Réactiver régénère le secret.
-    /// Sur un magasin persistant, le secret est écrit sur disque avant que
-    /// l'appel réussisse (en clair pour l'instant — voir la doc de [`storage`] :
-    /// le chiffrement au repos par clé serveur viendra).
+    /// sous forme d'URI `otpauth://` en QR code). Réactiver régénère le secret
+    /// (opération locale/admin ; par le réseau, passer par
+    /// [`Self::activer_2fa_reseau`] qui exige le mot de passe). Sur un magasin
+    /// persistant, le secret est **chiffré** (AEAD, clé serveur) puis écrit en
+    /// base avant que l'appel réussisse.
     ///
     /// # Errors
     /// `CompteInconnu` si l'e-mail n'est pas enregistré, `Stockage` si la
@@ -382,20 +412,34 @@ impl AccountStore {
             return Err(AccountError::CompteInconnu);
         }
         let secret = totp::generate_totp_secret();
-        let precedent = etat.secrets_2fa.insert(email.to_string(), secret.clone());
-        if let Err(e) = self.persister(&etat) {
-            // Durable ou rien : on restaure l'état 2FA antérieur.
-            match precedent {
-                Some(ancien) => etat.secrets_2fa.insert(email.to_string(), ancien),
-                None => etat.secrets_2fa.remove(email),
-            };
-            return Err(e);
+        if let Some(stockage) = &self.stockage {
+            // Durable ou rien : si l'écriture échoue, la mémoire n'a pas bougé.
+            stockage
+                .definir_secret_2fa(email, &secret)
+                .map_err(|e| AccountError::Stockage(e.to_string()))?;
         }
+        etat.secrets_2fa.insert(email.to_string(), secret.clone());
         drop(etat); // audit hors verrou
         self.auditer(audit::AuditEvent::TwoFactorEnabled {
             email: email.to_string(),
         });
         Ok(secret)
+    }
+
+    /// Activation de la 2FA **par le réseau** : exige le mot de passe du
+    /// compte, et refuse de remplacer un second facteur déjà actif (un mot de
+    /// passe volé ne doit pas suffire à substituer le TOTP de l'attaquant).
+    ///
+    /// # Errors
+    /// `IdentifiantsInvalides` (mot de passe, vérifié en premier),
+    /// `DeuxFacteursDejaActives` si un secret existe déjà, puis les erreurs
+    /// de [`Self::enable_2fa`].
+    pub fn activer_2fa_reseau(&self, email: &str, password: &str) -> Result<Vec<u8>, AccountError> {
+        self.verifier_identifiants_auditees(email, password)?;
+        if self.etat.lock().unwrap().secrets_2fa.contains_key(email) {
+            return Err(AccountError::DeuxFacteursDejaActives);
+        }
+        self.enable_2fa(email)
     }
 
     /// Connexion avec second facteur : mot de passe **puis** code TOTP
@@ -467,12 +511,14 @@ impl AccountStore {
             Some(_) => return Err(AccountError::SujetOidcDejaLie),
             None => {}
         }
+        if let Some(stockage) = &self.stockage {
+            // Durable ou rien : la base d'abord, la mémoire ensuite.
+            stockage
+                .inserer_lien_oidc(subject, email)
+                .map_err(|e| AccountError::Stockage(e.to_string()))?;
+        }
         etat.liens_oidc
             .insert(subject.to_string(), email.to_string());
-        if let Err(e) = self.persister(&etat) {
-            etat.liens_oidc.remove(subject); // durable ou rien
-            return Err(e);
-        }
         Ok(())
     }
 
@@ -502,6 +548,111 @@ impl AccountStore {
         self.auditer(audit::AuditEvent::LoginSuccess { email });
         Ok(jeton)
     }
+
+    // -- Licences (module [`licensing`]) -------------------------------------
+
+    /// Attribue (ou change) le plan de licence d'un compte ; persisté sur un
+    /// magasin persistant. Le plan apparaît dans le claim `plan` des jetons
+    /// applicatifs — nd-api peut ainsi appliquer les quotas sans rappel ici.
+    ///
+    /// # Errors
+    /// `CompteInconnu` si l'e-mail n'est pas enregistré, `Stockage` si la
+    /// persistance échoue (le plan précédent est alors conservé).
+    pub fn attribuer_plan(&self, email: &str, plan: Plan) -> Result<(), AccountError> {
+        let mut etat = self.etat.lock().unwrap();
+        if !etat.comptes.contains_key(email) {
+            return Err(AccountError::CompteInconnu);
+        }
+        if let Some(stockage) = &self.stockage {
+            // Durable ou rien : la base d'abord, la mémoire ensuite.
+            stockage
+                .definir_licence(email, plan)
+                .map_err(|e| AccountError::Stockage(e.to_string()))?;
+        }
+        etat.licences.insert(email.to_string(), plan);
+        Ok(())
+    }
+
+    /// Plan de licence d'un compte (`Free` si aucun n'a été attribué).
+    ///
+    /// # Errors
+    /// `CompteInconnu` si l'e-mail n'est pas enregistré.
+    pub fn plan_de(&self, email: &str) -> Result<Plan, AccountError> {
+        let etat = self.etat.lock().unwrap();
+        if !etat.comptes.contains_key(email) {
+            return Err(AccountError::CompteInconnu);
+        }
+        Ok(etat.licences.get(email).copied().unwrap_or_default())
+    }
+
+    // -- Jetons applicatifs (module [`jeton`]) --------------------------------
+
+    /// Échange un jeton de session opaque contre un **jeton applicatif**
+    /// signé Ed25519 (claims `iss`/`sub`/`roles`/`plan`/`iat`/`exp`, durée
+    /// [`jeton::DUREE_DEFAUT_S`]) que nd-api vérifie hors ligne avec
+    /// [`Self::cle_publique_jetons`]. Voir le format dans la doc de [`jeton`].
+    ///
+    /// # Errors
+    /// `SessionInvalide` si le jeton de session est inconnu ou périmé.
+    pub fn emettre_jeton_applicatif(&self, jeton_session: &str) -> Result<String, AccountError> {
+        let (email, plan) = {
+            let etat = self.etat.lock().unwrap();
+            let email = etat
+                .sessions
+                .get(jeton_session)
+                .cloned()
+                .ok_or(AccountError::SessionInvalide)?;
+            let plan = etat.licences.get(&email).copied().unwrap_or_default();
+            (email, plan)
+        };
+        Ok(self.jetons.emettre(
+            &email,
+            &["utilisateur"],
+            plan.nom(),
+            unix_maintenant(),
+            jeton::DUREE_DEFAUT_S,
+        ))
+    }
+
+    /// Clé publique Ed25519 (32 octets, hexadécimal) vérifiant les jetons
+    /// applicatifs — celle que nd-api (lot 07) doit connaître.
+    #[must_use]
+    pub fn cle_publique_jetons(&self) -> String {
+        self.jetons.cle_publique_hex()
+    }
+}
+
+/// Lit le secret serveur dans `<chemin>.cle` (32 octets, hexadécimal) ; le
+/// génère (aléa système) et l'écrit au premier lancement. La perte de ce
+/// fichier rend les secrets TOTP en base indéchiffrables et change la clé des
+/// jetons applicatifs — le sauvegarder avec la base.
+fn secret_serveur_fichier(chemin_base: &Path) -> Result<Vec<u8>, AccountError> {
+    let mut nom = chemin_base.as_os_str().to_owned();
+    nom.push(".cle");
+    let chemin_cle = std::path::PathBuf::from(nom);
+    match std::fs::read_to_string(&chemin_cle) {
+        Ok(contenu) => storage::hex_vers_octets(contenu.trim()).ok_or_else(|| {
+            AccountError::Stockage(format!(
+                "fichier de clé {} illisible (hexadécimal attendu)",
+                chemin_cle.display()
+            ))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut secret = [0u8; 32];
+            OsRng.fill_bytes(&mut secret);
+            std::fs::write(&chemin_cle, storage::octets_vers_hex(&secret))
+                .map_err(|e| AccountError::Stockage(format!("écriture du fichier de clé : {e}")))?;
+            println!(
+                "nd-accounts : secret serveur généré dans {} (à sauvegarder avec la base)",
+                chemin_cle.display()
+            );
+            Ok(secret.to_vec())
+        }
+        Err(e) => Err(AccountError::Stockage(format!(
+            "lecture du fichier de clé {} : {e}",
+            chemin_cle.display()
+        ))),
+    }
 }
 
 /// Temps Unix courant en secondes (0 si l'horloge est antérieure à l'époque).
@@ -528,15 +679,63 @@ fn jeton_aleatoire() -> String {
 // Protocole (trames u32 BE + charge utile, comme nd-signaling)
 // ---------------------------------------------------------------------------
 
+/// Requêtes du protocole (préfixées d'un octet d'étiquette). Couvre les flux
+/// jadis inatteignables par le réseau : **2FA complet** (`Login` →
+/// [`Response::DeuxFacteursRequis`] → `LoginDeuxFacteurs`), **OIDC**
+/// (`DemarrerOidc` → URL d'autorisation ; `RappelOidc` avec le `state` et le
+/// code renvoyés par le fournisseur), **jetons applicatifs** (`EmettreJeton`,
+/// `ClePubliqueJetons` pour nd-api) et **licences** (`AttribuerPlan` — auto-
+/// service documenté, en attendant un rôle admin/facturation —,
+/// `ConsulterLicence`).
 enum Request {
+    /// 1 — Création de compte.
     Register { email: String, password: String },
+    /// 2 — Connexion (peut répondre `DeuxFacteursRequis`).
     Login { email: String, password: String },
+    /// 3 — Connexion avec second facteur TOTP (validation du challenge).
+    LoginDeuxFacteurs {
+        email: String,
+        password: String,
+        code: String,
+    },
+    /// 4 — Activation de la 2FA (mot de passe exigé ; refusée si déjà active).
+    ActiverDeuxFacteurs { email: String, password: String },
+    /// 5 — Démarrage du flux OIDC : renvoie l'URL d'autorisation et le state.
+    DemarrerOidc,
+    /// 6 — Rappel OIDC : state + code d'autorisation → session locale.
+    RappelOidc { state: String, code: String },
+    /// 7 — Échange d'un jeton de session contre un jeton applicatif Ed25519.
+    EmettreJeton { session: String },
+    /// 8 — Clé publique Ed25519 des jetons applicatifs (pour nd-api).
+    ClePubliqueJetons,
+    /// 9 — Attribution d'un plan au compte de la session.
+    AttribuerPlan { session: String, plan: String },
+    /// 10 — Licence du compte de la session (plan + quota).
+    ConsulterLicence { session: String },
 }
 
+/// Réponses du protocole (préfixées d'un octet d'étiquette).
 enum Response {
+    /// 0 — Succès sans donnée.
     Ok,
+    /// 1 — Jeton de session opaque (connexion réussie).
     Token { jeton: String },
+    /// 2 — Refus ou échec, avec message lisible.
     Erreur { message: String },
+    /// 3 — Challenge 2FA : identifiants corrects, code TOTP attendu
+    /// (répondre par `LoginDeuxFacteurs`).
+    DeuxFacteursRequis,
+    /// 4 — Secret TOTP fraîchement activé (hexadécimal ; à présenter une
+    /// seule fois, p. ex. en QR code `otpauth://`).
+    SecretTotp { secret_hex: String },
+    /// 5 — URL d'autorisation OIDC à ouvrir dans le navigateur + state.
+    AutorisationOidc { url: String, state: String },
+    /// 6 — Jeton applicatif signé Ed25519 (format : doc du module [`jeton`]).
+    JetonApplicatif { jeton: String },
+    /// 7 — Clé publique Ed25519 (32 octets, hexadécimal).
+    ClePublique { hex: String },
+    /// 8 — Licence : nom du plan et quota de sessions (0 = illimité).
+    Licence { plan: String, max_sessions: u32 },
 }
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -579,20 +778,85 @@ impl Request {
                 put_bytes(&mut out, email.as_bytes());
                 put_bytes(&mut out, password.as_bytes());
             }
+            Request::LoginDeuxFacteurs {
+                email,
+                password,
+                code,
+            } => {
+                out.push(3);
+                put_bytes(&mut out, email.as_bytes());
+                put_bytes(&mut out, password.as_bytes());
+                put_bytes(&mut out, code.as_bytes());
+            }
+            Request::ActiverDeuxFacteurs { email, password } => {
+                out.push(4);
+                put_bytes(&mut out, email.as_bytes());
+                put_bytes(&mut out, password.as_bytes());
+            }
+            Request::DemarrerOidc => out.push(5),
+            Request::RappelOidc { state, code } => {
+                out.push(6);
+                put_bytes(&mut out, state.as_bytes());
+                put_bytes(&mut out, code.as_bytes());
+            }
+            Request::EmettreJeton { session } => {
+                out.push(7);
+                put_bytes(&mut out, session.as_bytes());
+            }
+            Request::ClePubliqueJetons => out.push(8),
+            Request::AttribuerPlan { session, plan } => {
+                out.push(9);
+                put_bytes(&mut out, session.as_bytes());
+                put_bytes(&mut out, plan.as_bytes());
+            }
+            Request::ConsulterLicence { session } => {
+                out.push(10);
+                put_bytes(&mut out, session.as_bytes());
+            }
         }
         out
     }
 
     fn from_bytes(d: &[u8]) -> Option<Request> {
         let mut p = 0;
-        let tag = read_u8(d, &mut p)?;
-        let email = read_string(d, &mut p)?;
-        let password = read_string(d, &mut p)?;
-        match tag {
-            1 => Some(Request::Register { email, password }),
-            2 => Some(Request::Login { email, password }),
-            _ => None,
-        }
+        let requete = match read_u8(d, &mut p)? {
+            1 => Request::Register {
+                email: read_string(d, &mut p)?,
+                password: read_string(d, &mut p)?,
+            },
+            2 => Request::Login {
+                email: read_string(d, &mut p)?,
+                password: read_string(d, &mut p)?,
+            },
+            3 => Request::LoginDeuxFacteurs {
+                email: read_string(d, &mut p)?,
+                password: read_string(d, &mut p)?,
+                code: read_string(d, &mut p)?,
+            },
+            4 => Request::ActiverDeuxFacteurs {
+                email: read_string(d, &mut p)?,
+                password: read_string(d, &mut p)?,
+            },
+            5 => Request::DemarrerOidc,
+            6 => Request::RappelOidc {
+                state: read_string(d, &mut p)?,
+                code: read_string(d, &mut p)?,
+            },
+            7 => Request::EmettreJeton {
+                session: read_string(d, &mut p)?,
+            },
+            8 => Request::ClePubliqueJetons,
+            9 => Request::AttribuerPlan {
+                session: read_string(d, &mut p)?,
+                plan: read_string(d, &mut p)?,
+            },
+            10 => Request::ConsulterLicence {
+                session: read_string(d, &mut p)?,
+            },
+            _ => return None,
+        };
+        // Toute la trame doit avoir été consommée (pas d'octets orphelins).
+        (p == d.len()).then_some(requete)
     }
 }
 
@@ -609,6 +873,29 @@ impl Response {
                 out.push(2);
                 put_bytes(&mut out, message.as_bytes());
             }
+            Response::DeuxFacteursRequis => out.push(3),
+            Response::SecretTotp { secret_hex } => {
+                out.push(4);
+                put_bytes(&mut out, secret_hex.as_bytes());
+            }
+            Response::AutorisationOidc { url, state } => {
+                out.push(5);
+                put_bytes(&mut out, url.as_bytes());
+                put_bytes(&mut out, state.as_bytes());
+            }
+            Response::JetonApplicatif { jeton } => {
+                out.push(6);
+                put_bytes(&mut out, jeton.as_bytes());
+            }
+            Response::ClePublique { hex } => {
+                out.push(7);
+                put_bytes(&mut out, hex.as_bytes());
+            }
+            Response::Licence { plan, max_sessions } => {
+                out.push(8);
+                put_bytes(&mut out, plan.as_bytes());
+                out.extend_from_slice(&max_sessions.to_be_bytes());
+            }
         }
         out
     }
@@ -624,6 +911,24 @@ impl Response {
             }),
             2 => Some(Response::Erreur {
                 message: read_string(d, &mut p)?,
+            }),
+            3 => Some(Response::DeuxFacteursRequis),
+            4 => Some(Response::SecretTotp {
+                secret_hex: read_string(d, &mut p)?,
+            }),
+            5 => Some(Response::AutorisationOidc {
+                url: read_string(d, &mut p)?,
+                state: read_string(d, &mut p)?,
+            }),
+            6 => Some(Response::JetonApplicatif {
+                jeton: read_string(d, &mut p)?,
+            }),
+            7 => Some(Response::ClePublique {
+                hex: read_string(d, &mut p)?,
+            }),
+            8 => Some(Response::Licence {
+                plan: read_string(d, &mut p)?,
+                max_sessions: read_u32(d, &mut p)?,
             }),
             _ => None,
         }
@@ -655,36 +960,184 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
 // Serveur
 // ---------------------------------------------------------------------------
 
+/// Service réseau : magasin de comptes + flux OIDC optionnel (fournisseur
+/// configuré). Clonable : les clones partagent magasin et flux.
+#[derive(Clone)]
+pub struct Service {
+    store: AccountStore,
+    oidc: Option<Arc<oidc::FluxOidc>>,
+}
+
+impl Service {
+    /// Service sans fédération OIDC (requêtes OIDC → « non configuré »).
+    #[must_use]
+    pub fn nouveau(store: AccountStore) -> Self {
+        Self { store, oidc: None }
+    }
+
+    /// Service avec fédération OIDC active.
+    #[must_use]
+    pub fn avec_oidc(store: AccountStore, flux: Arc<oidc::FluxOidc>) -> Self {
+        Self {
+            store,
+            oidc: Some(flux),
+        }
+    }
+
+    /// Traite une requête et produit la réponse (cœur du protocole).
+    fn traiter(&self, requete: Request) -> Response {
+        match requete {
+            Request::Register { email, password } => selon(
+                self.store
+                    .register(&email, &password)
+                    .map(|()| Response::Ok),
+            ),
+            // Flux 2FA, étape 1 : identifiants corrects mais compte protégé →
+            // challenge TOTP explicite (pas une erreur).
+            Request::Login { email, password } => match self.store.login(&email, &password) {
+                Ok(jeton) => Response::Token { jeton },
+                Err(AccountError::DeuxFacteursRequis) => Response::DeuxFacteursRequis,
+                Err(e) => erreur(&e),
+            },
+            // Flux 2FA, étape 2 : validation du code TOTP.
+            Request::LoginDeuxFacteurs {
+                email,
+                password,
+                code,
+            } => selon(
+                self.store
+                    .login_2fa(&email, &password, &code)
+                    .map(|jeton| Response::Token { jeton }),
+            ),
+            Request::ActiverDeuxFacteurs { email, password } => selon(
+                self.store
+                    .activer_2fa_reseau(&email, &password)
+                    .map(|secret| Response::SecretTotp {
+                        secret_hex: storage::octets_vers_hex(&secret),
+                    }),
+            ),
+            Request::DemarrerOidc => match &self.oidc {
+                Some(flux) => {
+                    let (url, state) = flux.demarrer(unix_maintenant());
+                    Response::AutorisationOidc { url, state }
+                }
+                None => Response::Erreur {
+                    message: "fédération OIDC non configurée".into(),
+                },
+            },
+            Request::RappelOidc { state, code } => match &self.oidc {
+                Some(flux) => self.rappel_oidc(flux, &state, &code),
+                None => Response::Erreur {
+                    message: "fédération OIDC non configurée".into(),
+                },
+            },
+            Request::EmettreJeton { session } => selon(
+                self.store
+                    .emettre_jeton_applicatif(&session)
+                    .map(|jeton| Response::JetonApplicatif { jeton }),
+            ),
+            Request::ClePubliqueJetons => Response::ClePublique {
+                hex: self.store.cle_publique_jetons(),
+            },
+            Request::AttribuerPlan { session, plan } => {
+                let Some(email) = self.store.verify_token(&session) else {
+                    return erreur(&AccountError::SessionInvalide);
+                };
+                let Some(plan) = Plan::depuis_nom(&plan) else {
+                    return Response::Erreur {
+                        message: format!("plan inconnu : {plan}"),
+                    };
+                };
+                selon(
+                    self.store
+                        .attribuer_plan(&email, plan)
+                        .map(|()| Response::Ok),
+                )
+            }
+            Request::ConsulterLicence { session } => {
+                let Some(email) = self.store.verify_token(&session) else {
+                    return erreur(&AccountError::SessionInvalide);
+                };
+                selon(self.store.plan_de(&email).map(|plan| Response::Licence {
+                    plan: plan.nom().to_string(),
+                    max_sessions: plan.max_sessions().unwrap_or(0),
+                }))
+            }
+        }
+    }
+
+    /// Rappel OIDC : valide le flux ([`oidc::FluxOidc::rappel`]) puis rattache
+    /// le sujet fédéré (`iss|sub`) à un compte local — déjà lié, ou lié à la
+    /// volée par e-mail vérifié si le fournisseur est configuré de confiance
+    /// ([`oidc::OptionsFlux::lier_par_email`]).
+    fn rappel_oidc(&self, flux: &oidc::FluxOidc, state: &str, code: &str) -> Response {
+        let claims = match flux.rappel(state, code, unix_maintenant()) {
+            Ok(claims) => claims,
+            Err(e) => {
+                return Response::Erreur {
+                    message: e.to_string(),
+                }
+            }
+        };
+        let sujet = format!("{}|{}", claims.emetteur, claims.sujet);
+        // Sujet déjà lié : connexion directe.
+        if self.store.oidc_account(&sujet).is_some() {
+            return selon(
+                self.store
+                    .login_oidc(&sujet)
+                    .map(|jeton| Response::Token { jeton }),
+            );
+        }
+        // Sinon, liaison automatique par e-mail vérifié — si configurée.
+        if flux.lier_par_email() {
+            if let Some(email) = &claims.email {
+                if let Err(e) = self.store.link_oidc(email, &sujet) {
+                    return erreur(&e);
+                }
+                return selon(
+                    self.store
+                        .login_oidc(&sujet)
+                        .map(|jeton| Response::Token { jeton }),
+                );
+            }
+        }
+        Response::Erreur {
+            message: "identité fédérée non liée à un compte local".into(),
+        }
+    }
+}
+
+/// Convertit un résultat métier en réponse (l'erreur devient un message).
+fn selon(resultat: Result<Response, AccountError>) -> Response {
+    resultat.unwrap_or_else(|e| erreur(&e))
+}
+
+/// Réponse d'erreur à partir d'une erreur métier.
+fn erreur(e: &AccountError) -> Response {
+    Response::Erreur {
+        message: e.to_string(),
+    }
+}
+
 /// Boucle de service (bloquante, un thread par connexion, une requête par connexion).
 ///
 /// # Errors
 /// Renvoie une erreur si l'acceptation d'une connexion échoue.
-pub fn serve(listener: TcpListener, store: AccountStore) -> std::io::Result<()> {
+pub fn serve(listener: TcpListener, service: Service) -> std::io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
-        let store = store.clone();
+        let service = service.clone();
         std::thread::spawn(move || {
-            let _ = handle_conn(stream, &store);
+            let _ = handle_conn(stream, &service);
         });
     }
     Ok(())
 }
 
-fn handle_conn(mut stream: TcpStream, store: &AccountStore) -> std::io::Result<()> {
+fn handle_conn(mut stream: TcpStream, service: &Service) -> std::io::Result<()> {
     let req_bytes = read_frame(&mut stream)?;
     let resp = match Request::from_bytes(&req_bytes) {
-        Some(Request::Register { email, password }) => match store.register(&email, &password) {
-            Ok(()) => Response::Ok,
-            Err(e) => Response::Erreur {
-                message: e.to_string(),
-            },
-        },
-        Some(Request::Login { email, password }) => match store.login(&email, &password) {
-            Ok(jeton) => Response::Token { jeton },
-            Err(e) => Response::Erreur {
-                message: e.to_string(),
-            },
-        },
+        Some(requete) => service.traiter(requete),
         None => Response::Erreur {
             message: "requête invalide".into(),
         },
@@ -692,18 +1145,53 @@ fn handle_conn(mut stream: TcpStream, store: &AccountStore) -> std::io::Result<(
     write_frame(&mut stream, &resp.to_bytes())
 }
 
+/// Construit le flux OIDC depuis l'environnement (`ND_OIDC_*`), s'il est
+/// configuré (au minimum : issuer, endpoints, client_id, redirect_uri).
+fn flux_oidc_depuis_env() -> Option<Arc<oidc::FluxOidc>> {
+    let variable = |nom: &str| std::env::var(nom).ok().filter(|v| !v.trim().is_empty());
+    let config = oidc::OidcConfig {
+        issuer: variable("ND_OIDC_ISSUER")?,
+        authorization_endpoint: variable("ND_OIDC_AUTH_ENDPOINT")?,
+        token_endpoint: variable("ND_OIDC_TOKEN_ENDPOINT")?,
+        jwks_uri: variable("ND_OIDC_JWKS_URI")?,
+        client_id: variable("ND_OIDC_CLIENT_ID")?,
+        redirect_uri: variable("ND_OIDC_REDIRECT_URI")?,
+        scopes: vec!["openid".into(), "email".into()],
+    };
+    let options = oidc::OptionsFlux {
+        lier_par_email: variable("ND_OIDC_LIER_PAR_EMAIL").is_some_and(|v| v == "1"),
+        ..oidc::OptionsFlux::default()
+    };
+    Some(Arc::new(oidc::FluxOidc::new(config, options)))
+}
+
 fn main() -> std::io::Result<()> {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| ADRESSE_DEFAUT.to_string());
-    // Second argument optionnel : chemin du fichier de comptes (persistance).
+    // Second argument optionnel : chemin de la base de comptes (persistance).
     let chemin = std::env::args().nth(2);
     let (store, mode) = match &chemin {
         Some(chemin) => {
-            let store = AccountStore::open(chemin).map_err(std::io::Error::other)?;
+            // Secret serveur : variable d'environnement (hexadécimal), sinon
+            // fichier `<base>.cle` auto-généré.
+            let store = match std::env::var("ND_ACCOUNTS_SECRET")
+                .ok()
+                .and_then(|hex| storage::hex_vers_octets(hex.trim()))
+            {
+                Some(secret) => {
+                    AccountStore::ouvrir_avec_secret(chemin, &secret, Argon2::default())
+                }
+                None => AccountStore::open(chemin),
+            }
+            .map_err(std::io::Error::other)?;
             (store, format!("comptes persistés dans {chemin}"))
         }
         None => (AccountStore::new(), "comptes en mémoire".to_string()),
+    };
+    let service = match flux_oidc_depuis_env() {
+        Some(flux) => Service::avec_oidc(store, flux),
+        None => Service::nouveau(store),
     };
     let listener = TcpListener::bind(&addr)?;
     println!(
@@ -711,7 +1199,7 @@ fn main() -> std::io::Result<()> {
         nd_proto::ProtocolVersion::CURRENT,
         listener.local_addr()?
     );
-    serve(listener, store)
+    serve(listener, service)
 }
 
 // ---------------------------------------------------------------------------
@@ -981,27 +1469,30 @@ mod tests {
                 .expect("register");
         } // le magasin est refermé : seul le fichier survit
 
-        let store = store_persistant(tmp.chemin());
-        let jeton = store
-            .login("alice@example.com", "s3cret!")
-            .expect("login après réouverture");
-        assert_eq!(
-            store.verify_token(&jeton).as_deref(),
-            Some("alice@example.com")
-        );
-        // Mauvais mot de passe : refusé sur le magasin rechargé.
-        assert_eq!(
-            store.login("alice@example.com", "mauvais"),
-            Err(AccountError::IdentifiantsInvalides)
-        );
-        // L'unicité d'e-mail est elle aussi rechargée.
-        assert_eq!(
-            store.register("alice@example.com", "autre"),
-            Err(AccountError::EmailDejaUtilise)
-        );
+        {
+            let store = store_persistant(tmp.chemin());
+            let jeton = store
+                .login("alice@example.com", "s3cret!")
+                .expect("login après réouverture");
+            assert_eq!(
+                store.verify_token(&jeton).as_deref(),
+                Some("alice@example.com")
+            );
+            // Mauvais mot de passe : refusé sur le magasin rechargé.
+            assert_eq!(
+                store.login("alice@example.com", "mauvais"),
+                Err(AccountError::IdentifiantsInvalides)
+            );
+            // L'unicité d'e-mail est elle aussi rechargée.
+            assert_eq!(
+                store.register("alice@example.com", "autre"),
+                Err(AccountError::EmailDejaUtilise)
+            );
 
-        // Une inscription après réouverture est persistée à son tour.
-        store.register("bob@example.com", "mdp2").expect("register");
+            // Une inscription après réouverture est persistée à son tour.
+            store.register("bob@example.com", "mdp2").expect("register");
+        } // la base (verrou exclusif redb) doit être refermée avant réouverture
+
         let store = store_persistant(tmp.chemin());
         assert!(store.login("bob@example.com", "mdp2").is_ok());
     }
@@ -1048,20 +1539,102 @@ mod tests {
     #[test]
     fn persistance_fichier_sans_mot_de_passe_en_clair() {
         let tmp = FichierTemp::nouveau("sans-mdp");
-        let store = store_persistant(tmp.chemin());
-        store
-            .register("dan@example.com", "MotDePasseTresSecret123")
-            .expect("register");
+        {
+            let store = store_persistant(tmp.chemin());
+            store
+                .register("dan@example.com", "MotDePasseTresSecret123")
+                .expect("register");
+        } // la base est refermée : son fichier n'est plus verrouillé
 
-        let contenu = std::fs::read_to_string(tmp.chemin()).expect("fichier écrit");
+        // La base est binaire : on cherche les motifs dans les octets bruts.
+        let brut = std::fs::read(tmp.chemin()).expect("base écrite");
+        let contient = |motif: &[u8]| brut.windows(motif.len()).any(|fenetre| fenetre == motif);
         assert!(
-            !contenu.contains("MotDePasseTresSecret123"),
+            !contient(b"MotDePasseTresSecret123"),
             "le mot de passe en clair ne doit jamais toucher le disque"
         );
         assert!(
-            contenu.contains("$argon2id$"),
+            contient(b"$argon2id$"),
             "seul le hachage PHC Argon2id est persisté"
         );
+    }
+
+    #[test]
+    fn persistance_secret_totp_chiffre_en_base() {
+        let tmp = FichierTemp::nouveau("totp-chiffre");
+        let secret = {
+            let store = store_persistant(tmp.chemin());
+            store.register("gala@example.com", "mdp").expect("register");
+            store.enable_2fa("gala@example.com").expect("enable_2fa")
+        };
+        // Ni les octets bruts du secret, ni son encodage hexadécimal (l'ancien
+        // format en clair) n'apparaissent dans le fichier de la base.
+        let brut = std::fs::read(tmp.chemin()).expect("base écrite");
+        assert!(
+            !brut.windows(secret.len()).any(|f| f == secret.as_slice()),
+            "le secret TOTP ne doit jamais toucher le disque en clair"
+        );
+        let hex = storage::octets_vers_hex(&secret);
+        assert!(
+            !brut.windows(hex.len()).any(|f| f == hex.as_bytes()),
+            "pas d'hexadécimal en clair non plus"
+        );
+        // Le secret rechargé (déchiffré) reste utilisable pour un login 2FA.
+        let store = store_persistant(tmp.chemin());
+        let code = totp::totp_at(&secret, unix_maintenant());
+        assert!(store.login_2fa("gala@example.com", "mdp", &code).is_ok());
+    }
+
+    #[test]
+    fn persistance_import_du_json_herite() {
+        let tmp = FichierTemp::nouveau("import-herite");
+        // Prépare un fichier de l'ancien format avec un vrai hachage et un
+        // secret TOTP en clair (hexadécimal), comme l'aurait écrit l'ancien
+        // service.
+        let (phc, secret) = {
+            let ancien = store_test();
+            ancien
+                .register("vera@example.com", "mdp")
+                .expect("register");
+            let phc = ancien
+                .etat
+                .lock()
+                .unwrap()
+                .comptes
+                .get("vera@example.com")
+                .cloned()
+                .expect("hachage");
+            (phc, totp::generate_totp_secret())
+        };
+        let herite = storage::DonneesPersistees {
+            version: storage::VERSION_FORMAT,
+            comptes: HashMap::from([("vera@example.com".to_string(), phc)]),
+            secrets_2fa: HashMap::from([(
+                "vera@example.com".to_string(),
+                storage::octets_vers_hex(&secret),
+            )]),
+            liens_oidc: HashMap::from([(
+                "https://idp.example|sub-vera".to_string(),
+                "vera@example.com".to_string(),
+            )]),
+        };
+        std::fs::write(
+            tmp.chemin_json(),
+            serde_json::to_string(&herite).expect("sérialisation"),
+        )
+        .expect("écriture du JSON hérité");
+
+        // L'ouverture de la base vierge importe tout : mot de passe, 2FA
+        // (secret rechiffré) et lien OIDC fonctionnent immédiatement.
+        let store = store_persistant(tmp.chemin());
+        assert_eq!(
+            store.login("vera@example.com", "mdp"),
+            Err(AccountError::DeuxFacteursRequis),
+            "compte et 2FA importés"
+        );
+        let code = totp::totp_at(&secret, unix_maintenant());
+        assert!(store.login_2fa("vera@example.com", "mdp", &code).is_ok());
+        assert!(store.login_oidc("https://idp.example|sub-vera").is_ok());
     }
 
     // -- Fédération OIDC (`link_oidc` / `login_oidc`) -------------------------
@@ -1185,48 +1758,509 @@ mod tests {
                 email: "a@b.c".into(),
                 password: "mdp".into(),
             },
+            Request::LoginDeuxFacteurs {
+                email: "a@b.c".into(),
+                password: "mdp".into(),
+                code: "123456".into(),
+            },
+            Request::ActiverDeuxFacteurs {
+                email: "a@b.c".into(),
+                password: "mdp".into(),
+            },
+            Request::DemarrerOidc,
+            Request::RappelOidc {
+                state: "etat".into(),
+                code: "code".into(),
+            },
+            Request::EmettreJeton {
+                session: "jeton".into(),
+            },
+            Request::ClePubliqueJetons,
+            Request::AttribuerPlan {
+                session: "jeton".into(),
+                plan: "pro".into(),
+            },
+            Request::ConsulterLicence {
+                session: "jeton".into(),
+            },
         ];
         for r in &reqs {
             assert!(Request::from_bytes(&r.to_bytes()).is_some());
         }
         assert!(Request::from_bytes(&[]).is_none());
+        assert!(Request::from_bytes(&[99]).is_none(), "étiquette inconnue");
+        // Octets excédentaires après une requête complète : trame refusée.
+        let mut trop_long = Request::DemarrerOidc.to_bytes();
+        trop_long.push(0);
+        assert!(Request::from_bytes(&trop_long).is_none());
 
-        let bytes = Response::Token {
-            jeton: "abc123".into(),
+        // Réponses : chaque variante fait l'aller-retour.
+        let reponses = [
+            Response::Ok,
+            Response::Token {
+                jeton: "abc123".into(),
+            },
+            Response::Erreur {
+                message: "boom".into(),
+            },
+            Response::DeuxFacteursRequis,
+            Response::SecretTotp {
+                secret_hex: "01ff".into(),
+            },
+            Response::AutorisationOidc {
+                url: "https://idp/authorize?x=1".into(),
+                state: "etat".into(),
+            },
+            Response::JetonApplicatif {
+                jeton: "a.b.c".into(),
+            },
+            Response::ClePublique { hex: "00ab".into() },
+            Response::Licence {
+                plan: "pro".into(),
+                max_sessions: 10,
+            },
+        ];
+        for reponse in &reponses {
+            assert!(Response::from_bytes(&reponse.to_bytes()).is_some());
         }
-        .to_bytes();
-        match Response::from_bytes(&bytes) {
-            Some(Response::Token { jeton }) => assert_eq!(jeton, "abc123"),
-            _ => panic!("désérialisation Token échouée"),
+        match Response::from_bytes(
+            &Response::Licence {
+                plan: "pro".into(),
+                max_sessions: 10,
+            }
+            .to_bytes(),
+        ) {
+            Some(Response::Licence { plan, max_sessions }) => {
+                assert_eq!(plan, "pro");
+                assert_eq!(max_sessions, 10);
+            }
+            _ => panic!("désérialisation Licence échouée"),
         }
+    }
+
+    // -- Licences et jetons applicatifs ---------------------------------------
+
+    #[test]
+    fn attribuer_et_consulter_un_plan_persiste() {
+        let tmp = FichierTemp::nouveau("licences");
+        {
+            let store = store_persistant(tmp.chemin());
+            store.register("lea@example.com", "mdp").expect("register");
+            // Sans attribution : plan Free par défaut.
+            assert_eq!(store.plan_de("lea@example.com"), Ok(Plan::Free));
+            store
+                .attribuer_plan("lea@example.com", Plan::Pro)
+                .expect("attribution");
+            // Compte inconnu : refus des deux côtés.
+            assert_eq!(
+                store.attribuer_plan("inconnue@example.com", Plan::Pro),
+                Err(AccountError::CompteInconnu)
+            );
+            assert_eq!(
+                store.plan_de("inconnue@example.com"),
+                Err(AccountError::CompteInconnu)
+            );
+        }
+        // Le plan survit à la réouverture.
+        let store = store_persistant(tmp.chemin());
+        assert_eq!(store.plan_de("lea@example.com"), Ok(Plan::Pro));
+    }
+
+    #[test]
+    fn jeton_applicatif_emis_et_verifiable() {
+        let store = store_test();
+        store.register("noe@example.com", "mdp").expect("register");
+        store
+            .attribuer_plan("noe@example.com", Plan::Entreprise)
+            .expect("plan");
+        let session = store.login("noe@example.com", "mdp").expect("login");
+
+        let jws = store
+            .emettre_jeton_applicatif(&session)
+            .expect("émission du jeton applicatif");
+        // Vérification hors ligne, comme le fera nd-api (lot 07).
+        let claims = jeton::verifier_jeton(&jws, &store.cle_publique_jetons(), unix_maintenant())
+            .expect("jeton vérifiable avec la clé publique");
+        assert_eq!(claims.emetteur, jeton::EMETTEUR);
+        assert_eq!(claims.sujet, "noe@example.com");
+        assert_eq!(claims.roles, vec!["utilisateur"]);
+        assert_eq!(claims.plan, "entreprise");
+        assert!(claims.expiration > claims.emis_a);
+
+        // Session inconnue : refus.
+        assert_eq!(
+            store.emettre_jeton_applicatif("jeton-fantome"),
+            Err(AccountError::SessionInvalide)
+        );
+    }
+
+    #[test]
+    fn activer_2fa_reseau_regles_de_securite() {
+        let store = store_test();
+        store.register("sam@example.com", "mdp").expect("register");
+        // Mot de passe faux : refus (et rien n'est activé).
+        assert_eq!(
+            store.activer_2fa_reseau("sam@example.com", "mauvais"),
+            Err(AccountError::IdentifiantsInvalides)
+        );
+        assert!(store.login("sam@example.com", "mdp").is_ok());
+        // Bon mot de passe : activation.
+        let secret = store
+            .activer_2fa_reseau("sam@example.com", "mdp")
+            .expect("activation");
+        assert_eq!(secret.len(), 20);
+        // Déjà active : le remplacement par le réseau est refusé.
+        assert_eq!(
+            store.activer_2fa_reseau("sam@example.com", "mdp"),
+            Err(AccountError::DeuxFacteursDejaActives)
+        );
+    }
+
+    // -- Serveur TCP ------------------------------------------------------------
+
+    /// Démarre un serveur sur un port éphémère et rend son adresse.
+    fn serveur(service: Service) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("adresse locale");
+        std::thread::spawn(move || {
+            let _ = serve(listener, service);
+        });
+        addr
+    }
+
+    /// Une requête, une réponse (une connexion par échange, comme le service).
+    fn aller_retour(addr: std::net::SocketAddr, req: &Request) -> Response {
+        let mut s = TcpStream::connect(addr).expect("connexion");
+        write_frame(&mut s, &req.to_bytes()).expect("écriture");
+        Response::from_bytes(&read_frame(&mut s).expect("lecture")).expect("réponse")
     }
 
     #[test]
     fn serveur_tcp_register_login() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("adresse locale");
-        std::thread::spawn(move || {
-            let _ = serve(listener, store_test());
-        });
+        let addr = serveur(Service::nouveau(store_test()));
 
-        let aller_retour = |req: &Request| -> Response {
-            let mut s = TcpStream::connect(addr).expect("connexion");
-            write_frame(&mut s, &req.to_bytes()).expect("écriture");
-            Response::from_bytes(&read_frame(&mut s).expect("lecture")).expect("réponse")
-        };
-
-        let inscription = aller_retour(&Request::Register {
-            email: "tcp@example.com".into(),
-            password: "mdp".into(),
-        });
+        let inscription = aller_retour(
+            addr,
+            &Request::Register {
+                email: "tcp@example.com".into(),
+                password: "mdp".into(),
+            },
+        );
         assert!(matches!(inscription, Response::Ok));
 
-        match aller_retour(&Request::Login {
-            email: "tcp@example.com".into(),
-            password: "mdp".into(),
-        }) {
+        match aller_retour(
+            addr,
+            &Request::Login {
+                email: "tcp@example.com".into(),
+                password: "mdp".into(),
+            },
+        ) {
             Response::Token { jeton } => assert_eq!(jeton.len(), 64),
             _ => panic!("login TCP : jeton attendu"),
         }
+    }
+
+    #[test]
+    fn serveur_tcp_flux_2fa_complet() {
+        let store = store_test();
+        let addr = serveur(Service::nouveau(store.clone()));
+        let email = "flux2fa@example.com";
+
+        // Inscription puis activation de la 2FA **par le réseau**.
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::Register {
+                    email: email.into(),
+                    password: "mdp".into(),
+                }
+            ),
+            Response::Ok
+        ));
+        let secret = match aller_retour(
+            addr,
+            &Request::ActiverDeuxFacteurs {
+                email: email.into(),
+                password: "mdp".into(),
+            },
+        ) {
+            Response::SecretTotp { secret_hex } => {
+                storage::hex_vers_octets(&secret_hex).expect("secret hexadécimal")
+            }
+            autre => panic!("secret TOTP attendu, reçu {:?}", autre.to_bytes()),
+        };
+
+        // Étape 1 du flux : login → challenge TOTP explicite.
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::Login {
+                    email: email.into(),
+                    password: "mdp".into(),
+                }
+            ),
+            Response::DeuxFacteursRequis
+        ));
+
+        // Mauvais code : refus.
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::LoginDeuxFacteurs {
+                    email: email.into(),
+                    password: "mdp".into(),
+                    code: "000000".into(),
+                }
+            ),
+            Response::Erreur { .. }
+        ));
+
+        // Étape 2 : validation du code TOTP courant → session ouverte.
+        let code = totp::totp_at(&secret, unix_maintenant());
+        let jeton = match aller_retour(
+            addr,
+            &Request::LoginDeuxFacteurs {
+                email: email.into(),
+                password: "mdp".into(),
+                code,
+            },
+        ) {
+            Response::Token { jeton } => jeton,
+            _ => panic!("login 2FA TCP : jeton attendu"),
+        };
+        assert_eq!(store.verify_token(&jeton).as_deref(), Some(email));
+    }
+
+    #[test]
+    fn serveur_tcp_jeton_applicatif_et_licence() {
+        let store = store_test();
+        let addr = serveur(Service::nouveau(store.clone()));
+        store.register("api@example.com", "mdp").expect("register");
+        let session = store.login("api@example.com", "mdp").expect("login");
+
+        // Attribution d'un plan par le réseau (session du compte requise).
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::AttribuerPlan {
+                    session: session.clone(),
+                    plan: "pro".into(),
+                }
+            ),
+            Response::Ok
+        ));
+        // Plan inconnu ou session invalide : refus.
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::AttribuerPlan {
+                    session: session.clone(),
+                    plan: "platine".into(),
+                }
+            ),
+            Response::Erreur { .. }
+        ));
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::ConsulterLicence {
+                    session: "fantome".into(),
+                }
+            ),
+            Response::Erreur { .. }
+        ));
+        match aller_retour(
+            addr,
+            &Request::ConsulterLicence {
+                session: session.clone(),
+            },
+        ) {
+            Response::Licence { plan, max_sessions } => {
+                assert_eq!(plan, "pro");
+                assert_eq!(max_sessions, 10);
+            }
+            _ => panic!("licence attendue"),
+        }
+
+        // Jeton applicatif émis par le réseau, vérifié avec la clé publique
+        // récupérée par le réseau — exactement le chemin de nd-api.
+        let cle = match aller_retour(addr, &Request::ClePubliqueJetons) {
+            Response::ClePublique { hex } => hex,
+            _ => panic!("clé publique attendue"),
+        };
+        let jws = match aller_retour(addr, &Request::EmettreJeton { session }) {
+            Response::JetonApplicatif { jeton } => jeton,
+            _ => panic!("jeton applicatif attendu"),
+        };
+        let claims =
+            jeton::verifier_jeton(&jws, &cle, unix_maintenant()).expect("jeton vérifiable");
+        assert_eq!(claims.sujet, "api@example.com");
+        assert_eq!(claims.plan, "pro");
+    }
+
+    #[test]
+    fn serveur_tcp_flux_oidc_complet() {
+        use crate::jwks::test_idp;
+
+        // Fournisseur simulé (clés RFC 7515) + flux OIDC avec liaison par
+        // e-mail vérifié (fournisseur de confiance).
+        let idp = test_idp::FournisseurSimule::demarrer(test_idp::document_jwks(
+            test_idp::KID_RSA,
+            test_idp::KID_P256,
+        ));
+        let config = oidc::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            authorization_endpoint: "https://idp.example.com/authorize".into(),
+            token_endpoint: idp.token_endpoint(),
+            jwks_uri: idp.jwks_uri(),
+            client_id: "novadesk-client".into(),
+            redirect_uri: "http://127.0.0.1/rappel".into(),
+            scopes: vec!["openid".into(), "email".into()],
+        };
+        let options = oidc::OptionsFlux {
+            lier_par_email: true,
+            ..oidc::OptionsFlux::default()
+        };
+        let flux = Arc::new(oidc::FluxOidc::new(config, options));
+
+        let store = store_test();
+        store
+            .register("carol@example.com", "mdp")
+            .expect("register");
+        let addr = serveur(Service::avec_oidc(store.clone(), flux));
+
+        // 1. Démarrage : URL d'autorisation + state.
+        let (url, state) = match aller_retour(addr, &Request::DemarrerOidc) {
+            Response::AutorisationOidc { url, state } => (url, state),
+            _ => panic!("URL d'autorisation attendue"),
+        };
+        assert!(url.contains("code_challenge_method=S256"));
+
+        // 2. « L'utilisatrice s'authentifie chez le fournisseur » : celui-ci
+        // préparera un ID token RS256 portant le nonce de l'URL.
+        let nonce = {
+            let marqueur = "&nonce=";
+            let debut = url.find(marqueur).expect("nonce dans l'URL") + marqueur.len();
+            url[debut..].split('&').next().expect("valeur").to_string()
+        };
+        let maintenant = unix_maintenant();
+        let charge = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "sub": "sub-carol",
+            "aud": "novadesk-client",
+            "exp": maintenant + 300,
+            "nonce": nonce,
+            "email": "carol@example.com",
+        });
+        *idp.reponse_jetons.lock().unwrap() = serde_json::json!({
+            "id_token": test_idp::signer_rs256(&charge, Some(test_idp::KID_RSA)),
+        })
+        .to_string();
+
+        // 3. Rappel : échange du code, validation JWKS, liaison par e-mail
+        // vérifié, session locale ouverte.
+        let jeton = match aller_retour(
+            addr,
+            &Request::RappelOidc {
+                state: state.clone(),
+                code: "code-tcp-1".into(),
+            },
+        ) {
+            Response::Token { jeton } => jeton,
+            Response::Erreur { message } => panic!("rappel OIDC refusé : {message}"),
+            _ => panic!("jeton de session attendu"),
+        };
+        assert_eq!(
+            store.verify_token(&jeton).as_deref(),
+            Some("carol@example.com")
+        );
+        // Le sujet fédéré est désormais lié : visible côté magasin.
+        assert_eq!(
+            store
+                .oidc_account("https://idp.example.com|sub-carol")
+                .as_deref(),
+            Some("carol@example.com")
+        );
+
+        // 4. Anti-rejeu : le même state est refusé une seconde fois.
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::RappelOidc {
+                    state,
+                    code: "code-tcp-1".into(),
+                }
+            ),
+            Response::Erreur { .. }
+        ));
+    }
+
+    #[test]
+    fn serveur_tcp_oidc_non_configure_et_sujet_non_lie() {
+        use crate::jwks::test_idp;
+
+        // Sans flux configuré : les requêtes OIDC répondent une erreur claire.
+        let addr = serveur(Service::nouveau(store_test()));
+        assert!(matches!(
+            aller_retour(addr, &Request::DemarrerOidc),
+            Response::Erreur { .. }
+        ));
+
+        // Avec flux mais **sans** liaison par e-mail : un sujet inconnu est
+        // refusé même avec un ID token parfaitement valide.
+        let idp = test_idp::FournisseurSimule::demarrer(test_idp::document_jwks(
+            test_idp::KID_RSA,
+            test_idp::KID_P256,
+        ));
+        let config = oidc::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            authorization_endpoint: "https://idp.example.com/authorize".into(),
+            token_endpoint: idp.token_endpoint(),
+            jwks_uri: idp.jwks_uri(),
+            client_id: "novadesk-client".into(),
+            redirect_uri: "http://127.0.0.1/rappel".into(),
+            scopes: vec![],
+        };
+        let flux = Arc::new(oidc::FluxOidc::new(config, oidc::OptionsFlux::default()));
+        let store = store_test();
+        store.register("greg@example.com", "mdp").expect("register");
+        let addr = serveur(Service::avec_oidc(store.clone(), flux));
+
+        let (url, state) = match aller_retour(addr, &Request::DemarrerOidc) {
+            Response::AutorisationOidc { url, state } => (url, state),
+            _ => panic!("URL d'autorisation attendue"),
+        };
+        let nonce = {
+            let marqueur = "&nonce=";
+            let debut = url.find(marqueur).expect("nonce") + marqueur.len();
+            url[debut..].split('&').next().expect("valeur").to_string()
+        };
+        let maintenant = unix_maintenant();
+        let charge = serde_json::json!({
+            "iss": "https://idp.example.com",
+            "sub": "sub-greg",
+            "aud": "novadesk-client",
+            "exp": maintenant + 300,
+            "nonce": nonce,
+            "email": "greg@example.com",
+        });
+        *idp.reponse_jetons.lock().unwrap() = serde_json::json!({
+            "id_token": test_idp::signer_rs256(&charge, Some(test_idp::KID_RSA)),
+        })
+        .to_string();
+        match aller_retour(
+            addr,
+            &Request::RappelOidc {
+                state,
+                code: "c".into(),
+            },
+        ) {
+            Response::Erreur { message } => {
+                assert!(message.contains("non liée"), "message : {message}");
+            }
+            _ => panic!("refus attendu pour un sujet non lié"),
+        }
+        // Rien n'a été lié en douce.
+        assert_eq!(store.oidc_account("https://idp.example.com|sub-greg"), None);
     }
 }

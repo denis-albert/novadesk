@@ -8,6 +8,27 @@
 //! ([`PrivacyState`]) et calcule la liste **ordonnée** d'actions concrètes
 //! ([`PrivacyAction`]) que la couche plateforme devra exécuter
 //! (voir plan 13, §rideau de confidentialité).
+//!
+//! # Intégration — l'effet système N'EST PAS implémenté ici
+//!
+//! Ce module reste volontairement pur calcul. L'exécuteur d'actions vit côté
+//! plateforme, et l'orchestrateur (`nd-core`) doit :
+//! 1. vérifier [`crate::Capability::PrivacyMode`] via le
+//!    [`crate::PermissionBroker`] avant toute transition ;
+//! 2. dérouler `transition_to(...)` **dans l'ordre rendu**, en traduisant
+//!    chaque [`PrivacyAction`] en appel plateforme :
+//!    - `EnableBlackScreen`/`DisableBlackScreen` → nd-capture
+//!      (TODO(nd-capture) : extinction/masquage de la sortie physique —
+//!      `SetDisplayConfig`/DDC sous Windows ; rien ici) ;
+//!    - `BlockLocalInput`/`UnblockLocalInput` → nd-input
+//!      (TODO(nd-input) : filtre d'entrées locales — hooks bas niveau
+//!      `WH_KEYBOARD_LL`/`WH_MOUSE_LL` ou `BlockInput` ; rien ici) ;
+//!    - `HideWallpaper`/`RestoreWallpaper` → intégration OS
+//!      (TODO(intégration OS) : `SystemParametersInfo(SPI_SETDESKWALLPAPER)`
+//!      avec sauvegarde/restauration ; rien ici) ;
+//! 3. exécuter [`PrivacyState::release_actions`] **systématiquement** à la fin
+//!    de session, y compris sur perte de lien (le poste ne doit jamais rester
+//!    écran noir / entrées bloquées après le départ du contrôleur).
 
 /// État du rideau de confidentialité côté machine contrôlée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

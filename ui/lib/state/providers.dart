@@ -69,6 +69,7 @@ class EntreeCarnet {
     required this.alias,
     required this.derniereConnexion,
     this.favori = false,
+    this.enLigne = false,
   });
 
   /// ID NovaDesk du poste distant.
@@ -82,29 +83,52 @@ class EntreeCarnet {
 
   /// Marqué d'une étoile dans le carnet.
   final bool favori;
+
+  /// Présence du pair (pastille verte sur la vignette).
+  /// FICTIF : viendra du service de rendez-vous (plan 11).
+  final bool enLigne;
+
+  EntreeCarnet copyWith({String? alias, bool? favori}) => EntreeCarnet(
+        id: id,
+        alias: alias ?? this.alias,
+        derniereConnexion: derniereConnexion,
+        favori: favori ?? this.favori,
+        enLigne: enLigne,
+      );
 }
 
-/// Sessions récentes + carnet d'adresses.
+/// Sessions récentes + carnet d'adresses. `StateProvider` : les vignettes
+/// permettent favori / renommage / suppression en local (état de
+/// présentation).
 ///
 /// FICTIF : sera synchronisé via le backend (plan 11), entrées chiffrées
 /// côté client (plan 06).
-final carnetProvider = Provider<List<EntreeCarnet>>((ref) {
+final carnetProvider = StateProvider<List<EntreeCarnet>>((ref) {
   return const [
     EntreeCarnet(
       id: 421887330,
       alias: 'poste-bureau',
       derniereConnexion: 'il y a 2 h',
       favori: true,
+      enLigne: true,
     ),
     EntreeCarnet(
       id: 730118902,
       alias: 'serveur-nas',
       derniereConnexion: 'hier',
+      enLigne: true,
     ),
     EntreeCarnet(
       id: 555240173,
       alias: 'pc-marie',
       derniereConnexion: 'lun. 14:07',
+    ),
+    EntreeCarnet(
+      id: 190774025,
+      alias: 'atelier-01',
+      derniereConnexion: 'mer. 09:42',
+      favori: true,
+      enLigne: true,
     ),
   ];
 });

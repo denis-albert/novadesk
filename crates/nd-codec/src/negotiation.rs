@@ -110,6 +110,26 @@ pub struct NetworkEstimate {
     pub loss: f32,
 }
 
+impl NetworkEstimate {
+    /// Construit l'estimation depuis les champs d'un `PathEstimate` de
+    /// nd-transport (`rtt_us`, `loss_ratio`, `estimated_bandwidth_kbps`) — champ à
+    /// champ, pour que nd-core fasse le pont **sans** que nd-codec dépende de
+    /// nd-transport. Le RTT est converti en millisecondes (saturé) et la perte
+    /// ramenée dans [0, 1].
+    #[must_use]
+    pub fn from_path(rtt_us: u64, loss_ratio: f32, estimated_bandwidth_kbps: u32) -> Self {
+        Self {
+            bandwidth_kbps: estimated_bandwidth_kbps,
+            rtt_ms: u32::try_from(rtt_us / 1_000).unwrap_or(u32::MAX),
+            loss: if loss_ratio.is_finite() {
+                loss_ratio.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
 /// Nature du contenu affiché, pilotant l'axe de dégradation (plan 03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProfile {
@@ -453,6 +473,23 @@ mod tests {
     }
 
     // ----- ABR -----
+
+    /// Le pont `PathEstimate` → `NetworkEstimate` convertit unités et bornes :
+    /// µs → ms (saturé), perte ramenée dans [0, 1] (NaN → 0), bande passante 1:1.
+    #[test]
+    fn from_path_convertit_unites_et_bornes() {
+        let e = NetworkEstimate::from_path(35_500, 0.02, 12_000);
+        assert_eq!(e.rtt_ms, 35, "35 500 µs → 35 ms");
+        assert_eq!(e.bandwidth_kbps, 12_000);
+        assert!((e.loss - 0.02).abs() < f32::EPSILON);
+
+        let sature = NetworkEstimate::from_path(u64::MAX, 7.5, u32::MAX);
+        assert_eq!(sature.rtt_ms, u32::MAX, "RTT saturé sans panique");
+        assert_eq!(sature.loss, 1.0, "perte bornée à 1");
+        let nan = NetworkEstimate::from_path(0, f32::NAN, 100);
+        assert_eq!(nan.loss, 0.0, "NaN neutralisé");
+        assert_eq!(nan.rtt_ms, 0);
+    }
 
     /// Bonne bande passante → palier 0 : la configuration cible est exactement la
     /// configuration de base (plein débit, plein fps, résolution native).
