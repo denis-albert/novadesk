@@ -21,24 +21,28 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nd_audio::AudioSession;
 use nd_codec::DecodedFrame;
 use nd_core::{
-    SessionEndpoint, SessionEngine, SessionHandle, SessionOptions, SessionState, UnattendedHost,
-    UnattendedHostHandle,
+    ChatMessage, SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions,
+    SessionState, UnattendedHost, UnattendedHostHandle,
 };
 use nd_features::{PermissionSet, Permissions};
+use nd_files::{ClipboardSync, TransferEvent};
 use nd_proto::{InputEvent, NovaId};
 use nd_transport::ServerIdentity;
 
 use crate::api::{
-    IncomingRequestDto, ListenInfoDto, PermissionsDto, SessionConfigDto, SessionEndpointDto,
-    SessionOptionsDto, SessionStateDto, SessionStatsDto, VideoFrameDto,
+    ChatMessageDto, IncomingRequestDto, ListenInfoDto, PermissionsDto, SessionConfigDto,
+    SessionEndpointDto, SessionOptionsDto, SessionStateDto, SessionStatsDto, TransferEventDto,
+    VideoFrameDto,
 };
 use crate::frb_generated::{SseEncode, StreamSink};
 
@@ -59,6 +63,11 @@ struct EntreeSession {
     etats: Option<Receiver<SessionState>>,
     /// Frames décodées (rôle contrôleur), tant qu'aucun consommateur ne les a prises.
     frames: Option<Receiver<DecodedFrame>>,
+    /// Messages de chat reçus + échos (mode étendu), tant qu'aucun consommateur
+    /// ne les a pris.
+    chat: Option<Receiver<ChatMessage>>,
+    /// Progression des transferts de fichiers (mode étendu), idem.
+    transfert: Option<Receiver<TransferEvent>>,
     /// Adresse/certificat d'écoute (sessions hôtes `Loopback` uniquement).
     ecoute: Option<ListenInfoDto>,
 }
@@ -119,16 +128,22 @@ pub(crate) fn demarrer_session_avec_options(
     demarrer_session_interne(config, endpoint, options.into())
 }
 
-/// Cœur commun : prépare l'endpoint, démarre le moteur avec `options` et
-/// enregistre la poignée dans la table.
+/// Cœur commun : prépare l'endpoint, démarre le moteur avec `options` (en
+/// injectant les briques média du mode étendu) et enregistre la poignée dans la
+/// table.
 fn demarrer_session_interne(
     config: SessionConfigDto,
     endpoint: SessionEndpointDto,
     options: SessionOptions,
 ) -> Result<u64, String> {
     let (endpoint_moteur, ecoute) = preparer_endpoint(endpoint)?;
-    let mut poignee = SessionEngine::start_with_options(config.into(), endpoint_moteur, options)
-        .map_err(|e| format!("démarrage de la session impossible : {e}"))?;
+    let media = construire_media(&options);
+    // `start_with_media` avec un `SessionMedia::default` équivaut à
+    // `start_with_options` (mode classique) ; en mode étendu, `media` porte
+    // l'audio et le presse-papiers réels (voir `construire_media`).
+    let mut poignee =
+        SessionEngine::start_with_media(config.into(), endpoint_moteur, options, media)
+            .map_err(|e| format!("démarrage de la session impossible : {e}"))?;
 
     // Extrait les récepteurs de la poignée en les échangeant contre des canaux
     // factices (dont l'émetteur est aussitôt lâché) : `SessionHandle` implémente
@@ -136,6 +151,11 @@ fn demarrer_session_interne(
     // publics reste sûr — la poignée n'utilise pas ses récepteurs en interne.
     let etats = Some(std::mem::replace(&mut poignee.state_rx, mpsc::channel().1));
     let frames = Some(std::mem::replace(&mut poignee.frame_rx, mpsc::channel().1));
+    let chat = Some(std::mem::replace(&mut poignee.chat_rx, mpsc::channel().1));
+    let transfert = Some(std::mem::replace(
+        &mut poignee.transfer_rx,
+        mpsc::channel().1,
+    ));
 
     let id = PROCHAIN_ID.fetch_add(1, Ordering::Relaxed);
     verrou().insert(
@@ -144,10 +164,32 @@ fn demarrer_session_interne(
             poignee,
             etats,
             frames,
+            chat,
+            transfert,
             ecoute,
         },
     );
     Ok(id)
+}
+
+/// Construit les briques média **injectées** dans la session.
+///
+/// Hors mode étendu : [`SessionMedia::default`] (aucune brique — session vidéo +
+/// entrées, comportement historique). En mode étendu : ouvre l'audio duplex
+/// système ([`AudioSession::duplex_systeme`]) et le presse-papiers de la
+/// plateforme ([`ClipboardSync::new`]) ; chaque brique indisponible reste
+/// `None` — la session démarre sans planter, seule la fonction correspondante
+/// reste inerte. Note : le moteur reconstruit l'audio à la volée si la capacité
+/// est accordée, mais **pas** le presse-papiers — l'injecter ici est donc ce qui
+/// active réellement la synchro presse-papiers.
+fn construire_media(options: &SessionOptions) -> SessionMedia {
+    if !options.extended_features {
+        return SessionMedia::default();
+    }
+    SessionMedia {
+        audio: AudioSession::duplex_systeme().ok(),
+        clipboard: ClipboardSync::new().ok(),
+    }
 }
 
 /// Traduit le DTO d'endpoint en [`SessionEndpoint`] du moteur. Pour `Loopback`,
@@ -269,6 +311,35 @@ pub(crate) fn envoyer_entree(id: u64, evenement: InputEvent) -> Result<(), Strin
 }
 
 // ---------------------------------------------------------------------------
+// Commandes des fonctions média étendues (chat, fichiers, audio, moniteur)
+// ---------------------------------------------------------------------------
+//
+// Chaque commande délègue à la méthode correspondante de [`SessionHandle`], qui
+// poste sur un canal interne non bloquant : inerte hors mode étendu ou si la
+// permission n'est pas accordée, mais toujours `Ok` tant que la session existe.
+
+/// Envoie un message de chat au pair (canal `Control` chiffré).
+pub(crate) fn envoyer_chat(id: u64, texte: String) -> Result<(), String> {
+    avec_entree(id, |entree| entree.poignee.send_chat(texte))
+}
+
+/// Démarre l'envoi d'une file de fichiers vers le pair (canal `Files`).
+pub(crate) fn envoyer_fichiers(id: u64, chemins: Vec<String>) -> Result<(), String> {
+    let fichiers: Vec<PathBuf> = chemins.into_iter().map(PathBuf::from).collect();
+    avec_entree(id, |entree| entree.poignee.send_files(fichiers))
+}
+
+/// Active/désactive l'audio de la session.
+pub(crate) fn definir_audio_actif(id: u64, actif: bool) -> Result<(), String> {
+    avec_entree(id, |entree| entree.poignee.set_audio_enabled(actif))
+}
+
+/// Demande la bascule vers le moniteur d'index donné (hôte).
+pub(crate) fn basculer_moniteur(id: u64, moniteur: u32) -> Result<(), String> {
+    avec_entree(id, |entree| entree.poignee.switch_monitor(moniteur))
+}
+
+// ---------------------------------------------------------------------------
 // Flux vers Dart (StreamSink) et lectures synchrones de repli
 // ---------------------------------------------------------------------------
 
@@ -297,6 +368,33 @@ pub(crate) fn flux_video(id: u64, sink: StreamSink<VideoFrameDto>) -> Result<(),
         frames,
         sink,
         VideoFrameDto::from,
+    )
+}
+
+/// Branche le flux de chat (mode étendu) : prend définitivement le récepteur de
+/// chat et lance son thread de drainage vers `sink`.
+pub(crate) fn flux_chat(id: u64, sink: StreamSink<ChatMessageDto>) -> Result<(), String> {
+    let chat = avec_entree(id, |entree| entree.chat.take())?
+        .ok_or_else(|| format!("le chat de la session {id} est déjà consommé (flux en cours)"))?;
+    demarrer_drain(
+        format!("nd-ffi-chat-{id}"),
+        chat,
+        sink,
+        ChatMessageDto::from,
+    )
+}
+
+/// Branche le flux de progression des transferts de fichiers (mode étendu) :
+/// prend définitivement le récepteur de transfert et lance son drainage.
+pub(crate) fn flux_transfert(id: u64, sink: StreamSink<TransferEventDto>) -> Result<(), String> {
+    let transfert = avec_entree(id, |entree| entree.transfert.take())?.ok_or_else(|| {
+        format!("le flux de transfert de la session {id} est déjà consommé (flux en cours)")
+    })?;
+    demarrer_drain(
+        format!("nd-ffi-transfert-{id}"),
+        transfert,
+        sink,
+        TransferEventDto::from,
     )
 }
 

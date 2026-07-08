@@ -19,8 +19,8 @@
 //!
 //! ```text
 //! # 1. Retirer l'échafaudage de compilation pré-régénération :
-//! #    supprimer crates/nd-ffi/src/pont_provisoire2.rs
-//! #    et la ligne `mod pont_provisoire2;` de lib.rs.
+//! #    supprimer crates/nd-ffi/src/pont_provisoire3.rs
+//! #    et la ligne `mod pont_provisoire3;` de lib.rs.
 //! #    (Oubli = conflit d'impl E0119 à la compilation, impossible à rater.)
 //! # 2. Depuis novadesk/ui (lit flutter_rust_bridge.yaml : rust_input crate::api) :
 //! flutter_rust_bridge_codegen generate
@@ -33,16 +33,27 @@
 //! a été complété sur place dans `frb_generated.rs` (marqué « lot §2 ») pour
 //! garder la crate compilable ; la régénération l'écrasera à l'identique.
 //!
+//! **Stopgap `frb_generated.rs` (lot session media)** : idem pour
+//! `SessionOptionsDto`, qui gagne trois champs (`extended_features`,
+//! `transfer_dir`, `transport_reconnect`) ; ses `impl SseDecode`/`SseEncode`
+//! générés (littéral exhaustif / accès par champ) ont été complétés sur place
+//! (marqués « lot session media »). La régénération les réécrira à l'identique.
+//!
 //! Fonctions exposées au Dart après régénération — **lot 03** : `start_session`,
 //! `session_listen_info`, `session_state_stream` (→ `Stream<SessionStateDto>`),
 //! `session_video_stream` (→ `Stream<VideoFrameDto>`), `wait_session_state`,
 //! `collect_video_frames`, `session_stats`, `session_last_error`, `send_input`,
-//! `stop_session`. **Lot §2 (nouvelles)** : `start_session_with_options`,
+//! `stop_session`. **Lot §2** : `start_session_with_options`,
 //! `start_unattended_host`, `unattended_incoming_stream`
 //! (→ `Stream<IncomingRequestDto>`), `approve_incoming`, `unattended_stats`,
-//! `stop_unattended_host`. DTO : `VideoFrameDto`, `SessionStatsDto` (enrichi),
-//! `SessionEndpointDto` (variante `ByRendezvous`), `SessionOptionsDto`,
-//! `IncomingRequestDto`, `ListenInfoDto`.
+//! `stop_unattended_host`. **Lot session media (nouvelles)** :
+//! `session_chat_stream` (→ `Stream<ChatMessageDto>`), `send_chat`,
+//! `session_transfer_stream` (→ `Stream<TransferEventDto>`), `send_files`,
+//! `set_audio_enabled`, `switch_monitor`. DTO : `VideoFrameDto`,
+//! `SessionStatsDto` (enrichi), `SessionEndpointDto` (variante `ByRendezvous`),
+//! `SessionOptionsDto` (enrichi : `extended_features`, `transfer_dir`,
+//! `transport_reconnect`), `IncomingRequestDto`, `ListenInfoDto`,
+//! `ChatMessageDto` (nouveau), `TransferEventDto` (nouveau).
 
 // Binding généré par `flutter_rust_bridge_codegen generate` (config dans
 // `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit

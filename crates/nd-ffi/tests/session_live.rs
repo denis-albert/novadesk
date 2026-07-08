@@ -189,6 +189,9 @@ fn start_session_with_options_refuse_une_adresse_illisible() {
         permissions: PermissionsDto::full(),
         recording_path: None,
         delta_mode: false,
+        extended_features: false,
+        transfer_dir: None,
+        transport_reconnect: false,
     };
     let erreur = start_session_with_options(
         config,

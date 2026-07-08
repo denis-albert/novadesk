@@ -23,8 +23,11 @@
 use std::path::PathBuf;
 
 use nd_codec::DecodedFrame;
-use nd_core::{SessionConfig, SessionOptions, SessionRole, SessionState, SessionStats};
+use nd_core::{
+    ChatMessage, SessionConfig, SessionOptions, SessionRole, SessionState, SessionStats,
+};
 use nd_features::{PermissionSet, Permissions};
+use nd_files::TransferEvent;
 use nd_proto::{InputEvent, NovaId};
 
 use crate::frb_generated::StreamSink;
@@ -328,8 +331,10 @@ impl From<SessionConfig> for SessionConfigDto {
 ///
 /// Complète [`SessionConfigDto`] : ce dernier porte le rôle, les ID et les
 /// permissions historiques ; celui-ci affine le comportement côté **contrôlé**
-/// (filtre de permissions granulaire, enregistrement local, encodage delta). Les
-/// axes non exposés ici (profil ABR, politique de reconnexion) prennent les
+/// (filtre de permissions granulaire, enregistrement local, encodage delta) et
+/// active les **canaux média annexes** (chat, fichiers, audio, presse-papiers,
+/// bascule moniteur) via [`extended_features`](SessionOptionsDto::extended_features).
+/// Les axes non exposés ici (profil ABR, politique de reconnexion) prennent les
 /// valeurs par défaut du moteur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOptionsDto {
@@ -342,6 +347,21 @@ pub struct SessionOptionsDto {
     /// Encodage delta **opt-in** : à n'activer que si la capture renseigne
     /// fidèlement les régions modifiées (voir [`nd_core::SessionOptions::delta_mode`]).
     pub delta_mode: bool,
+    /// Active les **fonctions étendues** de la session (canaux annexes : chat,
+    /// transfert de fichiers, audio, presse-papiers, bascule moniteur), chacune
+    /// gardée par sa permission. `false` (défaut) = session vidéo + entrées
+    /// historique, comportement strictement inchangé. Quand ce drapeau est vrai,
+    /// la façade démarre le moteur via `SessionEngine::start_with_media` en
+    /// injectant l'audio duplex système et le presse-papiers de la plateforme
+    /// (voir [`start_session_with_options`]).
+    pub extended_features: bool,
+    /// Répertoire de réception des fichiers transférés (canal `Files`). `None` =
+    /// dossier temporaire du système. Ignoré hors mode étendu.
+    pub transfer_dir: Option<String>,
+    /// Reconnexion transparente **au niveau transport** pour un point de contact
+    /// [`SessionEndpointDto::Direct`] côté contrôleur (voir
+    /// [`nd_core::SessionOptions::transport_reconnect`]). `false` par défaut.
+    pub transport_reconnect: bool,
 }
 
 impl From<SessionOptionsDto> for SessionOptions {
@@ -350,6 +370,9 @@ impl From<SessionOptionsDto> for SessionOptions {
             permissions: Some(PermissionSet::from(Permissions::from(dto.permissions))),
             recording: dto.recording_path.map(PathBuf::from),
             delta_mode: dto.delta_mode,
+            extended_features: dto.extended_features,
+            transfer_dir: dto.transfer_dir.map(PathBuf::from),
+            transport_reconnect: dto.transport_reconnect,
             // Profil ABR et politique de reconnexion : défauts du moteur.
             ..SessionOptions::default()
         }
@@ -563,6 +586,120 @@ pub struct ListenInfoDto {
 }
 
 // ---------------------------------------------------------------------------
+// Session média étendue : DTO (chat, transfert de fichiers)
+// ---------------------------------------------------------------------------
+
+/// Message de chat poussé par [`session_chat_stream`] (miroir plat de
+/// `nd_core::ChatMessage`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessageDto {
+    /// `true` si le message vient du pair distant, `false` pour l'écho local
+    /// d'un message que ce poste vient d'émettre via [`send_chat`].
+    pub from_remote: bool,
+    /// Texte du message (UTF-8).
+    pub text: String,
+}
+
+impl From<ChatMessage> for ChatMessageDto {
+    fn from(message: ChatMessage) -> Self {
+        ChatMessageDto {
+            from_remote: message.from_remote,
+            text: message.text,
+        }
+    }
+}
+
+/// Évènement de progression d'un transfert de fichiers, poussé par
+/// [`session_transfer_stream`] — **aplatissement** des variantes de
+/// `nd_files::TransferEvent` en une structure plate que le pont FFI traduit sans
+/// friction. L'UI branche sur [`kind`](TransferEventDto::kind) ; les champs
+/// non pertinents pour un `kind` donné valent `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferEventDto {
+    /// Nature de l'évènement : `"started"` (début d'un fichier), `"progress"`
+    /// (avancement), `"completed"` (fichier terminé et vérifié), `"finished"`
+    /// (toute la file transférée) ou `"cancelled"` (annulation).
+    pub kind: String,
+    /// Index (0-basé) du fichier concerné dans la file (`started`/`progress`/`completed`).
+    pub file_index: Option<u64>,
+    /// Nom du fichier concerné (`started`/`progress`/`completed`).
+    pub file_name: Option<String>,
+    /// Octets du **fichier courant** déjà présents (offset de reprise pour
+    /// `started`, octets faits pour `progress`, taille pour `completed`).
+    pub bytes_done: Option<u64>,
+    /// Taille totale du **fichier courant** (`started`/`progress`/`completed`).
+    pub bytes_total: Option<u64>,
+    /// Octets déjà présents pour l'ensemble de la file (`progress`).
+    pub session_bytes_done: Option<u64>,
+    /// Taille totale connue de la file (`progress`).
+    pub session_bytes_total: Option<u64>,
+    /// Pourcentage accompli de la **session** dans `[0, 100]` (`progress`).
+    pub percent: Option<f64>,
+    /// Débit instantané moyen de la session en octets/seconde (`progress`).
+    pub bytes_per_sec: Option<f64>,
+    /// Temps estimé avant la fin de la session en secondes, si un débit existe
+    /// (`progress`).
+    pub eta_secs: Option<f64>,
+}
+
+impl From<TransferEvent> for TransferEventDto {
+    fn from(event: TransferEvent) -> Self {
+        // Gabarit « tout absent » : chaque variante ne renseigne que ses champs.
+        let vide = |kind: &str| TransferEventDto {
+            kind: kind.to_owned(),
+            file_index: None,
+            file_name: None,
+            bytes_done: None,
+            bytes_total: None,
+            session_bytes_done: None,
+            session_bytes_total: None,
+            percent: None,
+            bytes_per_sec: None,
+            eta_secs: None,
+        };
+        match event {
+            TransferEvent::FileStarted {
+                index,
+                name,
+                size,
+                resume_offset,
+            } => TransferEventDto {
+                file_index: Some(index),
+                file_name: Some(name),
+                bytes_done: Some(resume_offset),
+                bytes_total: Some(size),
+                ..vide("started")
+            },
+            TransferEvent::Progress(info) => {
+                // `percent` emprunte `info` : calculé avant de déplacer `file_name`.
+                let percent = info.percent();
+                TransferEventDto {
+                    file_index: Some(info.file_index),
+                    file_name: Some(info.file_name),
+                    bytes_done: Some(info.file_bytes_done),
+                    bytes_total: Some(info.file_bytes_total),
+                    session_bytes_done: Some(info.session_bytes_done),
+                    session_bytes_total: Some(info.session_bytes_total),
+                    percent: Some(percent),
+                    bytes_per_sec: Some(info.bytes_per_sec),
+                    eta_secs: info.eta_secs,
+                    ..vide("progress")
+                }
+            }
+            TransferEvent::FileCompleted { index, name, size } => TransferEventDto {
+                file_index: Some(index),
+                file_name: Some(name),
+                bytes_done: Some(size),
+                bytes_total: Some(size),
+                ..vide("completed")
+            },
+            TransferEvent::Finished => vide("finished"),
+            TransferEvent::Cancelled => vide("cancelled"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session live : cycle de vie et flux
 // ---------------------------------------------------------------------------
 
@@ -583,10 +720,27 @@ pub fn start_session(
 
 /// Démarre une session comme [`start_session`], mais avec des options avancées
 /// ([`SessionOptionsDto`] : permissions granulaires, enregistrement local,
-/// encodage delta).
+/// encodage delta, **fonctions média étendues**).
 ///
 /// [`start_session`] équivaut à cet appel avec les options par défaut du moteur.
 /// L'identifiant renvoyé s'utilise avec les mêmes fonctions `session_*`.
+///
+/// # Mode étendu
+///
+/// Si [`SessionOptionsDto::extended_features`] est vrai, la façade démarre le
+/// moteur via `nd_core::SessionEngine::start_with_media` en **injectant des
+/// briques média réelles** : l'audio duplex système
+/// (`nd_audio::AudioSession::duplex_systeme`) et le presse-papiers de la
+/// plateforme (`nd_files::ClipboardSync::new`). Chaque brique indisponible
+/// (pas de périphérique audio, OS sans presse-papiers) est **silencieusement
+/// omise** (`None`) : la session démarre quand même, seule la fonction
+/// correspondante reste inerte — jamais d'échec de démarrage de ce fait. Hors
+/// mode étendu, aucune brique n'est injectée (comportement historique).
+///
+/// Une fois la session active, les canaux annexes se pilotent par ID via
+/// [`session_chat_stream`]/[`send_chat`],
+/// [`session_transfer_stream`]/[`send_files`], [`set_audio_enabled`] et
+/// [`switch_monitor`].
 pub fn start_session_with_options(
     config: SessionConfigDto,
     endpoint: SessionEndpointDto,
@@ -666,6 +820,63 @@ pub fn send_input(id: u64, event: InputEventDto) -> Result<(), String> {
 /// puis attend la fin de ses threads (au plus ~5 s). L'identifiant devient invalide.
 pub fn stop_session(id: u64) -> Result<(), String> {
     crate::flux::arreter_session(id)
+}
+
+// ---------------------------------------------------------------------------
+// Session média étendue : chat, transfert de fichiers, audio, moniteur
+// ---------------------------------------------------------------------------
+//
+// Toutes ces fonctions n'ont d'effet que sur une session démarrée en mode
+// étendu ([`SessionOptionsDto::extended_features`]) et dans la limite des
+// permissions accordées ; sur une session classique elles restent inertes
+// (aucune erreur, mais rien n'est émis/reçu). Elles prennent l'identifiant de
+// session en premier argument, comme les autres fonctions `session_*`.
+
+/// Pousse chaque message de chat de la session dans `sink` : messages **reçus**
+/// du pair ([`ChatMessageDto::from_remote`] vrai) et **échos locaux** des
+/// messages émis via [`send_chat`] (faux).
+///
+/// Un seul consommateur de chat par session (le drain prend définitivement le
+/// récepteur). Le drain s'arrête à la fin de la session (canal déconnecté) ou à
+/// l'annulation du `Stream` côté Dart.
+pub fn session_chat_stream(id: u64, sink: StreamSink<ChatMessageDto>) -> Result<(), String> {
+    crate::flux::flux_chat(id, sink)
+}
+
+/// Envoie un message de chat au pair (canal `Control` chiffré). L'écho local est
+/// livré sur [`session_chat_stream`] une fois le message effectivement émis.
+pub fn send_chat(id: u64, texte: String) -> Result<(), String> {
+    crate::flux::envoyer_chat(id, texte)
+}
+
+/// Pousse chaque évènement de progression du transfert de fichiers dans `sink`
+/// (début, avancement, fin par fichier, fin de file, annulation), tant côté
+/// **émetteur** que **récepteur** (voir [`TransferEventDto`]).
+///
+/// Un seul consommateur de transfert par session. Le drain s'arrête à la fin de
+/// la session ou à l'annulation du `Stream` côté Dart.
+pub fn session_transfer_stream(id: u64, sink: StreamSink<TransferEventDto>) -> Result<(), String> {
+    crate::flux::flux_transfert(id, sink)
+}
+
+/// Démarre l'**envoi** d'une file de fichiers vers le pair (canal `Files`) : les
+/// `chemins` locaux sont émis séquentiellement, la progression est observable
+/// sur [`session_transfer_stream`]. Gardé par la permission « fichiers » côté
+/// émetteur.
+pub fn send_files(id: u64, chemins: Vec<String>) -> Result<(), String> {
+    crate::flux::envoyer_fichiers(id, chemins)
+}
+
+/// Active ou désactive l'audio de la session (émission côté hôte, lecture côté
+/// contrôleur). Sans effet si la permission audio n'est pas accordée.
+pub fn set_audio_enabled(id: u64, actif: bool) -> Result<(), String> {
+    crate::flux::definir_audio_actif(id, actif)
+}
+
+/// Demande à l'hôte de diffuser le **moniteur** d'index donné (bascule
+/// multi-écran). L'hôte applique au mieux (un index hors bornes est ignoré).
+pub fn switch_monitor(id: u64, moniteur: u32) -> Result<(), String> {
+    crate::flux::basculer_moniteur(id, moniteur)
 }
 
 // ---------------------------------------------------------------------------

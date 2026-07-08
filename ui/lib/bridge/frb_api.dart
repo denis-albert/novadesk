@@ -361,6 +361,11 @@ class FrbNativeApi implements NativeApi {
         permissions: _permsVers(o.permissions),
         recordingPath: o.recordingPath,
         deltaMode: o.deltaMode,
+        // Mode étendu : la session porte aussi audio / chat / fichiers /
+        // presse-papiers ; reconnexion transparente activée (endpoint Direct).
+        extendedFeatures: true,
+        transferDir: null,
+        transportReconnect: true,
       );
 
   /// Conversion des statistiques (u64 ⇄ BigInt ; `targetBitrateKbps`,

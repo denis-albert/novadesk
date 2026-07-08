@@ -20,6 +20,11 @@ nd-features = { workspace = true }
 nd-codec = { workspace = true }
 # Session live : l'endpoint `Loopback` lie l'écouteur QUIC côté façade.
 nd-transport = { workspace = true }
+# Session média étendue : injection d'une `AudioSession` système dans `SessionMedia`.
+nd-audio = { workspace = true }
+# Session média étendue : `TransferEvent` (canal `Files`) et `ClipboardSync`
+# (presse-papiers injecté dans `SessionMedia`) viennent de nd-files.
+nd-files = { workspace = true }
 # Pont Dart <-> Rust. Version alignée sur le paquet Dart `flutter_rust_bridge`
 # résolu dans ui/pubspec.lock (2.12.0) : codegen, crate runtime et paquet Dart
 # doivent partager la même version.

@@ -1881,9 +1881,11 @@ name = "nd-ffi"
 version = "0.1.0"
 dependencies = [
  "flutter_rust_bridge",
+ "nd-audio",
  "nd-codec",
  "nd-core",
  "nd-features",
+ "nd-files",
  "nd-proto",
  "nd-transport",
 ]
