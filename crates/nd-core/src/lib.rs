@@ -9,11 +9,11 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nd_capture::{CaptureConfig, CapturedFrame, ScreenCapturer};
+use nd_capture::{enumerate_monitors, CaptureConfig, CapturedFrame, ScreenCapturer};
 use nd_codec::{
     CodecKind, ContentProfile, DecodedFrame, EncodedChunk, EncoderConfig, NetworkEstimate,
     RateController, VideoDecoder, VideoEncoder,
@@ -26,6 +26,9 @@ use nd_proto::{
 };
 use nd_transport::{ChannelHandle, PathEstimate, Transport};
 
+/// Câblage des briques média/annexes (audio, fichiers, presse-papiers, chat,
+/// bascule moniteur) dans la boucle de session. Voir [`media`].
+mod media;
 /// Établissement QUIC par ID via le rendez-vous (punch + repli relais).
 mod p2p;
 /// Orchestrateur de session réutilisable (threads + canaux). Voir [`SessionEngine`].
@@ -33,7 +36,10 @@ mod session;
 /// Service hôte « accès non surveillé ». Voir [`UnattendedHost`].
 mod unattended;
 
-pub use session::{SessionEndpoint, SessionEngine, SessionHandle, SessionOptions, SessionStats};
+pub use media::ChatMessage;
+pub use session::{
+    SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions, SessionStats,
+};
 pub use unattended::{UnattendedHost, UnattendedHostHandle};
 
 /// Rôle du poste local dans la session.
@@ -348,8 +354,28 @@ impl HostPipeline {
         let mut prochain_abr = Instant::now();
         let mut debit_cible_kbps = 0u32;
         let mut envoyees = 0u64;
+        // Bascule multi-écran : moniteur diffusé et resynchronisation (image-clé)
+        // forcée après un changement de moniteur (résolution potentiellement
+        // différente → décodeur à recaler).
+        let mut moniteur_courant = 0u32;
+        let mut resync_moniteur = false;
 
         while !stop.load(Ordering::Relaxed) {
+            // Bascule moniteur demandée par le contrôleur : re-cible la capture
+            // au vol (best-effort ; un index invalide est ignoré et annulé).
+            if let Some(demande) = &options.monitor_switch {
+                let voulu = demande.load(Ordering::Relaxed);
+                if voulu != moniteur_courant {
+                    if appliquer_bascule_moniteur(self.capturer.as_mut(), voulu) {
+                        moniteur_courant = voulu;
+                        self.configured = false;
+                        resync_moniteur = true;
+                    } else {
+                        demande.store(moniteur_courant, Ordering::Relaxed);
+                    }
+                }
+            }
+
             let capturee = self.capturer.next_frame()?;
             let image_fraiche = capturee.image.is_some();
             if image_fraiche && !self.configured {
@@ -365,8 +391,12 @@ impl HostPipeline {
                 regulateur = options
                     .abr_profile
                     .map(|profil| RateController::new(base, profil));
-                if let Some(chemin) = &options.recording {
-                    enregistreur = Some(EnregistreurMp4::ouvrir(chemin, base)?);
+                // L'enregistreur n'est ouvert qu'une fois : une bascule moniteur
+                // (qui remet `configured` à faux) ne doit pas ré-ouvrir le MP4.
+                if enregistreur.is_none() {
+                    if let Some(chemin) = &options.recording {
+                        enregistreur = Some(EnregistreurMp4::ouvrir(chemin, base)?);
+                    }
                 }
                 self.configured = true;
             }
@@ -398,7 +428,8 @@ impl HostPipeline {
             // Encodage : en mode delta, la frame capturée passe telle quelle
             // (`dirty` fidèle exigé ; image absente = trame de répétition) ; en
             // mode plein cadre, la dernière image disponible est ré-encodée.
-            let force_keyframe = self.sent == 0;
+            let force_keyframe = self.sent == 0 || resync_moniteur;
+            resync_moniteur = false;
             let chunk = if options.delta_mode {
                 let chunk = self.encoder.encode(&capturee, force_keyframe)?;
                 if image_fraiche {
@@ -427,7 +458,7 @@ impl HostPipeline {
 
             if self
                 .transport
-                .send(self.video_channel, chunk.data, Reliability::UnreliableFec)
+                .send(self.video_channel, chunk.data, options.video_reliability)
                 .is_err()
             {
                 break;
@@ -456,6 +487,29 @@ impl HostPipeline {
     }
 }
 
+/// Re-cible la capture sur le moniteur `index` (bascule multi-écran, plan 13).
+///
+/// Best-effort : vérifie d'abord que le moniteur existe ([`enumerate_monitors`])
+/// puis relance la capture dessus. Renvoie `false` — **sans** changer d'écran —
+/// si l'index est hors bornes ou si le backend refuse la reconfiguration ; le
+/// flux continue alors sur le moniteur courant. Sur une machine mono-écran, seul
+/// l'index 0 réussit (la voie de commande reste néanmoins prouvée de bout en
+/// bout, voir `examples/session_media_demo.rs`).
+fn appliquer_bascule_moniteur(capturer: &mut dyn ScreenCapturer, index: u32) -> bool {
+    let existe =
+        enumerate_monitors().is_ok_and(|liste| liste.iter().any(|m| m.id == MonitorId(index)));
+    if !existe {
+        return false;
+    }
+    capturer
+        .start(CaptureConfig {
+            monitor: MonitorId(index),
+            target_fps: 60,
+            capture_cursor: false,
+        })
+        .is_ok()
+}
+
 /// Options du flux hôte piloté ([`HostPipeline::run_streaming_pilote`]).
 #[derive(Debug, Clone)]
 pub struct HostStreamOptions {
@@ -473,17 +527,31 @@ pub struct HostStreamOptions {
     /// Chemin d'un fichier MP4 à enregistrer (opt-in) : chaque image encodée y
     /// est poussée, le fichier est clos et relisible en fin de flux.
     pub recording: Option<PathBuf>,
+    /// Fiabilité d'émission du flux vidéo. `UnreliableFec` (défaut) =
+    /// datagrammes protégés par FEC, comportement historique. `Reliable` = flux
+    /// ordonné : requis quand la direction `hôte → contrôleur` porte aussi un
+    /// plan de contrôle fiable (audio, presse-papiers, chat, fichiers) — sans
+    /// quoi le mélange fiable/datagrammes désynchronise le nonce Noise (voir
+    /// [`crate::media`]).
+    pub video_reliability: Reliability,
+    /// Index du moniteur à diffuser, partagé avec le récepteur (bascule
+    /// multi-écran). `None` = pas de bascule (moniteur 0 fixe). Quand la valeur
+    /// change, le flux re-cible la capture au vol (best-effort : dépend du
+    /// nombre de moniteurs réels).
+    pub monitor_switch: Option<Arc<AtomicU32>>,
 }
 
 impl Default for HostStreamOptions {
     /// ABR actif (profil bureautique [`ContentProfile::Text`], ~1 Hz), delta
-    /// coupé, pas d'enregistrement.
+    /// coupé, pas d'enregistrement, vidéo en datagrammes+FEC, pas de bascule.
     fn default() -> Self {
         HostStreamOptions {
             abr_profile: Some(ContentProfile::Text),
             abr_period: Duration::from_secs(1),
             delta_mode: false,
             recording: None,
+            video_reliability: Reliability::UnreliableFec,
+            monitor_switch: None,
         }
     }
 }
@@ -778,6 +846,13 @@ impl Transport for EncryptedTransport {
 
     fn path_estimate(&self) -> PathEstimate {
         self.inner.path_estimate()
+    }
+
+    /// Délègue l'état de connexion au transport sous-jacent : sans cette
+    /// délégation, [`nd_transport::ReconnectingTransport`] (qui scrute
+    /// `is_connected`) ne verrait jamais la coupure à travers la couche chiffrée.
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
     }
 }
 

@@ -15,6 +15,11 @@ nd-crypto = { workspace = true }
 nd-features = { workspace = true }
 # Résolution par ID (SessionEndpoint::ByRendezvous du moteur de session).
 nd-signaling = { workspace = true }
+# Briques « prêtes pour la session » câblées dans la boucle média (lot 05) :
+# audio système (canal Audio), transfert de fichiers + presse-papiers (canaux
+# Fichiers / Contrôle-annexe).
+nd-audio = { workspace = true }
+nd-files = { workspace = true }
 
 [dev-dependencies]
 # Fenêtre de démonstration (viewer). L'UI définitive sera en Flutter (voir plan 10).

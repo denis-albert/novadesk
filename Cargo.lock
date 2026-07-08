@@ -1845,10 +1845,12 @@ name = "nd-core"
 version = "0.1.0"
 dependencies = [
  "minifb",
+ "nd-audio",
  "nd-capture",
  "nd-codec",
  "nd-crypto",
  "nd-features",
+ "nd-files",
  "nd-input",
  "nd-proto",
  "nd-signaling",

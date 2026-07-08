@@ -41,35 +41,42 @@
 //! (une paire de clés par session) ; l'identité persistante (`IdentityStore`) et
 //! l'épinglage TOFU arrivent au lot 06.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use nd_audio::AudioSession;
 use nd_capture::create_capturer;
 use nd_codec::{
     create_decoder, create_encoder, create_hardware_encoder, CodecKind, ContentProfile,
-    DecodedFrame, VideoEncoder,
+    DecodedFrame, EncodedChunk, VideoDecoder, VideoEncoder,
 };
 use nd_crypto::{generate_static_keypair, HandshakeRole};
 use nd_features::{
     Capability, PermissionBroker, PermissionSet, ReconnectController, ReconnectPolicy,
 };
-use nd_input::create_injector;
-use nd_proto::{ChannelKind, InputEvent, NdError, NovaId, Reliability, Result};
+use nd_files::{ClipboardSync, TransferEvent, TransferSession};
+use nd_input::{create_injector, InputInjector};
+use nd_proto::{ChannelKind, InputEvent, MonitorId, NdError, NovaId, Reliability, Result};
 use nd_signaling::RendezvousClient;
 use nd_transport::{
-    connect_quic, ChannelHandle, Listener, PathEstimate, QuicTransport, ServerIdentity, Transport,
+    connect_quic, Backoff, ChannelHandle, Listener, PathEstimate, QuicTransport,
+    ReconnectingTransport, ServerIdentity, Transport,
 };
 
+use crate::media::{
+    decoder_audio, decoder_controle, encoder_audio, encoder_controle, Categorie, ChatMessage,
+    CommandeMedia, SousTypeControle, MONITEURS_MAX,
+};
 use crate::p2p::{self, AttenteRendezvous};
 use crate::{
-    apply_input, establish, HostPipeline, HostStreamOptions, SessionConfig, SessionRole,
-    SessionState, ViewerPipeline,
+    apply_input, establish, HostPipeline, HostStreamOptions, HostStreamTick, SessionConfig,
+    SessionRole, SessionState, ViewerPipeline,
 };
 
 /// Largeur de la fenêtre glissante de mesure du débit d'images (fps).
@@ -156,26 +163,68 @@ pub struct SessionOptions {
     pub recording: Option<PathBuf>,
     /// Profil de contenu de l'échelle ABR (axe de dégradation, voir plan 03).
     pub abr_profile: ContentProfile,
-    /// Encodage delta **opt-in** (voir [`HostStreamOptions::delta_mode`]) : ne
-    /// l'activer que si la source de capture renseigne fidèlement les régions
-    /// modifiées — le capteur DXGI actuel ne rapporte pas les défilements.
+    /// Encodage delta (voir [`HostStreamOptions::delta_mode`]). `nd-capture`
+    /// renseigne désormais fidèlement `CapturedFrame::dirty` (vide ⇔ rien
+    /// changé) : le delta est donc **actif par défaut** (gain mesuré dans
+    /// `examples/session_media_demo.rs`).
     pub delta_mode: bool,
     /// Politique de reconnexion automatique ([`SessionEndpoint::ByRendezvous`]).
     pub reconnect: ReconnectPolicy,
+    /// Câble les **canaux annexes** dans la boucle de session — audio (canal
+    /// `Audio`), transfert de fichiers (canal `Files`), presse-papiers + chat +
+    /// bascule moniteur (canal `Control` multiplexé) — chacun gardé par sa
+    /// [`Capability`]. Défaut `false` : session **vidéo + entrées** historique
+    /// (comportement strictement inchangé). Voir [`crate::media`] pour
+    /// l'arbitrage fiable/non-fiable imposé par le nonce Noise.
+    pub extended_features: bool,
+    /// Répertoire de réception des fichiers transférés (canal `Files`). `None` =
+    /// dossier temporaire du système. Ignoré hors mode étendu.
+    pub transfer_dir: Option<PathBuf>,
+    /// **Reconnexion transparente au niveau transport** ([`ReconnectingTransport`])
+    /// pour le point de contact [`SessionEndpoint::Direct`] côté contrôleur :
+    /// enveloppe le transport de session d'une fabrique qui, à la coupure,
+    /// re-connecte **et re-négocie Noise** vers la même adresse/certificat
+    /// (l'hôte doit ré-accepter). Défaut `false`. Pour
+    /// [`SessionEndpoint::ByRendezvous`], la reconnexion transparente est portée
+    /// par la boucle d'époques (re-punch + re-négociation via le rendez-vous),
+    /// mécanisme plus riche et déjà actif — ce drapeau ne s'y applique pas.
+    pub transport_reconnect: bool,
 }
 
 impl Default for SessionOptions {
     /// Permissions dérivées de la configuration, pas d'enregistrement, ABR en
-    /// profil bureautique, delta coupé, politique de reconnexion par défaut.
+    /// profil bureautique, delta **actif**, reconnexion par défaut, canaux
+    /// annexes **coupés** (session vidéo + entrées historique).
     fn default() -> Self {
         SessionOptions {
             permissions: None,
             recording: None,
             abr_profile: ContentProfile::Text,
-            delta_mode: false,
+            delta_mode: true,
             reconnect: ReconnectPolicy::default(),
+            extended_features: false,
+            transfer_dir: None,
+            transport_reconnect: false,
         }
     }
+}
+
+/// Briques média **injectées** dans une session (tests, sondes, ou back-end
+/// personnalisé), en marge des [`SessionOptions`] sérialisables.
+///
+/// Ces objets ne sont ni `Clone` ni `Debug` (ils portent des périphériques et
+/// des tampons) : ils sont donc passés à part, via
+/// [`SessionEngine::start_with_media`]. Un champ à `None` est **construit à la
+/// volée** depuis les fabriques système si la capacité correspondante est
+/// accordée (audio duplex système, presse-papiers de la plateforme).
+#[derive(Default)]
+pub struct SessionMedia {
+    /// Session audio à utiliser (émission côté hôte, lecture côté contrôleur).
+    /// `None` + [`Capability::Audio`] ⇒ [`AudioSession::duplex_systeme`].
+    pub audio: Option<AudioSession>,
+    /// Synchro presse-papiers à utiliser. `None` + capacité presse-papiers ⇒
+    /// [`ClipboardSync::new`] (presse-papiers réel de la plateforme).
+    pub clipboard: Option<ClipboardSync>,
 }
 
 /// Permissions effectives du poste contrôlé : celles des options si fournies,
@@ -206,7 +255,17 @@ fn chemin_enregistrement(base: &Path, epoque: u32) -> PathBuf {
 }
 
 /// Options du flux hôte piloté pour une époque donnée.
-fn options_flux_hote(options: &SessionOptions, epoque: u32) -> HostStreamOptions {
+///
+/// En **mode étendu**, la vidéo passe en émission **fiable** (la direction
+/// `hôte → contrôleur` porte alors aussi le plan de contrôle fiable : un seul
+/// domaine d'ordonnancement, voir [`crate::media`]) et la bascule moniteur est
+/// branchée sur `moniteur`. Hors mode étendu : datagrammes+FEC, pas de bascule.
+fn options_flux_hote(
+    options: &SessionOptions,
+    epoque: u32,
+    moniteur: Arc<AtomicU32>,
+) -> HostStreamOptions {
+    let etendu = options.extended_features;
     HostStreamOptions {
         abr_profile: Some(options.abr_profile),
         abr_period: PERIODE_ABR,
@@ -215,6 +274,12 @@ fn options_flux_hote(options: &SessionOptions, epoque: u32) -> HostStreamOptions
             .recording
             .as_deref()
             .map(|base| chemin_enregistrement(base, epoque)),
+        video_reliability: if etendu {
+            Reliability::Reliable
+        } else {
+            Reliability::UnreliableFec
+        },
+        monitor_switch: etendu.then_some(moniteur),
     }
 }
 
@@ -416,6 +481,13 @@ impl Transport for TransportPartage {
             .expect("verrou du transport partagé")
             .path_estimate()
     }
+
+    fn is_connected(&self) -> bool {
+        self.interne
+            .lock()
+            .expect("verrou du transport partagé")
+            .is_connected()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +507,19 @@ pub struct SessionHandle {
     pub frame_rx: Receiver<DecodedFrame>,
     /// Entrées à transmettre au pair (contrôleur), sérialisées sur le canal `Input`.
     pub input_tx: Sender<InputEvent>,
+    /// Messages de chat **à émettre** vers le pair (canal `Control` multiplexé).
+    /// Sans effet hors mode étendu ([`SessionOptions::extended_features`]).
+    pub chat_tx: Sender<String>,
+    /// Messages de chat **reçus** du pair ([`ChatMessage::from_remote`] vrai) et
+    /// échos locaux des messages émis (faux).
+    pub chat_rx: Receiver<ChatMessage>,
+    /// Flux de **progression des transferts de fichiers** (canal `Files`) :
+    /// démarrage, progression, fin par fichier, et fin de file.
+    pub transfer_rx: Receiver<TransferEvent>,
+    /// Commandes vers les threads média (envoi de fichiers, bascule moniteur,
+    /// activation audio) — voir [`SessionHandle::send_files`],
+    /// [`SessionHandle::switch_monitor`], [`SessionHandle::set_audio_enabled`].
+    commandes_tx: Sender<CommandeMedia>,
     compteurs: Arc<CompteursSession>,
     stop: Arc<AtomicBool>,
     pilote: Option<JoinHandle<()>>,
@@ -468,6 +553,37 @@ impl SessionHandle {
             .lock()
             .expect("verrou du backend d'encodage")
             .clone()
+    }
+
+    /// Envoie un message de chat au pair (canal `Control` multiplexé). Raccourci
+    /// autour de [`SessionHandle::chat_tx`] ; sans effet hors mode étendu.
+    pub fn send_chat(&self, texte: impl Into<String>) {
+        let _ = self.chat_tx.send(texte.into());
+    }
+
+    /// Démarre l'**envoi** d'une file de fichiers vers le pair (canal `Files`).
+    /// La progression est observable sur [`SessionHandle::transfer_rx`]. Gardé
+    /// par [`Capability::FileUpload`] côté émetteur ; sans effet hors mode
+    /// étendu.
+    pub fn send_files(&self, fichiers: Vec<PathBuf>) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::EnvoyerFichiers(fichiers));
+    }
+
+    /// Demande à l'hôte de diffuser le **moniteur** d'index donné (bascule
+    /// multi-écran, plan 13). L'hôte applique au mieux (voir
+    /// [`crate::HostPipeline`]) ; sans effet hors mode étendu.
+    pub fn switch_monitor(&self, moniteur: u32) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::BasculerMoniteur(moniteur));
+    }
+
+    /// Active ou désactive l'audio (émission côté hôte, lecture côté contrôleur).
+    /// Sans effet hors mode étendu ou si [`Capability::Audio`] n'est pas accordé.
+    pub fn set_audio_enabled(&self, actif: bool) {
+        let _ = self.commandes_tx.send(CommandeMedia::AudioActif(actif));
     }
 
     /// Arrête la session : lève le signal d'arrêt puis attend la fin des threads
@@ -541,6 +657,24 @@ impl SessionEngine {
         endpoint: SessionEndpoint,
         options: SessionOptions,
     ) -> Result<SessionHandle> {
+        Self::start_with_media(config, endpoint, options, SessionMedia::default())
+    }
+
+    /// Démarre une session en **injectant** des briques média
+    /// ([`SessionMedia`] : session audio, presse-papiers) — utile aux sondes et
+    /// aux back-ends personnalisés. Équivalent additif de
+    /// [`SessionEngine::start_with_options`], qui délègue ici avec
+    /// [`SessionMedia::default`] (briques construites à la volée si les capacités
+    /// sont accordées).
+    ///
+    /// # Errors
+    /// Voir [`SessionEngine::start_with_options`].
+    pub fn start_with_media(
+        config: SessionConfig,
+        endpoint: SessionEndpoint,
+        options: SessionOptions,
+        injectees: SessionMedia,
+    ) -> Result<SessionHandle> {
         if config.role == SessionRole::Controller
             && config.peer_id.is_none()
             && matches!(endpoint, SessionEndpoint::ByRendezvous { .. })
@@ -553,8 +687,32 @@ impl SessionEngine {
         let (state_tx, state_rx) = mpsc::channel();
         let (frame_tx, frame_rx) = mpsc::sync_channel(PROFONDEUR_FILE_FRAMES);
         let (input_tx, input_rx) = mpsc::channel();
+        // Canaux vers/depuis la poignée pour les fonctions étendues.
+        let (chat_in_tx, chat_in_rx) = mpsc::channel();
+        let (chat_out_tx, chat_out_rx) = mpsc::channel();
+        let (transfer_out_tx, transfer_out_rx) = mpsc::channel();
+        let (commandes_tx, commandes_rx) = mpsc::channel();
         let compteurs = Arc::new(CompteursSession::default());
         let stop = Arc::new(AtomicBool::new(false));
+
+        let media = Arc::new(EtatMedia {
+            role: config.role,
+            permissions: resoudre_permissions(&config, &options),
+            transfer_dir: options
+                .transfer_dir
+                .clone()
+                .unwrap_or_else(std::env::temp_dir),
+            audio: Mutex::new(injectees.audio),
+            clipboard: Mutex::new(injectees.clipboard),
+            transfer: Mutex::new(None),
+            audio_actif: AtomicBool::new(true),
+            moniteur: Arc::new(AtomicU32::new(0)),
+            dernier_presse_papiers: Mutex::new(None),
+            chat_out: chat_out_tx,
+            transfer_out: transfer_out_tx,
+            commandes: Mutex::new(commandes_rx),
+            chat_in: Mutex::new(chat_in_rx),
+        });
 
         let ctx = ContextePilote {
             config,
@@ -564,6 +722,7 @@ impl SessionEngine {
             input_rx: Arc::new(Mutex::new(input_rx)),
             compteurs: Arc::clone(&compteurs),
             stop: Arc::clone(&stop),
+            media,
         };
         let pilote = thread::Builder::new()
             .name("nd-session-pilote".to_owned())
@@ -573,6 +732,10 @@ impl SessionEngine {
             state_rx,
             frame_rx,
             input_tx,
+            chat_tx: chat_in_tx,
+            chat_rx: chat_out_rx,
+            transfer_rx: transfer_out_rx,
+            commandes_tx,
             compteurs,
             stop,
             pilote: Some(pilote),
@@ -588,6 +751,43 @@ impl SessionEngine {
 /// `Receiver` n'est pas clonable, chaque époque le verrouille à son tour.
 type EntreesPartagees = Arc<Mutex<Receiver<InputEvent>>>;
 
+/// État des **fonctions étendues** partagé par les threads d'une session (et
+/// persistant entre les époques d'une reconnexion) : briques média, canaux
+/// vers/depuis la [`SessionHandle`], et bascules d'activation.
+///
+/// Toute la mutabilité est intérieure (`Mutex`/atomiques) : une seule époque
+/// vit à la fois, la contention est donc nulle en pratique.
+struct EtatMedia {
+    /// Rôle local (sens de l'audio et de la vidéo).
+    role: SessionRole,
+    /// Capacités effectives : gate de chaque fonction étendue.
+    permissions: PermissionSet,
+    /// Répertoire de réception des fichiers (canal `Files`).
+    transfer_dir: PathBuf,
+    /// Session audio (émission hôte / lecture contrôleur), injectée ou système.
+    audio: Mutex<Option<AudioSession>>,
+    /// Synchro presse-papiers (injectée ou plateforme).
+    clipboard: Mutex<Option<ClipboardSync>>,
+    /// Transfert de fichiers actif (émetteur **ou** récepteur), partagé entre le
+    /// thread récepteur (`handle_incoming`) et l'émetteur (`poll_outgoing`).
+    transfer: Mutex<Option<TransferSession>>,
+    /// Émission (hôte) / lecture (contrôleur) audio active.
+    audio_actif: AtomicBool,
+    /// Index du moniteur demandé (bascule multi-écran), lu par la capture hôte.
+    moniteur: Arc<AtomicU32>,
+    /// Dernier presse-papiers **appliqué** (anti-boucle : ne pas ré-émettre ce
+    /// que l'on vient de recevoir).
+    dernier_presse_papiers: Mutex<Option<Vec<u8>>>,
+    /// Chat reçu + échos → [`SessionHandle::chat_rx`].
+    chat_out: Sender<ChatMessage>,
+    /// Progression des transferts → [`SessionHandle::transfer_rx`].
+    transfer_out: Sender<TransferEvent>,
+    /// Commandes depuis la poignée ([`SessionHandle::send_files`], …).
+    commandes: Mutex<Receiver<CommandeMedia>>,
+    /// Chat à émettre depuis la poignée ([`SessionHandle::chat_tx`]).
+    chat_in: Mutex<Receiver<String>>,
+}
+
 /// Contexte vivant du pilote de session, partagé par toutes les époques.
 struct ContextePilote {
     config: SessionConfig,
@@ -597,6 +797,9 @@ struct ContextePilote {
     input_rx: EntreesPartagees,
     compteurs: Arc<CompteursSession>,
     stop: Arc<AtomicBool>,
+    /// État des fonctions étendues (audio, fichiers, presse-papiers, chat,
+    /// moniteur). Inerte hors [`SessionOptions::extended_features`].
+    media: Arc<EtatMedia>,
 }
 
 /// Corps du thread pilote : déroule la session, mémorise l'erreur éventuelle,
@@ -622,6 +825,11 @@ fn derouler_session(ctx: &ContextePilote, endpoint: SessionEndpoint) -> Result<(
             vivre_epoque(ctx, transport, 1).map(|_fin| ())
         }
         SessionEndpoint::Direct { addr, cert_der } => {
+            // Reconnexion transparente **au niveau transport** (opt-in, contrôleur) :
+            // le transport de session s'auto-rétablit vers la même adresse.
+            if ctx.config.role == SessionRole::Controller && ctx.options.transport_reconnect {
+                return vivre_direct_reconnectant(ctx, addr, cert_der);
+            }
             let _ = ctx.state_tx.send(SessionState::Connecting);
             let transport = connect_quic(addr, &cert_der)?;
             vivre_epoque(ctx, transport, 1).map(|_fin| ())
@@ -791,6 +999,65 @@ fn attendre_interruptible(delai: Duration, stop: &Arc<AtomicBool>) {
     }
 }
 
+/// Traduit la politique de reconnexion de session en [`Backoff`] transport
+/// (délai initial, plafond, nombre de tentatives).
+fn backoff_depuis_politique(politique: ReconnectPolicy) -> Backoff {
+    Backoff {
+        delai_initial: Duration::from_millis(politique.base_delay_ms),
+        delai_max: Duration::from_millis(politique.max_delay_ms),
+        max_tentatives: politique.max_attempts,
+    }
+}
+
+/// Rôle **contrôleur** en [`SessionEndpoint::Direct`] avec **reconnexion
+/// transparente au niveau transport** : le transport de session est enveloppé
+/// dans un [`ReconnectingTransport`] dont la fabrique re-connecte QUIC **et
+/// re-négocie Noise** vers la même adresse/certificat à chaque coupure (l'hôte
+/// doit ré-accepter). Le consommateur ne voit pas la coupure : la session reste
+/// `Active` et le flux reprend sur l'image-clé de la nouvelle négociation.
+///
+/// À la différence de la boucle d'époques ([`SessionEndpoint::ByRendezvous`]),
+/// il n'y a **qu'une** époque logique : la garde de coupure n'est pas armée, le
+/// rétablissement est porté par le transport. L'épuisement du backoff clôt la
+/// session (erreur remontée au pilote).
+fn vivre_direct_reconnectant(
+    ctx: &ContextePilote,
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
+) -> Result<()> {
+    let _ = ctx.state_tx.send(SessionState::Connecting);
+    // Identité Noise éphémère régénérée à chaque (re)négociation.
+    let fabrique = move || -> Result<Box<dyn Transport>> {
+        let brut = connect_quic(addr, &cert_der)?;
+        let cles = generate_static_keypair()?;
+        let securise = establish(Box::new(brut), HandshakeRole::Initiator, &cles.private)?;
+        Ok(Box::new(securise) as Box<dyn Transport>)
+    };
+    let _ = ctx.state_tx.send(SessionState::Handshaking);
+    let initial = fabrique()?;
+    let _ = ctx.state_tx.send(SessionState::Active);
+
+    let reconnectant = ReconnectingTransport::avec_backoff(
+        initial,
+        fabrique,
+        backoff_depuis_politique(ctx.options.reconnect),
+    );
+    let partage = TransportPartage::new(Box::new(reconnectant), Arc::clone(&ctx.compteurs));
+    let params = ParamsEpoqueControleur {
+        compteurs: &ctx.compteurs,
+        stop: &ctx.stop,
+        etats: &ctx.state_tx,
+        frame_tx: &ctx.frame_tx,
+        entrees: &ctx.input_rx,
+        epoque: 1,
+    };
+    if ctx.options.extended_features {
+        executer_controleur_ext(partage, &params, &ctx.media, &ctx.stop)
+    } else {
+        executer_controleur(partage, &params, &ctx.stop)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Époques (une connexion vécue de bout en bout)
 // ---------------------------------------------------------------------------
@@ -898,18 +1165,26 @@ fn vivre_epoque_avec_pair(
                 entrees: &ctx.input_rx,
                 epoque,
             };
-            vivre_epoque_controleur(transport, &params)
+            if ctx.options.extended_features {
+                vivre_epoque_controleur_ext(transport, &params, &ctx.media)
+            } else {
+                vivre_epoque_controleur(transport, &params)
+            }
         }
         SessionRole::Controlled => {
             let params = ParamsEpoqueHote {
                 permissions: resoudre_permissions(&ctx.config, &ctx.options),
-                flux: options_flux_hote(&ctx.options, epoque),
+                flux: options_flux_hote(&ctx.options, epoque, Arc::clone(&ctx.media.moniteur)),
                 compteurs: &ctx.compteurs,
                 stop: &ctx.stop,
                 etats: Some(&ctx.state_tx),
                 pair,
             };
-            vivre_epoque_hote(transport, &params)
+            if ctx.options.extended_features {
+                vivre_epoque_hote_ext(transport, &params, &ctx.media)
+            } else {
+                vivre_epoque_hote(transport, &params)
+            }
         }
     }
 }
@@ -1164,6 +1439,661 @@ fn executer_hote(
     arret.store(true, Ordering::Relaxed);
     let _ = entrees.join();
     resultat.map(|_rapport| ())
+}
+
+// ---------------------------------------------------------------------------
+// Époques « étendues » : vidéo + entrées **plus** audio, fichiers,
+// presse-papiers, chat et bascule moniteur (voir [`crate::media`]).
+//
+// Invariant crypto : dans chaque direction, un seul récepteur (démux ordonné
+// des nonces) et des envois **tous fiables** (mutex sérialisant, un seul
+// domaine d'ordonnancement — pas de mélange fiable/datagrammes).
+// ---------------------------------------------------------------------------
+
+/// Horloge monotone en microsecondes depuis `debut` (base commune de
+/// `recevoir`/`tick_lecture` audio).
+fn maintenant_us(debut: Instant) -> u64 {
+    u64::try_from(debut.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Période du pas de lecture audio côté contrôleur (~50 Hz).
+const PERIODE_TICK_AUDIO_US: u64 = 20_000;
+
+/// Période de scrutation du presse-papiers local (émission des changements).
+const PERIODE_PRESSE_PAPIERS: Duration = Duration::from_millis(250);
+
+/// Cartographie `index de canal → catégorie` pour le démultiplexage : pré-ouvre
+/// tous les canaux susceptibles d'arriver (dont la vidéo de chaque moniteur) de
+/// sorte que chaque `poll_recv` se range par catégorie.
+fn construire_carte_reception(transport: &mut impl Transport) -> HashMap<u32, Categorie> {
+    let mut kinds = vec![
+        ChannelKind::Control,
+        ChannelKind::Input,
+        ChannelKind::Audio,
+        ChannelKind::Files,
+    ];
+    for m in 0..MONITEURS_MAX {
+        kinds.push(ChannelKind::Video(MonitorId(m)));
+    }
+    let mut carte = HashMap::new();
+    for kind in kinds {
+        let handle = transport.open_channel(kind);
+        carte.insert(handle.0, Categorie::depuis_kind(kind));
+    }
+    carte
+}
+
+/// Applique une entrée reçue derrière le **filtre de permissions** (chemin chaud
+/// partagé par l'injection classique et étendue).
+fn appliquer_entree_gardee(
+    injecteur: &dyn InputInjector,
+    broker: &mut PermissionBroker,
+    refus_journalises: &mut PermissionSet,
+    compteurs: &CompteursSession,
+    acteur: &str,
+    data: &[u8],
+) {
+    let Some(evenement) = InputEvent::from_bytes(data) else {
+        return;
+    };
+    let capacite = Capability::required_for_input(&evenement);
+    if broker.is_allowed(capacite) {
+        if apply_input(injecteur, &evenement).is_ok() {
+            compteurs.inputs_applied.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        compteurs.inputs_denied.fetch_add(1, Ordering::Relaxed);
+        if refus_journalises.grant(capacite) {
+            let _ = broker.authorize_input(acteur, &evenement);
+        }
+    }
+}
+
+/// Construit (paresseusement) la session audio système si [`Capability::Audio`]
+/// est accordé, puis règle le sens actif selon le rôle (émission côté hôte,
+/// lecture côté contrôleur).
+fn assurer_audio(media: &EtatMedia) {
+    if !media.permissions.allows(Capability::Audio) {
+        return;
+    }
+    let mut garde = media.audio.lock().expect("verrou audio");
+    if garde.is_none() {
+        if let Ok(session) = AudioSession::duplex_systeme() {
+            *garde = Some(session);
+        }
+    }
+    if let Some(audio) = garde.as_mut() {
+        let actif = media.audio_actif.load(Ordering::Relaxed);
+        match media.role {
+            SessionRole::Controlled => {
+                audio.definir_emission_active(actif);
+                audio.definir_lecture_active(false);
+            }
+            SessionRole::Controller => {
+                audio.definir_lecture_active(actif);
+                audio.definir_emission_active(false);
+            }
+        }
+    }
+}
+
+/// Reçoit une trame du canal `Files` : crée paresseusement le récepteur si
+/// besoin, l'alimente, puis draine ses événements vers la poignée.
+fn traiter_fichiers(media: &EtatMedia, data: &[u8]) {
+    if !media.permissions.allows(Capability::FileDownload) {
+        return;
+    }
+    let mut garde = media.transfer.lock().expect("verrou transfert");
+    if garde.is_none() {
+        *garde = Some(TransferSession::receive(media.transfer_dir.clone()));
+    }
+    if let Some(session) = garde.as_mut() {
+        let _ = session.handle_incoming(data);
+        for evenement in session.take_events() {
+            let _ = media.transfer_out.send(evenement);
+        }
+    }
+}
+
+/// Reçoit un message du canal `Control` multiplexé : chat, presse-papiers ou
+/// bascule moniteur (chacun gardé par sa capacité).
+fn traiter_controle(media: &EtatMedia, data: &[u8]) {
+    let Some((sous_type, payload)) = decoder_controle(data) else {
+        return;
+    };
+    match sous_type {
+        SousTypeControle::Chat => {
+            if let Ok(texte) = String::from_utf8(payload.to_vec()) {
+                let _ = media.chat_out.send(ChatMessage {
+                    from_remote: true,
+                    text: texte,
+                });
+            }
+        }
+        SousTypeControle::PressePapiers => {
+            if !media.permissions.allows(Capability::ClipboardWrite) {
+                return;
+            }
+            if let Some(clip) = media
+                .clipboard
+                .lock()
+                .expect("verrou presse-papiers")
+                .as_ref()
+            {
+                let _ = clip.apply_bytes(payload);
+            }
+            // Mémorise pour ne pas ré-émettre ce que l'on vient d'appliquer.
+            *media
+                .dernier_presse_papiers
+                .lock()
+                .expect("verrou dernier presse-papiers") = Some(payload.to_vec());
+        }
+        SousTypeControle::BasculeMoniteur => {
+            if let Ok(octets) = <[u8; 4]>::try_from(payload) {
+                media
+                    .moniteur
+                    .store(u32::from_be_bytes(octets), Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Récepteur démux **contrôleur** : vidéo → décodage → frames, audio →
+/// `recevoir`/`tick_lecture` → lecture, fichiers → transfert, contrôle →
+/// presse-papiers/chat.
+fn recepteur_controleur(
+    mut transport: TransportPartage,
+    mut decodeur: Box<dyn VideoDecoder>,
+    frame_tx: SyncSender<DecodedFrame>,
+    media: &Arc<EtatMedia>,
+    compteurs: &Arc<CompteursSession>,
+    arret: &Arc<AtomicBool>,
+) -> Result<()> {
+    let carte = construire_carte_reception(&mut transport);
+    let debut = Instant::now();
+    let mut prochain_tick = PERIODE_TICK_AUDIO_US;
+    while !arret.load(Ordering::Relaxed) {
+        match transport.poll_recv() {
+            Ok(Some((handle, data))) => match carte.get(&handle.0).copied() {
+                Some(Categorie::Video(_)) => {
+                    let chunk = EncodedChunk {
+                        data,
+                        is_keyframe: false,
+                        monitor: MonitorId(0),
+                        timestamp_us: 0,
+                    };
+                    if let Some(frame) = decodeur.decode(&chunk)? {
+                        compteurs.frame_livree();
+                        let _ = frame_tx.try_send(frame);
+                    }
+                }
+                Some(Categorie::Audio) => {
+                    if media.permissions.allows(Capability::Audio)
+                        && media.audio_actif.load(Ordering::Relaxed)
+                    {
+                        if let Some(paquet) = decoder_audio(&data) {
+                            let arrivee = maintenant_us(debut);
+                            if let Some(audio) = media.audio.lock().expect("verrou audio").as_mut()
+                            {
+                                audio.recevoir(paquet, arrivee);
+                            }
+                        }
+                    }
+                }
+                Some(Categorie::Fichiers) => traiter_fichiers(media, &data),
+                Some(Categorie::Controle) => traiter_controle(media, &data),
+                Some(Categorie::Input) | None => {}
+            },
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(_) => break,
+        }
+        // Pas de lecture audio cadencé (~20 ms), indépendant des arrivées.
+        let maintenant = maintenant_us(debut);
+        if maintenant >= prochain_tick {
+            prochain_tick = maintenant + PERIODE_TICK_AUDIO_US;
+            if media.permissions.allows(Capability::Audio) {
+                if let Some(audio) = media.audio.lock().expect("verrou audio").as_mut() {
+                    let _ = audio.tick_lecture(maintenant);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Récepteur démux **hôte** : entrées → filtre de permissions → injection ;
+/// fichiers → transfert ; contrôle → presse-papiers/chat/bascule moniteur.
+fn recepteur_hote(
+    mut transport: TransportPartage,
+    injecteur: Box<dyn InputInjector>,
+    permissions: PermissionSet,
+    acteur: String,
+    media: &Arc<EtatMedia>,
+    compteurs: &Arc<CompteursSession>,
+    arret: &Arc<AtomicBool>,
+) -> Result<()> {
+    let carte = construire_carte_reception(&mut transport);
+    let mut broker = PermissionBroker::with_permissions(permissions);
+    let mut refus_journalises = PermissionSet::none();
+    while !arret.load(Ordering::Relaxed) {
+        match transport.poll_recv() {
+            Ok(Some((handle, data))) => match carte.get(&handle.0).copied() {
+                Some(Categorie::Input) => appliquer_entree_gardee(
+                    injecteur.as_ref(),
+                    &mut broker,
+                    &mut refus_journalises,
+                    compteurs,
+                    &acteur,
+                    &data,
+                ),
+                Some(Categorie::Fichiers) => traiter_fichiers(media, &data),
+                Some(Categorie::Controle) => traiter_controle(media, &data),
+                _ => {}
+            },
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(_) => break,
+        }
+    }
+    injecteur.release_all();
+    Ok(())
+}
+
+/// Draine les commandes de la poignée (envoi de fichiers, bascule moniteur,
+/// activation audio) et les applique/émet.
+fn traiter_commandes(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    let commandes: Vec<CommandeMedia> = {
+        let rx = media.commandes.lock().expect("verrou commandes");
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    };
+    for commande in commandes {
+        match commande {
+            CommandeMedia::EnvoyerFichiers(fichiers) => {
+                if media.permissions.allows(Capability::FileUpload) {
+                    if let Ok(session) = TransferSession::send(fichiers) {
+                        *media.transfer.lock().expect("verrou transfert") = Some(session);
+                    }
+                }
+            }
+            CommandeMedia::BasculerMoniteur(index) => match media.role {
+                // Le contrôleur demande à l'hôte ; l'hôte se commande lui-même.
+                SessionRole::Controller => {
+                    let trame =
+                        encoder_controle(SousTypeControle::BasculeMoniteur, &index.to_be_bytes());
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+                SessionRole::Controlled => media.moniteur.store(index, Ordering::Relaxed),
+            },
+            CommandeMedia::AudioActif(actif) => {
+                media.audio_actif.store(actif, Ordering::Relaxed);
+                if let Some(audio) = media.audio.lock().expect("verrou audio").as_mut() {
+                    match media.role {
+                        SessionRole::Controlled => audio.definir_emission_active(actif),
+                        SessionRole::Controller => audio.definir_lecture_active(actif),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Émet les messages de chat en attente (canal `Control`) + écho local.
+fn envoyer_chat_en_attente(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    let messages: Vec<String> = {
+        let rx = media.chat_in.lock().expect("verrou chat");
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    };
+    for texte in messages {
+        let trame = encoder_controle(SousTypeControle::Chat, texte.as_bytes());
+        if transport
+            .send(canal_controle, trame, Reliability::Reliable)
+            .is_ok()
+        {
+            let _ = media.chat_out.send(ChatMessage {
+                from_remote: false,
+                text: texte,
+            });
+        }
+    }
+}
+
+/// Émet le presse-papiers local s'il a changé (garde [`Capability::ClipboardRead`]).
+fn synchroniser_presse_papiers(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    if !media.permissions.allows(Capability::ClipboardRead) {
+        return;
+    }
+    let octets = {
+        let garde = media.clipboard.lock().expect("verrou presse-papiers");
+        garde
+            .as_ref()
+            .and_then(|clip| clip.capture_bytes().ok().flatten())
+    };
+    let Some(octets) = octets else {
+        return;
+    };
+    {
+        let mut dernier = media
+            .dernier_presse_papiers
+            .lock()
+            .expect("verrou dernier presse-papiers");
+        if dernier.as_ref() == Some(&octets) {
+            return;
+        }
+        *dernier = Some(octets.clone());
+    }
+    let trame = encoder_controle(SousTypeControle::PressePapiers, &octets);
+    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+}
+
+/// Pompe le transfert de fichiers actif : émet les trames sortantes (canal
+/// `Files`) et draine les événements vers la poignée.
+fn pomper_transfert(
+    transport: &mut TransportPartage,
+    canal_files: ChannelHandle,
+    media: &EtatMedia,
+) {
+    let mut garde = media.transfer.lock().expect("verrou transfert");
+    let Some(session) = garde.as_mut() else {
+        return;
+    };
+    while let Ok(Some(bytes)) = session.poll_outgoing() {
+        if transport
+            .send(canal_files, bytes, Reliability::Reliable)
+            .is_err()
+        {
+            break;
+        }
+    }
+    for evenement in session.take_events() {
+        let _ = media.transfer_out.send(evenement);
+    }
+}
+
+/// Boucle d'**émission audio** dédiée de l'hôte (canal `Audio`) : produit une
+/// trame par tour et l'émet. La cadence est portée par la capture elle-même
+/// (`produire` bloque jusqu'à la trame suivante ≈ 20 ms) — un thread à part pour
+/// ne pas retarder le plan de contrôle du thread de fonctions.
+fn boucle_audio_hote(
+    mut transport: TransportPartage,
+    media: &Arc<EtatMedia>,
+    arret: &Arc<AtomicBool>,
+) {
+    let canal_audio = transport.open_channel(ChannelKind::Audio);
+    while !arret.load(Ordering::Relaxed) {
+        if !media.permissions.allows(Capability::Audio)
+            || !media.audio_actif.load(Ordering::Relaxed)
+        {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let paquet = {
+            let mut garde = media.audio.lock().expect("verrou audio");
+            garde
+                .as_mut()
+                .and_then(|audio| audio.produire().ok().flatten())
+        };
+        match paquet {
+            Some(paquet) => {
+                if transport
+                    .send(canal_audio, encoder_audio(&paquet), Reliability::Reliable)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            None => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+/// Émetteur de fonctions étendues côté **contrôleur** : entrées (canal `Input`)
+/// + plan de contrôle (fichiers, presse-papiers, chat, commandes).
+fn emetteur_features_controleur(
+    mut transport: TransportPartage,
+    media: &Arc<EtatMedia>,
+    entrees: &EntreesPartagees,
+    arret: &Arc<AtomicBool>,
+) {
+    let canal_input = transport.open_channel(ChannelKind::Input);
+    let canal_files = transport.open_channel(ChannelKind::Files);
+    let canal_controle = transport.open_channel(ChannelKind::Control);
+    let mut prochaine_synchro = Instant::now();
+    while !arret.load(Ordering::Relaxed) {
+        // Entrées : basse latence (recv borné), seule voie émettrice restante.
+        let evenement = {
+            let file = entrees.lock().expect("verrou de la file d'entrées");
+            file.recv_timeout(Duration::from_millis(10))
+        };
+        match evenement {
+            Ok(evenement) => {
+                if transport
+                    .send(canal_input, evenement.to_bytes(), Reliability::Reliable)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        traiter_commandes(&mut transport, canal_controle, media);
+        envoyer_chat_en_attente(&mut transport, canal_controle, media);
+        pomper_transfert(&mut transport, canal_files, media);
+        if Instant::now() >= prochaine_synchro {
+            prochaine_synchro = Instant::now() + PERIODE_PRESSE_PAPIERS;
+            synchroniser_presse_papiers(&mut transport, canal_controle, media);
+        }
+    }
+}
+
+/// Émetteur de fonctions étendues côté **hôte** : audio (canal `Audio`) + plan
+/// de contrôle (fichiers, presse-papiers, chat, commandes).
+fn emetteur_features_hote(
+    mut transport: TransportPartage,
+    media: &Arc<EtatMedia>,
+    arret: &Arc<AtomicBool>,
+) {
+    let canal_files = transport.open_channel(ChannelKind::Files);
+    let canal_controle = transport.open_channel(ChannelKind::Control);
+    let mut prochaine_synchro = Instant::now();
+    while !arret.load(Ordering::Relaxed) {
+        traiter_commandes(&mut transport, canal_controle, media);
+        envoyer_chat_en_attente(&mut transport, canal_controle, media);
+        pomper_transfert(&mut transport, canal_files, media);
+        if Instant::now() >= prochaine_synchro {
+            prochaine_synchro = Instant::now() + PERIODE_PRESSE_PAPIERS;
+            synchroniser_presse_papiers(&mut transport, canal_controle, media);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Époque **étendue** du contrôleur : garde + Noise (initiateur) + démux média.
+fn vivre_epoque_controleur_ext(
+    transport: QuicTransport,
+    params: &ParamsEpoqueControleur<'_>,
+    media: &Arc<EtatMedia>,
+) -> Result<FinEpoque> {
+    let garde = GardeEpoque::armer(&transport, params.stop)?;
+    let arret = garde.arret();
+    let resultat = derouler_epoque_controleur_ext(transport, params, media, &arret);
+    garde.conclure(resultat, params.stop)
+}
+
+/// Corps faillible de l'époque contrôleur étendue.
+fn derouler_epoque_controleur_ext(
+    transport: QuicTransport,
+    params: &ParamsEpoqueControleur<'_>,
+    media: &Arc<EtatMedia>,
+    arret: &Arc<AtomicBool>,
+) -> Result<()> {
+    let _ = params.etats.send(SessionState::Handshaking);
+    let cles = generate_static_keypair()?;
+    let securise = establish(Box::new(transport), HandshakeRole::Initiator, &cles.private)?;
+    let _ = params.etats.send(SessionState::Active);
+    let partage = TransportPartage::new(Box::new(securise), Arc::clone(params.compteurs));
+    executer_controleur_ext(partage, params, media, arret)
+}
+
+/// Boucle média **étendue** du contrôleur sur un transport déjà chiffré :
+/// récepteur démux (pilote) + émetteur de fonctions (thread). Partagée par
+/// l'époque étendue et la voie à reconnexion transport ([`vivre_direct_reconnectant`]).
+fn executer_controleur_ext(
+    partage: TransportPartage,
+    params: &ParamsEpoqueControleur<'_>,
+    media: &Arc<EtatMedia>,
+    arret: &Arc<AtomicBool>,
+) -> Result<()> {
+    let decodeur = create_decoder(CodecKind::H264)?;
+    assurer_audio(media);
+    // Reprise : purge des entrées périmées accumulées pendant la coupure.
+    if params.epoque > 1 {
+        if let Ok(file) = params.entrees.lock() {
+            while file.try_recv().is_ok() {}
+        }
+    }
+
+    let transport_emetteur = partage.clone();
+    let media_emetteur = Arc::clone(media);
+    let entrees = Arc::clone(params.entrees);
+    let arret_emetteur = Arc::clone(arret);
+    let emetteur = thread::Builder::new()
+        .name("nd-session-features-ctl".to_owned())
+        .spawn(move || {
+            emetteur_features_controleur(
+                transport_emetteur,
+                &media_emetteur,
+                &entrees,
+                &arret_emetteur,
+            );
+        })?;
+
+    let resultat = recepteur_controleur(
+        partage,
+        decodeur,
+        params.frame_tx.clone(),
+        media,
+        params.compteurs,
+        arret,
+    );
+    arret.store(true, Ordering::Relaxed);
+    let _ = emetteur.join();
+    resultat
+}
+
+/// Époque **étendue** de l'hôte : garde + Noise (répondeur) + vidéo fiable +
+/// audio + démux entrées/fichiers/contrôle.
+fn vivre_epoque_hote_ext(
+    transport: QuicTransport,
+    params: &ParamsEpoqueHote<'_>,
+    media: &Arc<EtatMedia>,
+) -> Result<FinEpoque> {
+    let garde = GardeEpoque::armer(&transport, params.stop)?;
+    let arret = garde.arret();
+    let resultat = derouler_epoque_hote_ext(transport, params, media, &arret);
+    garde.conclure(resultat, params.stop)
+}
+
+/// Corps faillible de l'époque hôte étendue.
+fn derouler_epoque_hote_ext(
+    transport: QuicTransport,
+    params: &ParamsEpoqueHote<'_>,
+    media: &Arc<EtatMedia>,
+    arret: &Arc<AtomicBool>,
+) -> Result<()> {
+    if let Some(etats) = params.etats {
+        let _ = etats.send(SessionState::Handshaking);
+    }
+    let cles = generate_static_keypair()?;
+    let securise = establish(Box::new(transport), HandshakeRole::Responder, &cles.private)?;
+    if let Some(etats) = params.etats {
+        let _ = etats.send(SessionState::Active);
+    }
+    let partage = TransportPartage::new(Box::new(securise), Arc::clone(params.compteurs));
+
+    let injecteur = create_injector()?;
+    let capteur = create_capturer()?;
+    let encodeur = creer_encodeur_hote()?;
+    params.compteurs.note_backend(encodeur.nom_backend());
+    let mut hote = HostPipeline::new(capteur, encodeur, Box::new(partage.clone()))?;
+    assurer_audio(media);
+
+    let transport_recepteur = partage.clone();
+    let media_recepteur = Arc::clone(media);
+    let compteurs_recepteur = Arc::clone(params.compteurs);
+    let arret_recepteur = Arc::clone(arret);
+    let permissions = params.permissions;
+    let acteur = params.pair.to_string();
+    let recepteur = thread::Builder::new()
+        .name("nd-session-recv-hote".to_owned())
+        .spawn(move || {
+            let _ = recepteur_hote(
+                transport_recepteur,
+                injecteur,
+                permissions,
+                acteur,
+                &media_recepteur,
+                &compteurs_recepteur,
+                &arret_recepteur,
+            );
+        })?;
+
+    let transport_emetteur = partage.clone();
+    let media_emetteur = Arc::clone(media);
+    let arret_emetteur = Arc::clone(arret);
+    let emetteur = thread::Builder::new()
+        .name("nd-session-features-hote".to_owned())
+        .spawn(move || {
+            emetteur_features_hote(transport_emetteur, &media_emetteur, &arret_emetteur);
+        })?;
+
+    // Émission audio sur son propre thread : la capture cadence (≈ 20 ms/trame).
+    let transport_audio = partage.clone();
+    let media_audio = Arc::clone(media);
+    let arret_audio = Arc::clone(arret);
+    let audio = thread::Builder::new()
+        .name("nd-session-audio-hote".to_owned())
+        .spawn(move || boucle_audio_hote(transport_audio, &media_audio, &arret_audio))?;
+
+    let enregistrees_avant = params.compteurs.frames_enregistrees.load(Ordering::Relaxed);
+    let compteurs_flux = Arc::clone(params.compteurs);
+    let resultat = hote.run_streaming_pilote(Arc::clone(arret), params.flux.clone(), move |tick| {
+        maj_compteurs_flux(&compteurs_flux, enregistrees_avant, &tick);
+    });
+
+    arret.store(true, Ordering::Relaxed);
+    let _ = recepteur.join();
+    let _ = emetteur.join();
+    let _ = audio.join();
+    resultat.map(|_rapport| ())
+}
+
+/// Reporte un instantané [`HostStreamTick`] dans les compteurs de session.
+fn maj_compteurs_flux(
+    compteurs: &CompteursSession,
+    enregistrees_avant: u64,
+    tick: &HostStreamTick,
+) {
+    compteurs
+        .debit_cible_kbps
+        .store(u64::from(tick.target_bitrate_kbps), Ordering::Relaxed);
+    compteurs
+        .palier_abr
+        .store(u64::from(tick.abr_level), Ordering::Relaxed);
+    compteurs
+        .frames_enregistrees
+        .store(enregistrees_avant + tick.frames_recorded, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1759,5 +2689,94 @@ mod tests {
 
         let _ = hote.join().expect("thread hôte");
         poignee.stop();
+    }
+
+    /// Reconnexion **au niveau transport** ([`ReconnectingTransport`]) pour un
+    /// contrôleur en [`SessionEndpoint::Direct`] : un hôte manuel sert deux
+    /// connexions successives (il coupe entre les deux) ; le transport de session
+    /// se rétablit **de façon transparente** (re-connexion + re-négociation
+    /// Noise) et le flux reprend. Preuve : plus de frames décodées que la
+    /// première connexion n'en a envoyées.
+    #[test]
+    fn controleur_direct_se_reconnecte_au_niveau_transport() {
+        let ecouteur = bind("127.0.0.1:0".parse().expect("adresse")).expect("bind");
+        let addr = ecouteur.local_addr();
+        let cert = ecouteur.server_cert_der();
+
+        // 1re connexion : 10 frames puis coupure ; 2e connexion : 30 frames.
+        let hote = thread::spawn(move || -> Result<()> {
+            for (epoque, total) in [(0usize, 10usize), (1, 30)] {
+                let _ = epoque;
+                let brut = ecouteur.accept()?;
+                let cles = generate_static_keypair()?;
+                let mut chiffre = establish(brut, HandshakeRole::Responder, &cles.private)?;
+                let canal = chiffre.open_channel(ChannelKind::Video(MonitorId(0)));
+                let mut encodeur = create_encoder(CodecKind::H264)?;
+                encodeur.configure(EncoderConfig {
+                    kind: CodecKind::H264,
+                    width: 64,
+                    height: 64,
+                    target_bitrate_kbps: 1_000,
+                    max_fps: 60,
+                })?;
+                let mut seq = 0usize;
+                let echeance = Instant::now() + Duration::from_secs(10);
+                while seq < total && Instant::now() < echeance {
+                    let chunk = encodeur.encode(&frame_synthetique(seq), seq.is_multiple_of(20))?;
+                    if chiffre
+                        .send(canal, chunk.data, Reliability::UnreliableFec)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    seq += 1;
+                    thread::sleep(Duration::from_millis(12));
+                }
+                // Chute du transport → coupure vue par le contrôleur (reconnexion).
+                drop(chiffre);
+            }
+            Ok(())
+        });
+
+        let options = SessionOptions {
+            transport_reconnect: true,
+            reconnect: ReconnectPolicy {
+                base_delay_ms: 50,
+                max_delay_ms: 200,
+                multiplier: 1.0,
+                max_attempts: Some(100),
+                jitter: false,
+            },
+            ..SessionOptions::default()
+        };
+        let poignee = SessionEngine::start_with_options(
+            config(SessionRole::Controller, Some(NovaId(202_020_202))),
+            SessionEndpoint::Direct {
+                addr,
+                cert_der: cert,
+            },
+            options,
+        )
+        .expect("start");
+
+        let etats = attendre_etat(&poignee, SessionState::Active, Duration::from_secs(15));
+        assert_eq!(
+            etats.last(),
+            Some(&SessionState::Active),
+            "erreur moteur : {:?}",
+            poignee.last_error()
+        );
+
+        // La 1re connexion n'envoie que 10 frames : dépasser ce total prouve que
+        // le flux a repris sur la 2e connexion (reconnexion transport réussie).
+        let total = attendre_frames(&poignee, 12, Duration::from_secs(25));
+        assert!(
+            total >= 12,
+            "frames sur deux connexions = {total} (erreur : {:?})",
+            poignee.last_error()
+        );
+
+        poignee.stop();
+        let _ = hote.join().expect("thread hôte");
     }
 }

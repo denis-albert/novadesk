@@ -168,6 +168,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Souris accordée, clavier refusé : preuve du filtre d'injection.
             permissions: Some(permissions_hote),
             recording: Some(chemin_mp4.clone()),
+            // Delta est **actif par défaut** (voir `SessionOptions::delta_mode`)
+            // depuis que la capture renseigne fidèlement `dirty` ; cette sonde
+            // veut un décompte d'images **continu et déterministe** (flux réel,
+            // ABR, enregistrement), donc elle le désactive explicitement — sur un
+            // écran statique, delta transformerait les images en répétitions.
+            delta_mode: false,
             ..SessionOptions::default()
         },
     )?;
