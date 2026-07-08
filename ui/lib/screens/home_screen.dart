@@ -19,6 +19,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../app_routes.dart';
 import '../bridge/native_api.dart';
 import '../state/providers.dart';
+import '../theme/motion.dart';
 import '../theme/nova_theme.dart';
 import '../widgets/app_frame.dart';
 import '../widgets/nova_icons.dart';
@@ -219,7 +220,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Future<void> _renommer(EntreeCarnet entree) async {
     final controller = TextEditingController(text: entree.alias);
-    final nouvelAlias = await showDialog<String>(
+    final nouvelAlias = await montrerDialogueNova<String>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Renommer'),
@@ -256,18 +257,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: NovaAppFrame(
-        vue: NovaVue.accueil,
-        corps: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _entete(),
-            _barreOnglets(),
-            Expanded(child: _liste()),
-          ],
-        ),
-      ),
+    // Corps seul : l'habillage (barre de titre, rail, barre d'état) est fourni
+    // une seule fois par la coquille persistante (NovaCoquille).
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _entete(),
+        _barreOnglets(),
+        Expanded(child: _liste()),
+      ],
     );
   }
 
@@ -457,7 +455,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             }),
             _lien(t, NovaIcones.inviter, 'Inviter', _montrerInvitation),
             _lien(t, NovaIcones.cadenas, 'Accès non surveillé',
-                () => naviguerVersVue(context, NovaRoutes.nonSurveille)),
+                () => naviguerVersVue(ref, context, NovaVue.nonSurveille)),
           ],
         ),
       ],
@@ -576,7 +574,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // --- Modale d'invitation --------------------------------------------------
 
   void _montrerInvitation() {
-    showDialog<void>(context: context, builder: (context) => const _InviteDialog());
+    montrerDialogueNova<void>(
+        context: context, builder: (context) => const _InviteDialog());
   }
 }
 

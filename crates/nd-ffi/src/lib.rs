@@ -54,6 +54,21 @@
 //! `SessionOptionsDto` (enrichi : `extended_features`, `transfer_dir`,
 //! `transport_reconnect`), `IncomingRequestDto`, `ListenInfoDto`,
 //! `ChatMessageDto` (nouveau), `TransferEventDto` (nouveau).
+//!
+//! **Lot « état persistant » (nouvelles)** — état applicatif réel et durable
+//! (module privé [`etat`], stockage JSON atomique) : `local_identity`,
+//! `generate_ephemeral_password`, `list_contacts`, `add_contact`,
+//! `update_contact`, `remove_contact`, `set_favorite`, `list_groups`,
+//! `add_group`, `get_settings`, `get_setting`, `set_setting`, `record_session`,
+//! `recent_sessions`, `list_recordings`, `unattended_config`,
+//! `set_unattended_password`, `verify_unattended_password`, `add_trusted_device`,
+//! `remove_trusted_device`, `record_access`, `access_log`. DTO :
+//! `LocalIdentityDto`, `AddressBookEntryDto`, `SettingDto`, `RecentSessionDto`,
+//! `RecordingDto`, `UnattendedConfigDto`, `AccessLogEntryDto`. Toutes ces
+//! fonctions sont **synchrones** (aucun `StreamSink`) : elles n'exigent aucun
+//! `impl SseEncode` écrit à la main, donc **aucun `pont_provisoire4.rs` n'est
+//! nécessaire** pour ce lot (le codegen produira leurs `SseEncode`/`SseDecode`
+//! à la régénération, à l'identique).
 
 // Binding généré par `flutter_rust_bridge_codegen generate` (config dans
 // `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit
@@ -67,6 +82,12 @@ pub mod api;
 /// statiques + threads de drainage + file d'approbation). Hors du périmètre
 /// scanné par le codegen (`rust_input: crate::api`).
 mod flux;
+
+/// État applicatif **persistant** (identité locale, carnet d'adresses, réglages,
+/// historique, enregistrements, accès non surveillé) : stockage JSON atomique
+/// sous le répertoire de données de l'application. Hors du périmètre scanné par
+/// le codegen ; la façade [`api`] l'enveloppe en fonctions plates.
+mod etat;
 
 pub use api::*;
 

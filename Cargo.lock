@@ -1880,14 +1880,19 @@ dependencies = [
 name = "nd-ffi"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "flutter_rust_bridge",
  "nd-audio",
  "nd-codec",
  "nd-core",
+ "nd-crypto",
  "nd-features",
  "nd-files",
  "nd-proto",
  "nd-transport",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

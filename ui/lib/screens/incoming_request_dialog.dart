@@ -11,6 +11,7 @@ library;
 
 import 'package:flutter/material.dart';
 
+import '../theme/motion.dart';
 import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_kit.dart';
@@ -53,7 +54,7 @@ class IncomingRequestDialog extends StatefulWidget {
     String idFormate = '555 240 173',
     String empreinte = '3F·A9·7C·22·E1·08',
   }) {
-    return showDialog<ReponseEntrante>(
+    return montrerDialogueNova<ReponseEntrante>(
       context: context,
       builder: (context) => IncomingRequestDialog(
         alias: alias,

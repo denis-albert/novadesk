@@ -17,7 +17,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../app_routes.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
-import '../widgets/app_frame.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_kit.dart';
 
@@ -180,17 +179,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
     final onglet = _onglets[_ongletActif];
-    return Scaffold(
-      body: NovaAppFrame(
-        vue: NovaVue.reglages,
-        corps: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _railOnglets(t),
-            Expanded(child: _panneau(t, onglet)),
-          ],
-        ),
-      ),
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _railOnglets(t),
+        Expanded(child: _panneau(t, onglet)),
+      ],
     );
   }
 

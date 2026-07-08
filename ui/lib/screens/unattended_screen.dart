@@ -17,8 +17,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../app_routes.dart';
 import '../bridge/native_api.dart';
 import '../state/providers.dart';
+import '../theme/motion.dart';
 import '../theme/nova_theme.dart';
-import '../widgets/app_frame.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_id_field.dart';
 import '../widgets/nova_kit.dart';
@@ -273,7 +273,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     final aliasController = TextEditingController();
     final api = ref.read(nativeApiProvider);
 
-    final valide = await showDialog<bool>(
+    final valide = await montrerDialogueNova<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Ajouter un appareil de confiance'),
@@ -326,7 +326,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   }
 
   Future<void> _gererAppareils() async {
-    await showDialog<void>(
+    await montrerDialogueNova<void>(
       context: context,
       builder: (context) {
         final t = NovaTokens.of(context);
@@ -401,7 +401,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   }
 
   void _voirJournal() {
-    showDialog<void>(
+    montrerDialogueNova<void>(
       context: context,
       builder: (context) {
         final t = NovaTokens.of(context);
@@ -453,54 +453,48 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return Scaffold(
-      body: NovaAppFrame(
-        vue: NovaVue.nonSurveille,
-        corps: ListView(
-          padding: const EdgeInsets.fromLTRB(26, 22, 26, 22),
-          children: [
-            Text('Accès non surveillé',
-                style: TextStyle(
-                    fontSize: 16, fontWeight: FontWeight.w600, color: t.texte)),
-            const SizedBox(height: 3),
-            Text(
-              'Autorisez la connexion à ce poste sans validation manuelle.',
-              style: TextStyle(fontSize: 12, color: t.texte3),
-            ),
-            const SizedBox(height: 16),
-            _ligne(
-              t,
-              titre: "Activer l'accès non surveillé",
-              sousTitre: 'Ce poste peut être contrôlé à distance avec le mot de '
-                  'passe ci-dessous.',
-              controle: NovaSwitch(
-                actif: _actif,
-                onChanged:
-                    _bascule ? null : (v) => unawaited(_basculerHote(v)),
-              ),
-            ),
-            _lignePassword(t),
-            _ligneProfils(t),
-            _ligne(
-              t,
-              titre: 'Appareils de confiance',
-              sousTitre:
-                  '${_appareils.map((a) => a.alias).join(' · ')} — connexion '
-                  'sans mot de passe.',
-              controle: NovaBoutonSecondaire(
-                  libelle: 'Gérer', onPressed: () => unawaited(_gererAppareils())),
-            ),
-            _ligne(
-              t,
-              titre: 'Journal des accès',
-              sousTitre: _sousTitreJournal(),
-              controle: NovaBoutonSecondaire(
-                  libelle: 'Voir le journal', onPressed: _voirJournal),
-              dernier: true,
-            ),
-          ],
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(26, 22, 26, 22),
+      children: [
+        Text('Accès non surveillé',
+            style: TextStyle(
+                fontSize: 16, fontWeight: FontWeight.w600, color: t.texte)),
+        const SizedBox(height: 3),
+        Text(
+          'Autorisez la connexion à ce poste sans validation manuelle.',
+          style: TextStyle(fontSize: 12, color: t.texte3),
         ),
-      ),
+        const SizedBox(height: 16),
+        _ligne(
+          t,
+          titre: "Activer l'accès non surveillé",
+          sousTitre: 'Ce poste peut être contrôlé à distance avec le mot de '
+              'passe ci-dessous.',
+          controle: NovaSwitch(
+            actif: _actif,
+            onChanged: _bascule ? null : (v) => unawaited(_basculerHote(v)),
+          ),
+        ),
+        _lignePassword(t),
+        _ligneProfils(t),
+        _ligne(
+          t,
+          titre: 'Appareils de confiance',
+          sousTitre:
+              '${_appareils.map((a) => a.alias).join(' · ')} — connexion '
+              'sans mot de passe.',
+          controle: NovaBoutonSecondaire(
+              libelle: 'Gérer', onPressed: () => unawaited(_gererAppareils())),
+        ),
+        _ligne(
+          t,
+          titre: 'Journal des accès',
+          sousTitre: _sousTitreJournal(),
+          controle: NovaBoutonSecondaire(
+              libelle: 'Voir le journal', onPressed: _voirJournal),
+          dernier: true,
+        ),
+      ],
     );
   }
 

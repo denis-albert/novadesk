@@ -29,6 +29,7 @@ use nd_core::{
 use nd_features::{PermissionSet, Permissions};
 use nd_files::TransferEvent;
 use nd_proto::{InputEvent, NovaId};
+use serde::{Deserialize, Serialize};
 
 use crate::frb_generated::StreamSink;
 
@@ -957,4 +958,271 @@ pub fn unattended_stats(host_id: u64) -> Result<SessionStatsDto, String> {
 /// service (au plus ~5 s). L'identifiant devient invalide.
 pub fn stop_unattended_host(host_id: u64) -> Result<(), String> {
     crate::flux::arreter_hote_non_surveille(host_id)
+}
+
+// ===========================================================================
+// État applicatif persistant (identité, carnet, réglages, historique,
+// enregistrements, accès non surveillé)
+// ===========================================================================
+//
+// Ces fonctions remplacent les données fictives de l'UI par un état **réel et
+// durable** (voir [`crate::etat`] pour le stockage : JSON atomique sous le
+// répertoire de données de l'application, `%APPDATA%\NovaDesk` sous Windows).
+// Toutes sont **synchrones** et faillibles (`Result<_, String>`, message
+// français affichable) : aucune ne pousse de flux, donc aucun nouvel encodeur
+// de pont (`SseEncode`) n'est requis.
+
+// ---------------------------------------------------------------------------
+// 1. Identité locale
+// ---------------------------------------------------------------------------
+
+/// Identité locale de l'appareil, prête à afficher (écran d'accueil « votre ID »).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalIdentityDto {
+    /// `NovaId` brut à 9 chiffres, stable et persistant.
+    pub id: u64,
+    /// ID au format groupé (« 123 456 789 »), prêt à afficher.
+    pub id_formate: String,
+    /// Empreinte hexadécimale (BLAKE2s, 64 caractères) de la clé publique
+    /// statique — sert à la vérification d'identité (TOFU).
+    pub empreinte: String,
+}
+
+/// Renvoie l'identité locale, en la **créant et persistant** au premier appel
+/// (paire de clés statiques via `nd_crypto::IdentityStore` + `NovaId` dérivé et
+/// stocké). Les appels suivants rechargent exactement les mêmes valeurs.
+pub fn local_identity() -> Result<LocalIdentityDto, String> {
+    crate::etat::magasin().identite_locale()
+}
+
+/// Génère un mot de passe éphémère **lisible** (session ponctuelle) : 10
+/// caractères d'un alphabet sans symboles ambigus. Non persisté.
+#[must_use]
+pub fn generate_ephemeral_password() -> String {
+    crate::etat::generer_mot_de_passe_ephemere()
+}
+
+// ---------------------------------------------------------------------------
+// 2. Carnet d'adresses persistant
+// ---------------------------------------------------------------------------
+
+/// Entrée du carnet d'adresses (contact enregistré).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressBookEntryDto {
+    /// `NovaId` du contact.
+    pub id: u64,
+    /// Nom lisible donné au contact.
+    pub alias: String,
+    /// Groupe de rangement (chaîne vide = non groupé).
+    #[serde(default)]
+    pub groupe: String,
+    /// Étiquettes libres associées au contact.
+    #[serde(default)]
+    pub etiquettes: Vec<String>,
+    /// Contact marqué comme favori.
+    #[serde(default)]
+    pub favori: bool,
+    /// Horodatage Unix (secondes) de la dernière connexion, si connue.
+    #[serde(default)]
+    pub derniere_connexion: Option<i64>,
+}
+
+/// Liste tous les contacts du carnet.
+pub fn list_contacts() -> Result<Vec<AddressBookEntryDto>, String> {
+    crate::etat::magasin().lister_contacts()
+}
+
+/// Ajoute un contact et renvoie l'entrée créée. Erreur si l'`id` existe déjà.
+/// Un `groupe` non vide est automatiquement ajouté à la liste des groupes.
+pub fn add_contact(
+    alias: String,
+    id: u64,
+    groupe: String,
+    etiquettes: Vec<String>,
+) -> Result<AddressBookEntryDto, String> {
+    crate::etat::magasin().ajouter_contact(alias, id, groupe, etiquettes)
+}
+
+/// Met à jour l'alias, le groupe et les étiquettes d'un contact existant.
+/// Le favori et la dernière connexion ne sont pas touchés (voir
+/// [`set_favorite`] et [`record_session`]). Erreur si l'`id` est inconnu.
+pub fn update_contact(
+    id: u64,
+    alias: String,
+    groupe: String,
+    etiquettes: Vec<String>,
+) -> Result<(), String> {
+    crate::etat::magasin().modifier_contact(id, alias, groupe, etiquettes)
+}
+
+/// Retire un contact du carnet. Erreur si l'`id` est inconnu.
+pub fn remove_contact(id: u64) -> Result<(), String> {
+    crate::etat::magasin().supprimer_contact(id)
+}
+
+/// Marque (ou démarque) un contact comme favori. Erreur si l'`id` est inconnu.
+pub fn set_favorite(id: u64, favori: bool) -> Result<(), String> {
+    crate::etat::magasin().definir_favori(id, favori)
+}
+
+/// Liste les groupes déclarés du carnet.
+pub fn list_groups() -> Result<Vec<String>, String> {
+    crate::etat::magasin().lister_groupes()
+}
+
+/// Ajoute un groupe (éventuellement vide de contacts). Erreur si le nom est
+/// vide ou déjà présent.
+pub fn add_group(nom: String) -> Result<(), String> {
+    crate::etat::magasin().ajouter_groupe(nom)
+}
+
+// ---------------------------------------------------------------------------
+// 3. Réglages persistants
+// ---------------------------------------------------------------------------
+
+/// Réglage clé/valeur (les deux en texte : l'UI interprète selon la clé).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingDto {
+    /// Clé du réglage (ex. `theme`, `langue`, `dossier_enregistrement`,
+    /// `serveur_rendezvous`, `serveur_relais`, `serveurs_stun`,
+    /// `prereglage_qualite`, `demarrer_avec_systeme`).
+    pub cle: String,
+    /// Valeur textuelle courante (surcharge persistée ou défaut).
+    pub valeur: String,
+}
+
+/// Renvoie tous les réglages effectifs (défauts raisonnables fusionnés avec les
+/// surcharges persistées), triés par clé.
+pub fn get_settings() -> Result<Vec<SettingDto>, String> {
+    crate::etat::magasin().get_reglages()
+}
+
+/// Valeur effective d'un réglage (`None` si la clé est inconnue). Pratique pour
+/// lire une clé isolée sans parcourir [`get_settings`].
+pub fn get_setting(cle: String) -> Result<Option<String>, String> {
+    crate::etat::magasin().reglage(&cle)
+}
+
+/// Définit (persiste) la valeur d'un réglage. Erreur si la clé est vide.
+pub fn set_setting(cle: String, valeur: String) -> Result<(), String> {
+    crate::etat::magasin().definir_reglage(cle, valeur)
+}
+
+// ---------------------------------------------------------------------------
+// 4. Historique de sessions
+// ---------------------------------------------------------------------------
+
+/// Une session récente (historique borné, le plus récent en tête).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentSessionDto {
+    /// `NovaId` du pair joint.
+    pub id: u64,
+    /// Alias affiché au moment de la session.
+    pub alias: String,
+    /// Horodatage Unix (secondes) du démarrage de la session.
+    pub timestamp: i64,
+}
+
+/// Journalise le démarrage d'une session (à appeler au moment de se connecter) :
+/// ajoute/rafraîchit l'entrée en tête de l'historique (dédupliquée par `id`,
+/// bornée) et met à jour la dernière connexion du contact correspondant.
+pub fn record_session(id: u64, alias: String) -> Result<(), String> {
+    crate::etat::magasin().enregistrer_session(id, alias)
+}
+
+/// Renvoie les sessions récentes, de la plus récente à la plus ancienne.
+pub fn recent_sessions() -> Result<Vec<RecentSessionDto>, String> {
+    crate::etat::magasin().sessions_recentes()
+}
+
+// ---------------------------------------------------------------------------
+// 5. Enregistrements
+// ---------------------------------------------------------------------------
+
+/// Description d'un fichier d'enregistrement présent sur le disque.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingDto {
+    /// Chemin absolu du fichier.
+    pub chemin: String,
+    /// Nom de fichier seul.
+    pub nom: String,
+    /// Date de modification du fichier (horodatage Unix, secondes).
+    pub date: i64,
+    /// Durée en secondes (lue via `nd_features::Mp4Reader` pour un `.mp4` ;
+    /// `0.0` si inconnue).
+    pub duree_s: f64,
+    /// Taille du fichier en octets.
+    pub taille_octets: u64,
+}
+
+/// Liste les enregistrements (`.mp4`/`.ndr`) d'un dossier — `dir` s'il est
+/// fourni, sinon le réglage `dossier_enregistrement`, sinon
+/// `<répertoire de données>/enregistrements`. Un dossier absent renvoie une
+/// liste vide. Les fichiers sont triés du plus récent au plus ancien.
+pub fn list_recordings(dir: Option<String>) -> Result<Vec<RecordingDto>, String> {
+    crate::etat::magasin().lister_enregistrements(dir)
+}
+
+// ---------------------------------------------------------------------------
+// 6. Accès non surveillé persistant
+// ---------------------------------------------------------------------------
+
+/// Configuration d'accès non surveillé, sans jamais exposer le secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattendedConfigDto {
+    /// Un mot de passe permanent est configuré (seul un hachage salé est stocké).
+    pub a_mot_de_passe: bool,
+    /// `NovaId` des appareils de confiance.
+    pub appareils_de_confiance: Vec<u64>,
+}
+
+/// Une entrée du journal des accès non surveillés.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessLogEntryDto {
+    /// `NovaId` brut de l'appelant.
+    pub peer_id: u64,
+    /// ID de l'appelant au format groupé, prêt à afficher.
+    pub peer_id_formate: String,
+    /// Horodatage Unix (secondes) de l'accès.
+    pub timestamp: i64,
+    /// Vrai si l'accès a été accepté, faux s'il a été refusé.
+    pub accepte: bool,
+}
+
+/// Renvoie la configuration d'accès non surveillé.
+pub fn unattended_config() -> Result<UnattendedConfigDto, String> {
+    crate::etat::magasin().config_non_surveille()
+}
+
+/// Définit le mot de passe permanent d'accès non surveillé (stocké **haché et
+/// salé**, jamais en clair). Un mot de passe vide efface la configuration.
+pub fn set_unattended_password(pwd: String) -> Result<(), String> {
+    crate::etat::magasin().definir_mot_de_passe_non_surveille(pwd)
+}
+
+/// Vérifie un mot de passe candidat contre le hachage stocké (`false` si aucun
+/// mot de passe n'est configuré).
+pub fn verify_unattended_password(pwd: String) -> Result<bool, String> {
+    crate::etat::magasin().verifier_mot_de_passe_non_surveille(pwd)
+}
+
+/// Ajoute un appareil à la liste de confiance (sans effet s'il y figure déjà).
+pub fn add_trusted_device(id: u64) -> Result<(), String> {
+    crate::etat::magasin().ajouter_appareil_confiance(id)
+}
+
+/// Retire un appareil de la liste de confiance. Erreur s'il n'y figure pas.
+pub fn remove_trusted_device(id: u64) -> Result<(), String> {
+    crate::etat::magasin().retirer_appareil_confiance(id)
+}
+
+/// Ajoute une entrée au journal des accès (append) : à appeler quand une
+/// demande d'accès non surveillé est tranchée.
+pub fn record_access(peer_id: u64, accepte: bool) -> Result<(), String> {
+    crate::etat::magasin().enregistrer_acces(peer_id, accepte)
+}
+
+/// Renvoie le journal des accès, du plus récent au plus ancien.
+pub fn access_log() -> Result<Vec<AccessLogEntryDto>, String> {
+    crate::etat::magasin().journal_acces()
 }

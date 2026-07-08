@@ -20,7 +20,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../app_routes.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
-import '../widgets/app_frame.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_kit.dart';
 
@@ -244,17 +243,12 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
     // (jamais dans un `itemBuilder` paresseux de ListView).
     final lignes = [for (final e in filtrees) (e, _adresse(e))];
 
-    return Scaffold(
-      body: NovaAppFrame(
-        vue: NovaVue.carnet,
-        corps: Row(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            _railGroupes(t, groupes),
-            Expanded(child: _panneauPrincipal(t, lignes, filtrees.isEmpty)),
-          ],
-        ),
-      ),
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _railGroupes(t, groupes),
+        Expanded(child: _panneauPrincipal(t, lignes, filtrees.isEmpty)),
+      ],
     );
   }
 

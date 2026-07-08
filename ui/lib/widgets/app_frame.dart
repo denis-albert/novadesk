@@ -13,7 +13,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../app_routes.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
 import 'nova_icons.dart';
@@ -74,29 +73,38 @@ class NovaAppFrame extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Navigation partagée : pile ≤ 2 (accueil = base, une vue au-dessus au plus).
+// Navigation partagée : coquille persistante (une seule route de base). Les
+// cinq sections vivent dans un IndexedStack piloté par [sectionCouranteProvider]
+// (voir NovaCoquille dans main.dart) ; la session est la seule vraie route,
+// ouverte au-dessus de la coquille.
 // ---------------------------------------------------------------------------
 
-void naviguerVersVue(BuildContext context, String route) {
-  final nav = Navigator.of(context);
-  nav.popUntil((r) => r.isFirst);
-  if (route != NovaRoutes.accueil) {
-    nav.pushNamed(route);
-  }
+/// Section active de la coquille (met en évidence le rail et l'onglet, et pilote
+/// l'IndexedStack de contenu). La session n'est pas une section : c'est une
+/// route empilée au-dessus de la coquille.
+final sectionCouranteProvider =
+    StateProvider<NovaVue>((ref) => NovaVue.accueil);
+
+/// Bascule la coquille vers [vue]. Referme d'abord toute route ouverte au-dessus
+/// (fenêtre de session…), puis change la section : **aucun push de page**, le
+/// contenu change en place via l'IndexedStack animé de la coquille.
+void naviguerVersVue(WidgetRef ref, BuildContext context, NovaVue vue) {
+  Navigator.of(context).popUntil((route) => route.isFirst);
+  ref.read(sectionCouranteProvider.notifier).state = vue;
 }
 
 // ---------------------------------------------------------------------------
 // Barre de titre + onglets
 // ---------------------------------------------------------------------------
 
-class _BarreTitre extends StatelessWidget {
+class _BarreTitre extends ConsumerWidget {
   const _BarreTitre({required this.vue, this.libelleSession});
 
   final NovaVue vue;
   final String? libelleSession;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final t = NovaTokens.of(context);
     final enSession = vue == NovaVue.session;
     return Container(
@@ -120,7 +128,7 @@ class _BarreTitre extends StatelessWidget {
             libelle: 'Accueil',
             icone: NovaIcones.accueil,
             actif: !enSession,
-            onTap: () => naviguerVersVue(context, NovaRoutes.accueil),
+            onTap: () => naviguerVersVue(ref, context, NovaVue.accueil),
           ),
           if (libelleSession != null)
             _OngletSession(
@@ -464,13 +472,13 @@ class _BoutonFenetreState extends State<_BoutonFenetre> {
 // Rail de navigation
 // ---------------------------------------------------------------------------
 
-class _RailNavigation extends StatelessWidget {
+class _RailNavigation extends ConsumerWidget {
   const _RailNavigation({required this.vue});
 
   final NovaVue vue;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final t = NovaTokens.of(context);
     return Container(
       width: 50,
@@ -485,32 +493,32 @@ class _RailNavigation extends StatelessWidget {
             icone: NovaIcones.accueil,
             infobulle: 'Accueil',
             actif: vue == NovaVue.accueil,
-            onTap: () => naviguerVersVue(context, NovaRoutes.accueil),
+            onTap: () => naviguerVersVue(ref, context, NovaVue.accueil),
           ),
           _RailItem(
             icone: NovaIcones.carnet,
             infobulle: 'Carnet',
             actif: vue == NovaVue.carnet,
-            onTap: () => naviguerVersVue(context, NovaRoutes.carnet),
+            onTap: () => naviguerVersVue(ref, context, NovaVue.carnet),
           ),
           _RailItem(
             icone: NovaIcones.enregistrements,
             infobulle: 'Enregistrements',
             actif: vue == NovaVue.enregistrements,
-            onTap: () => naviguerVersVue(context, NovaRoutes.enregistrements),
+            onTap: () => naviguerVersVue(ref, context, NovaVue.enregistrements),
           ),
           _RailItem(
             icone: NovaIcones.cadenas,
             infobulle: 'Accès non surveillé',
             actif: vue == NovaVue.nonSurveille,
-            onTap: () => naviguerVersVue(context, NovaRoutes.nonSurveille),
+            onTap: () => naviguerVersVue(ref, context, NovaVue.nonSurveille),
           ),
           const Spacer(),
           _RailItem(
             icone: NovaIcones.reglages,
             infobulle: 'Réglages',
             actif: vue == NovaVue.reglages,
-            onTap: () => naviguerVersVue(context, NovaRoutes.reglages),
+            onTap: () => naviguerVersVue(ref, context, NovaVue.reglages),
           ),
         ],
       ),

@@ -29,7 +29,9 @@ import 'screens/session_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/unattended_screen.dart';
 import 'state/providers.dart';
+import 'theme/motion.dart';
 import 'theme/nova_theme.dart';
+import 'widgets/app_frame.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -117,28 +119,177 @@ class NovaDeskApp extends ConsumerWidget {
     );
   }
 
-  Route<dynamic>? _genererRoute(RouteSettings parametres) {
-    switch (parametres.name) {
-      case NovaRoutes.accueil:
-        return MaterialPageRoute(builder: (_) => const HomeScreen());
-      case NovaRoutes.carnet:
-        return MaterialPageRoute(builder: (_) => const AddressBookScreen());
-      case NovaRoutes.enregistrements:
-        return MaterialPageRoute(builder: (_) => const RecordingsScreen());
-      case NovaRoutes.nonSurveille:
-        return MaterialPageRoute(builder: (_) => const UnattendedScreen());
-      case NovaRoutes.reglages:
-        return MaterialPageRoute(builder: (_) => const SettingsScreen());
-      case NovaRoutes.session:
-        final arguments = parametres.arguments;
-        if (arguments is! SessionScreenArgs) {
-          // Une session ne s'ouvre jamais sans configuration validée.
-          return MaterialPageRoute(builder: (_) => const HomeScreen());
-        }
-        return MaterialPageRoute(
-          builder: (_) => SessionScreen(args: arguments),
-        );
+  Route<dynamic> _genererRoute(RouteSettings parametres) {
+    if (parametres.name == NovaRoutes.session) {
+      final arguments = parametres.arguments;
+      if (arguments is! SessionScreenArgs) {
+        // Une session ne s'ouvre jamais sans configuration validée : on
+        // retombe proprement sur la coquille.
+        return _routeCoquille(parametres);
+      }
+      // Ouverture de la session : fondu + léger zoom (retour symétrique).
+      return PageRouteBuilder<void>(
+        settings: parametres,
+        transitionDuration: NovaMotion.session,
+        reverseTransitionDuration: NovaMotion.session,
+        pageBuilder: (context, animation, secondaryAnimation) =>
+            SessionScreen(args: arguments),
+        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+          if (NovaMotion.animationsReduites(context)) return child;
+          final courbe = CurvedAnimation(
+            parent: animation,
+            curve: NovaMotion.sessionCourbe,
+            reverseCurve: NovaMotion.sessionCourbe.flipped,
+          );
+          return FadeTransition(
+            opacity: courbe,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: NovaMotion.sessionZoomInitial, end: 1)
+                  .animate(courbe),
+              child: child,
+            ),
+          );
+        },
+      );
     }
-    return null;
+    // Accueil (et repli de sécurité pour toute autre route nommée) : la coquille
+    // persistante gère les cinq sections en interne, sans transition de page.
+    return _routeCoquille(parametres);
+  }
+
+  /// Route de base : la coquille persistante, sans transition propre (l'animation
+  /// des sections vit dans la coquille elle-même).
+  Route<dynamic> _routeCoquille(RouteSettings parametres) {
+    return PageRouteBuilder<void>(
+      settings: parametres,
+      transitionDuration: Duration.zero,
+      reverseTransitionDuration: Duration.zero,
+      pageBuilder: (context, animation, secondaryAnimation) =>
+          const NovaCoquille(),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Coquille persistante : barre de titre + rail + barre d'état conservés ; seul
+// le contenu des cinq sections change (IndexedStack animé d'un fondu doux).
+// ---------------------------------------------------------------------------
+
+/// Habillage racine des sections principales. Le rail et l'onglet « Accueil »
+/// n'empilent plus de routes : ils modifient [sectionCouranteProvider], et le
+/// contenu bascule en place via [_ContenuSections].
+class NovaCoquille extends ConsumerWidget {
+  const NovaCoquille({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final vue = ref.watch(sectionCouranteProvider);
+    return Scaffold(
+      body: NovaAppFrame(
+        vue: vue,
+        corps: _ContenuSections(index: _indexSection(vue)),
+      ),
+    );
+  }
+}
+
+/// Index de section dans l'IndexedStack (l'ordre suit le rail).
+int _indexSection(NovaVue vue) => switch (vue) {
+      NovaVue.accueil => 0,
+      NovaVue.carnet => 1,
+      NovaVue.enregistrements => 2,
+      NovaVue.nonSurveille => 3,
+      NovaVue.reglages => 4,
+      NovaVue.session => 0,
+    };
+
+/// Écran de la section [index].
+Widget _sectionPour(int index) => switch (index) {
+      0 => const HomeScreen(),
+      1 => const AddressBookScreen(),
+      2 => const RecordingsScreen(),
+      3 => const UnattendedScreen(),
+      _ => const SettingsScreen(),
+    };
+
+/// Contenu des sections : un [IndexedStack] **persistant** (chaque section
+/// conserve son état — défilement, saisies, squelette de chargement joué une
+/// seule fois) que l'on **rejoue** en fondu + léger glissement à chaque
+/// changement d'index.
+///
+/// Choix délibéré d'un contrôleur explicite plutôt qu'un `AnimatedSwitcher`
+/// classique : en changeant la clé de l'IndexedStack, ce dernier recréerait tout
+/// le sous-arbre à chaque bascule et **réinitialiserait** l'état des sections
+/// (défilements perdus, squelette rejoué). Ici l'IndexedStack reste unique — les
+/// états sont donc préservés — et seule la fine couche fondu/glissement est
+/// réanimée : un « fade-through » sobre, adapté aux destinations de rail.
+///
+/// Les sections sont construites **paresseusement** (une section jamais visitée
+/// ne coûte rien) puis conservées. Le réglage « animations réduites » supprime
+/// la transition.
+class _ContenuSections extends StatefulWidget {
+  const _ContenuSections({required this.index});
+
+  final int index;
+
+  @override
+  State<_ContenuSections> createState() => _ContenuSectionsState();
+}
+
+class _ContenuSectionsState extends State<_ContenuSections>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controleur = AnimationController(
+    vsync: this,
+    duration: NovaMotion.sections,
+    value: 1,
+  );
+  late final CurvedAnimation _courbe =
+      CurvedAnimation(parent: _controleur, curve: NovaMotion.sectionsCourbe);
+
+  /// Sections déjà visitées : construites une fois, puis maintenues en vie.
+  late final Set<int> _construites = {widget.index};
+
+  @override
+  void didUpdateWidget(covariant _ContenuSections ancien) {
+    super.didUpdateWidget(ancien);
+    if (ancien.index != widget.index) {
+      _construites.add(widget.index);
+      if (NovaMotion.animationsReduites(context)) {
+        _controleur.value = 1;
+      } else {
+        _controleur.forward(from: 0);
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _courbe.dispose();
+    _controleur.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _courbe,
+      child: AnimatedBuilder(
+        animation: _courbe,
+        builder: (context, child) => Transform.translate(
+          offset: Offset(0, (1 - _courbe.value) * NovaMotion.sectionsDecalage),
+          child: child,
+        ),
+        child: IndexedStack(
+          index: widget.index,
+          sizing: StackFit.expand,
+          children: [
+            for (var i = 0; i < 5; i++)
+              _construites.contains(i)
+                  ? _sectionPour(i)
+                  : const SizedBox.shrink(),
+          ],
+        ),
+      ),
+    );
   }
 }

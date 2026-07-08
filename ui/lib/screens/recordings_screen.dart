@@ -17,7 +17,6 @@ import 'package:flutter/material.dart';
 
 import '../app_routes.dart';
 import '../theme/nova_theme.dart';
-import '../widgets/app_frame.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_kit.dart';
 
@@ -103,15 +102,12 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return NovaAppFrame(
-      vue: NovaVue.enregistrements,
-      corps: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _construireListe(t),
-          Expanded(child: _construireScene(t)),
-        ],
-      ),
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _construireListe(t),
+        Expanded(child: _construireScene(t)),
+      ],
     );
   }
 

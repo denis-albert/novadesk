@@ -25,10 +25,24 @@ nd-audio = { workspace = true }
 # Session média étendue : `TransferEvent` (canal `Files`) et `ClipboardSync`
 # (presse-papiers injecté dans `SessionMedia`) viennent de nd-files.
 nd-files = { workspace = true }
+# État applicatif persistant (lot « état réel ») : identité locale stable via
+# `nd_crypto::IdentityStore::load_or_create` + empreinte `PeerFingerprint`.
+nd-crypto = { workspace = true }
+# Persistance pur Rust : JSON atomique (sérialisation des DTO plats de la façade).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Hachage salé du mot de passe d'accès non surveillé (jamais stocké en clair) —
+# même primitive que `nd-features`/`nd-files`.
+blake3 = "1"
 # Pont Dart <-> Rust. Version alignée sur le paquet Dart `flutter_rust_bridge`
 # résolu dans ui/pubspec.lock (2.12.0) : codegen, crate runtime et paquet Dart
 # doivent partager la même version.
 flutter_rust_bridge = "=2.12.0"
+
+[dev-dependencies]
+# Répertoires temporaires uniques pour les tests de persistance (round-trips,
+# réouverture depuis disque).
+tempfile = "3"
 
 [lints]
 workspace = true
