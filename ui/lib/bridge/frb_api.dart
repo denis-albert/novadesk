@@ -213,6 +213,34 @@ class FrbNativeApi implements NativeApi {
   Future<void> stopSession(int id) => frb.stopSession(id: BigInt.from(id));
 
   // ---------------------------------------------------------------------------
+  // Canaux média annexes — délégation aux fonctions générées (u64 ⇄ BigInt)
+  // ---------------------------------------------------------------------------
+
+  @override
+  Stream<ChatMessageDto> sessionChatStream(int id) =>
+      frb.sessionChatStream(id: BigInt.from(id)).map(_chatDepuis);
+
+  @override
+  Future<void> sendChat(int id, String texte) =>
+      frb.sendChat(id: BigInt.from(id), texte: texte);
+
+  @override
+  Stream<TransferEventDto> sessionTransferStream(int id) =>
+      frb.sessionTransferStream(id: BigInt.from(id)).map(_transfertDepuis);
+
+  @override
+  Future<void> sendFiles(int id, List<String> chemins) =>
+      frb.sendFiles(id: BigInt.from(id), chemins: chemins);
+
+  @override
+  Future<void> setAudioEnabled(int id, bool actif) =>
+      frb.setAudioEnabled(id: BigInt.from(id), actif: actif);
+
+  @override
+  Future<void> switchMonitor(int id, int moniteur) =>
+      frb.switchMonitor(id: BigInt.from(id), moniteur: moniteur);
+
+  // ---------------------------------------------------------------------------
   // Hôte « accès non surveillé » — délégation aux fonctions générées
   // ---------------------------------------------------------------------------
 
@@ -388,6 +416,24 @@ class FrbNativeApi implements NativeApi {
       IncomingRequestDto(
         peerId: r.peerId.toInt(),
         peerIdFormate: r.peerIdFormate,
+      );
+
+  static ChatMessageDto _chatDepuis(frb.ChatMessageDto m) =>
+      ChatMessageDto(fromRemote: m.fromRemote, text: m.text);
+
+  /// Aplatit l'évènement de transfert généré (compteurs `u64` ⇄ `BigInt`).
+  static TransferEventDto _transfertDepuis(frb.TransferEventDto e) =>
+      TransferEventDto(
+        kind: e.kind,
+        fileIndex: e.fileIndex?.toInt(),
+        fileName: e.fileName,
+        bytesDone: e.bytesDone?.toInt(),
+        bytesTotal: e.bytesTotal?.toInt(),
+        sessionBytesDone: e.sessionBytesDone?.toInt(),
+        sessionBytesTotal: e.sessionBytesTotal?.toInt(),
+        percent: e.percent,
+        bytesPerSec: e.bytesPerSec,
+        etaSecs: e.etaSecs,
       );
 
   static frb.InputEventDto _inputVers(InputEventDto e) => switch (e) {

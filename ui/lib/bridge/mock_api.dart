@@ -353,6 +353,156 @@ class MockNativeApi implements NativeApi {
   @override
   Future<void> stopSession(int id) async {
     _debutSession.remove(id);
+    unawaited(_chatControleurs.remove(id)?.close());
+    unawaited(_transfertControleurs.remove(id)?.close());
+  }
+
+  // -------------------------------------------------------------------------
+  // Canaux média annexes — discussion, transfert, audio, moniteurs
+  // (flux de synthèse : parcours entièrement démontrable SANS le cœur natif)
+  // -------------------------------------------------------------------------
+
+  /// Un contrôleur de discussion par session (créé à la première écoute ou au
+  /// premier envoi). Diffusion : robuste à un ré-abonnement de l'UI.
+  final Map<int, StreamController<ChatMessageDto>> _chatControleurs = {};
+
+  /// Un contrôleur de transfert par session.
+  final Map<int, StreamController<TransferEventDto>> _transfertControleurs = {};
+
+  /// Journaux **observables par les tests** des réglages audio et des bascules
+  /// de moniteur (le cœur réel, lui, agit sur la session).
+  final List<({int id, bool actif})> reglagesAudio = <({int id, bool actif})>[];
+  final List<({int id, int moniteur})> basculesMoniteur =
+      <({int id, int moniteur})>[];
+
+  StreamController<ChatMessageDto> _chatControleur(int id) =>
+      _chatControleurs.putIfAbsent(
+        id,
+        () => StreamController<ChatMessageDto>.broadcast(),
+      );
+
+  StreamController<TransferEventDto> _transfertControleur(int id) =>
+      _transfertControleurs.putIfAbsent(
+        id,
+        () => StreamController<TransferEventDto>.broadcast(),
+      );
+
+  @override
+  Stream<ChatMessageDto> sessionChatStream(int id) => _chatControleur(id).stream;
+
+  /// Livre l'écho local immédiatement (comme le cœur réel), puis répond ~1,5 s
+  /// plus tard par un message distant de synthèse (« bien reçu »).
+  @override
+  Future<void> sendChat(int id, String texte) async {
+    final controleur = _chatControleur(id);
+    if (controleur.isClosed) return;
+    controleur.add(ChatMessageDto(fromRemote: false, text: texte));
+    Timer(const Duration(milliseconds: 1500), () {
+      if (!controleur.isClosed) {
+        controleur.add(
+          ChatMessageDto(fromRemote: true, text: 'Bien reçu : « $texte »'),
+        );
+      }
+    });
+  }
+
+  @override
+  Stream<TransferEventDto> sessionTransferStream(int id) =>
+      _transfertControleur(id).stream;
+
+  /// Émet une progression synthétique par fichier
+  /// (`started` → `progress`×8 → `completed`) puis `finished` en fin de file.
+  @override
+  Future<void> sendFiles(int id, List<String> chemins) async {
+    if (chemins.isEmpty) return;
+    final controleur = _transfertControleur(id);
+    if (controleur.isClosed) return;
+    unawaited(_simulerTransfert(controleur, chemins));
+  }
+
+  Future<void> _simulerTransfert(
+    StreamController<TransferEventDto> controleur,
+    List<String> chemins,
+  ) async {
+    final tailles = [for (final c in chemins) _tailleSynthetique(c)];
+    final total = tailles.fold<int>(0, (somme, t) => somme + t);
+    final debut = DateTime.now();
+    var faitSession = 0;
+
+    for (var index = 0; index < chemins.length; index++) {
+      if (controleur.isClosed) return;
+      final nom = _nomFichier(chemins[index]);
+      final taille = tailles[index];
+      controleur.add(TransferEventDto(
+        kind: 'started',
+        fileIndex: index,
+        fileName: nom,
+        bytesDone: 0,
+        bytesTotal: taille,
+      ));
+      const etapes = 8;
+      for (var pas = 1; pas <= etapes; pas++) {
+        await Future<void>.delayed(const Duration(milliseconds: 180));
+        if (controleur.isClosed) return;
+        final faitFichier = (taille * pas / etapes).round();
+        final faitCourant = faitSession + faitFichier;
+        final secondes =
+            DateTime.now().difference(debut).inMilliseconds / 1000.0;
+        final debit = secondes > 0 ? faitCourant / secondes : 0.0;
+        final restant = (total - faitCourant).clamp(0, total);
+        controleur.add(TransferEventDto(
+          kind: 'progress',
+          fileIndex: index,
+          fileName: nom,
+          bytesDone: faitFichier,
+          bytesTotal: taille,
+          sessionBytesDone: faitCourant,
+          sessionBytesTotal: total,
+          percent: total > 0 ? faitCourant / total * 100.0 : 100.0,
+          bytesPerSec: debit,
+          etaSecs: debit > 0 ? restant / debit : 0.0,
+        ));
+      }
+      faitSession += taille;
+      if (controleur.isClosed) return;
+      controleur.add(TransferEventDto(
+        kind: 'completed',
+        fileIndex: index,
+        fileName: nom,
+        bytesDone: taille,
+        bytesTotal: taille,
+      ));
+    }
+    if (controleur.isClosed) return;
+    controleur.add(const TransferEventDto(kind: 'finished'));
+  }
+
+  @override
+  Future<void> setAudioEnabled(int id, bool actif) async {
+    reglagesAudio.add((id: id, actif: actif));
+    debugPrint('MockNativeApi.setAudioEnabled(session $id) = '
+        '${actif ? 'activé' : 'désactivé'}');
+  }
+
+  @override
+  Future<void> switchMonitor(int id, int moniteur) async {
+    basculesMoniteur.add((id: id, moniteur: moniteur));
+    debugPrint('MockNativeApi.switchMonitor(session $id) → moniteur $moniteur');
+  }
+
+  /// Nom de fichier depuis un chemin (séparateurs `/` ou `\`).
+  static String _nomFichier(String chemin) {
+    final segments = chemin
+        .split(RegExp(r'[\\/]+'))
+        .where((s) => s.isNotEmpty)
+        .toList();
+    return segments.isEmpty ? chemin : segments.last;
+  }
+
+  /// Taille synthétique déterministe (2–42 Mo) pour une démo reproductible.
+  static int _tailleSynthetique(String chemin) {
+    final h = chemin.hashCode & 0x7fffffff;
+    return 2 * 1024 * 1024 + h % (40 * 1024 * 1024);
   }
 
   // -------------------------------------------------------------------------

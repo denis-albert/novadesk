@@ -610,6 +610,94 @@ class IncomingRequestDto {
 }
 
 // ---------------------------------------------------------------------------
+// Canaux média annexes : discussion et transfert de fichiers
+// (lot « session media »)
+// ---------------------------------------------------------------------------
+
+/// Message de discussion poussé par [NativeApi.sessionChatStream] (miroir de
+/// `nd_ffi::ChatMessageDto`, lui-même miroir de `nd_core::ChatMessage`).
+class ChatMessageDto {
+  const ChatMessageDto({required this.fromRemote, required this.text});
+
+  /// `true` si le message vient du pair distant ; `false` pour l'écho local
+  /// d'un message que ce poste vient d'émettre via [NativeApi.sendChat].
+  final bool fromRemote;
+
+  /// Texte du message (UTF-8).
+  final String text;
+
+  @override
+  bool operator ==(Object other) =>
+      other is ChatMessageDto &&
+      other.fromRemote == fromRemote &&
+      other.text == text;
+
+  @override
+  int get hashCode => Object.hash(fromRemote, text);
+
+  @override
+  String toString() => 'ChatMessageDto(fromRemote: $fromRemote, text: $text)';
+}
+
+/// Évènement de progression d'un transfert de fichiers, poussé par
+/// [NativeApi.sessionTransferStream] (miroir de `nd_ffi::TransferEventDto`).
+///
+/// Structure **plate** : l'UI branche sur [kind] ; les champs non pertinents
+/// pour un `kind` donné valent `null`. Les compteurs d'octets sont des `int`
+/// Dart (l'adaptateur FRB convertit les `u64`/`BigInt` du pont).
+class TransferEventDto {
+  const TransferEventDto({
+    required this.kind,
+    this.fileIndex,
+    this.fileName,
+    this.bytesDone,
+    this.bytesTotal,
+    this.sessionBytesDone,
+    this.sessionBytesTotal,
+    this.percent,
+    this.bytesPerSec,
+    this.etaSecs,
+  });
+
+  /// Nature de l'évènement : `"started"` (début d'un fichier), `"progress"`
+  /// (avancement), `"completed"` (fichier terminé), `"finished"` (file
+  /// entièrement transférée) ou `"cancelled"` (annulation).
+  final String kind;
+
+  /// Index (0-basé) du fichier concerné (`started`/`progress`/`completed`).
+  final int? fileIndex;
+
+  /// Nom du fichier concerné (`started`/`progress`/`completed`).
+  final String? fileName;
+
+  /// Octets du **fichier courant** déjà transférés.
+  final int? bytesDone;
+
+  /// Taille totale du **fichier courant**.
+  final int? bytesTotal;
+
+  /// Octets déjà transférés pour l'ensemble de la file (`progress`).
+  final int? sessionBytesDone;
+
+  /// Taille totale connue de la file (`progress`).
+  final int? sessionBytesTotal;
+
+  /// Pourcentage accompli de la **session** dans `[0, 100]` (`progress`).
+  final double? percent;
+
+  /// Débit instantané moyen de la session en octets/seconde (`progress`).
+  final double? bytesPerSec;
+
+  /// Temps estimé avant la fin de la session en secondes (`progress`).
+  final double? etaSecs;
+
+  @override
+  String toString() =>
+      'TransferEventDto(kind: $kind, fileName: $fileName, '
+      'bytesDone: $bytesDone, bytesTotal: $bytesTotal, percent: $percent)';
+}
+
+// ---------------------------------------------------------------------------
 // Interface de la façade
 // ---------------------------------------------------------------------------
 
@@ -727,6 +815,40 @@ abstract interface class NativeApi {
   /// Arrête la session et invalide son identifiant
   /// (miroir de `nd_ffi::stop_session`).
   Future<void> stopSession(int id);
+
+  // -------------------------------------------------------------------------
+  // Canaux média annexes : discussion, transfert, audio, moniteurs
+  // (lot « session media » — chaque canal gardé par sa permission, mode étendu)
+  // -------------------------------------------------------------------------
+
+  /// Flux des messages de discussion de la session : messages **reçus** du pair
+  /// ([ChatMessageDto.fromRemote] vrai) et **échos locaux** des messages émis
+  /// via [sendChat] (faux). Miroir de `nd_ffi::session_chat_stream`.
+  Stream<ChatMessageDto> sessionChatStream(int id);
+
+  /// Envoie un message de discussion au pair ; l'écho local est livré sur
+  /// [sessionChatStream] une fois le message émis. Miroir de
+  /// `nd_ffi::send_chat`.
+  Future<void> sendChat(int id, String texte);
+
+  /// Flux des évènements de progression du transfert de fichiers, tant côté
+  /// **émetteur** que **récepteur**. Miroir de `nd_ffi::session_transfer_stream`.
+  Stream<TransferEventDto> sessionTransferStream(int id);
+
+  /// Démarre l'**envoi** d'une file de fichiers ([chemins] locaux) vers le
+  /// pair ; la progression est observable sur [sessionTransferStream]. Gardé
+  /// par la permission « fichiers ». Miroir de `nd_ffi::send_files`.
+  Future<void> sendFiles(int id, List<String> chemins);
+
+  /// Active ou désactive l'audio de la session (émission côté hôte, lecture
+  /// côté contrôleur). Sans effet si la permission audio n'est pas accordée.
+  /// Miroir de `nd_ffi::set_audio_enabled`.
+  Future<void> setAudioEnabled(int id, bool actif);
+
+  /// Demande à l'hôte de diffuser le **moniteur** d'index [moniteur] (bascule
+  /// multi-écran ; un index hors bornes est ignoré au mieux). Miroir de
+  /// `nd_ffi::switch_monitor`.
+  Future<void> switchMonitor(int id, int moniteur);
 
   // -------------------------------------------------------------------------
   // Hôte « accès non surveillé » (lot §2b)

@@ -89,13 +89,34 @@ class SessionScreen extends ConsumerStatefulWidget {
 class _SessionScreenState extends ConsumerState<SessionScreen> {
   final FocusNode _noeudFocus = FocusNode(debugLabel: 'surface-session');
   final TextEditingController _chatController = TextEditingController();
+  final ScrollController _chatScroll = ScrollController();
+
+  /// Champ de saisie du/des chemin(s) à envoyer (transfert sans plugin natif).
+  final TextEditingController _cheminController = TextEditingController();
 
   /// Identifiant de la session ouverte par le cœur (`start_session`).
   int? _sessionId;
 
   StreamSubscription<SessionStateDto>? _abonnementEtat;
   StreamSubscription<VideoFrameDto>? _abonnementVideo;
+  StreamSubscription<ChatMessageDto>? _abonnementChat;
+  StreamSubscription<TransferEventDto>? _abonnementTransfert;
   Timer? _minuterieStats;
+
+  /// File de transfert alimentée par `session_transfer_stream` (clé = index du
+  /// fichier). Agrégats de session mis à jour à chaque évènement `progress`.
+  final Map<int, _TransfertFichier> _transferts = {};
+  bool _transfertActif = false;
+  double _pourcentTransfert = 0;
+  double _debitTransfert = 0;
+  double _etaTransfert = 0;
+
+  /// Fichiers de démonstration envoyés quand le champ de chemin est vide
+  /// (aucun sélecteur natif disponible : ni admin ni symlinks ici).
+  static const List<String> _fichiersDemoATransferer = [
+    r'C:\Users\Public\Documents\rapport-Q2.pdf',
+    r'C:\Users\Public\Documents\build-9.7.3.zip',
+  ];
 
   /// Trame vidéo courante décodée en `ui.Image`, peinte par [_PeintreVideo].
   final ValueNotifier<ui.Image?> _trameCourante = ValueNotifier<ui.Image?>(null);
@@ -181,6 +202,8 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     _fermerPopover();
     unawaited(_abonnementEtat?.cancel());
     unawaited(_abonnementVideo?.cancel());
+    unawaited(_abonnementChat?.cancel());
+    unawaited(_abonnementTransfert?.cancel());
     _minuterieStats?.cancel();
     unawaited(_arreterMoteur());
     _trameCourante.value?.dispose();
@@ -189,6 +212,8 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
       unawaited(windowManager.setFullScreen(false));
     }
     _chatController.dispose();
+    _chatScroll.dispose();
+    _cheminController.dispose();
     _noeudFocus.dispose();
     super.dispose();
   }
@@ -227,6 +252,18 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
         _surTrameVideo,
         onError: (Object _) {
           // Trame corrompue : ignorée, le flux continue.
+        },
+      );
+      _abonnementChat = _api.sessionChatStream(id).listen(
+        _surMessageChat,
+        onError: (Object _) {
+          // Message illisible : ignoré, le flux continue.
+        },
+      );
+      _abonnementTransfert = _api.sessionTransferStream(id).listen(
+        _surEvenementTransfert,
+        onError: (Object _) {
+          // Évènement de transfert illisible : ignoré, le flux continue.
         },
       );
     } catch (e) {
@@ -498,13 +535,128 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
 
   void _aVenir(String fonction) => _informer('$fonction — à venir (lot 04).');
 
+  // ---------------------------------------------------------------------------
+  // Discussion réelle (canal `Control` du cœur via `send_chat` / chat stream)
+  // ---------------------------------------------------------------------------
+
+  /// Envoi d'un message : appelle `send_chat`. L'écho local (fromRemote faux) et
+  /// la réponse distante arrivent tous deux par `session_chat_stream` : on ne
+  /// duplique donc rien localement.
   void _envoyerMessageChat() {
     final texte = _chatController.text.trim();
     if (texte.isEmpty) return;
+    final id = _sessionId;
+    if (id == null) {
+      _informer('Discussion indisponible : session non démarrée.');
+      return;
+    }
+    unawaited(_api.sendChat(id, texte));
+    _chatController.clear();
+  }
+
+  void _surMessageChat(ChatMessageDto message) {
+    if (!mounted) return;
     setState(() {
-      _messages.add(_MessageChat(texte: texte, deMoi: true));
-      _chatController.clear();
+      // `fromRemote` vrai = message du pair (à gauche) ; faux = mon écho local.
+      _messages
+          .add(_MessageChat(texte: message.text, deMoi: !message.fromRemote));
     });
+    _defilerChatEnBas();
+  }
+
+  void _defilerChatEnBas() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_chatScroll.hasClients) {
+        unawaited(_chatScroll.animateTo(
+          _chatScroll.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        ));
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transfert réel (canal `Files` du cœur via `send_files` / transfer stream)
+  // ---------------------------------------------------------------------------
+
+  /// Lance l'envoi. Faute de sélecteur natif (aucun plugin ici), on lit un
+  /// simple champ de chemins (séparés par « ; ») ; à vide, on envoie les
+  /// entrées de démonstration pour garder le parcours démontrable sous mock.
+  void _envoyerFichiers() {
+    final id = _sessionId;
+    if (id == null) {
+      _informer('Transfert indisponible : session non démarrée.');
+      return;
+    }
+    final saisie = _cheminController.text.trim();
+    final chemins = saisie.isEmpty
+        ? _fichiersDemoATransferer
+        : saisie
+            .split(RegExp(r'[;\n]+'))
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .toList();
+    if (chemins.isEmpty) return;
+    _cheminController.clear();
+    unawaited(_api.sendFiles(id, chemins));
+    _informer('Envoi de ${chemins.length} fichier(s) au poste distant…');
+  }
+
+  void _surEvenementTransfert(TransferEventDto e) {
+    if (!mounted) return;
+    setState(() {
+      switch (e.kind) {
+        case 'started':
+          _transfertActif = true;
+          _ftOuvert = true; // révèle le panneau si un transfert débute
+          final index = e.fileIndex ?? _transferts.length;
+          _transferts[index] = _TransfertFichier(
+            index: index,
+            nom: e.fileName ?? 'fichier',
+            bytesTotal: e.bytesTotal ?? 0,
+            bytesDone: e.bytesDone ?? 0,
+          );
+        case 'progress':
+          _transfertActif = true;
+          final index = e.fileIndex ?? 0;
+          final f = _transferts.putIfAbsent(
+            index,
+            () => _TransfertFichier(
+              index: index,
+              nom: e.fileName ?? 'fichier',
+              bytesTotal: e.bytesTotal ?? 0,
+            ),
+          );
+          f.bytesDone = e.bytesDone ?? f.bytesDone;
+          if (e.bytesTotal != null) f.bytesTotal = e.bytesTotal!;
+          if (e.fileName != null) f.nom = e.fileName!;
+          f.termine = false;
+          _pourcentTransfert = e.percent ?? _pourcentTransfert;
+          _debitTransfert = e.bytesPerSec ?? _debitTransfert;
+          _etaTransfert = e.etaSecs ?? _etaTransfert;
+        case 'completed':
+          final f = _transferts[e.fileIndex ?? 0];
+          if (f != null) {
+            if (e.bytesTotal != null) f.bytesTotal = e.bytesTotal!;
+            f.bytesDone = f.bytesTotal;
+            f.termine = true;
+          }
+        case 'finished':
+          _transfertActif = false;
+          _pourcentTransfert = 100;
+          _etaTransfert = 0;
+          for (final f in _transferts.values) {
+            f.termine = true;
+            f.bytesDone = f.bytesTotal;
+          }
+        case 'cancelled':
+          _transfertActif = false;
+      }
+    });
+    if (e.kind == 'finished') {
+      NovaToast.montrer(context, 'Transfert terminé.');
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1183,7 +1335,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
           icone: NovaIcones.audio,
           texte: 'Entendre le son distant',
           coche: _permAudio,
-          onTap: () => _basculerPerm(() => _permAudio = !_permAudio),
+          onTap: _basculerAudio,
         ),
         _PopItem(
           icone: NovaIcones.dossier,
@@ -1217,6 +1369,17 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   void _basculerPerm(VoidCallback modif) {
     setState(modif);
     _rafraichirPopover();
+  }
+
+  /// Bascule l'audio de la session : met à jour l'UI puis pilote le cœur via
+  /// `set_audio_enabled` (sans effet si la permission audio n'est pas accordée).
+  void _basculerAudio() {
+    setState(() => _permAudio = !_permAudio);
+    _rafraichirPopover();
+    final id = _sessionId;
+    if (id != null) {
+      unawaited(_api.setAudioEnabled(id, _permAudio));
+    }
   }
 
   Widget _contenuActions(BuildContext context) {
@@ -1341,19 +1504,19 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
           icone: NovaIcones.moniteur,
           texte: 'Écran 1 (principal)',
           selectionne: _moniteur == 0,
-          onTap: () => _choisir(() => _moniteur = 0),
+          onTap: () => _choisirMoniteur(0),
         ),
         _PopItem(
           icone: NovaIcones.moniteur,
           texte: 'Écran 2',
           selectionne: _moniteur == 1,
-          onTap: () => _choisir(() => _moniteur = 1),
+          onTap: () => _choisirMoniteur(1),
         ),
         _PopItem(
           icone: NovaIcones.tousEcrans,
           texte: 'Afficher tous les écrans',
           selectionne: _moniteur == 2,
-          onTap: () => _choisir(() => _moniteur = 2),
+          onTap: () => _choisirMoniteur(2),
         ),
       ],
     );
@@ -1397,6 +1560,18 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     _fermerPopover();
   }
 
+  /// Sélection d'un moniteur distant : met à jour l'UI puis demande la bascule
+  /// multi-écran au cœur via `switch_monitor` (index 2 = « tous les écrans »,
+  /// appliqué au mieux par l'hôte).
+  void _choisirMoniteur(int moniteur) {
+    setState(() => _moniteur = moniteur);
+    _fermerPopover();
+    final id = _sessionId;
+    if (id != null) {
+      unawaited(_api.switchMonitor(id, moniteur));
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Tableau blanc (maquette `.wbtb`)
   // ---------------------------------------------------------------------------
@@ -1433,7 +1608,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   Widget _transfert() {
     final t = NovaTokens.of(context);
     return Container(
-      height: 248,
+      height: 300,
       decoration: BoxDecoration(
         color: t.fenetre,
         border: Border(top: BorderSide(color: t.filetFort)),
@@ -1484,7 +1659,43 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
               ],
             ),
           ),
-          _fileTransfert(t),
+          _zoneEnvoi(t),
+          if (_transferts.isNotEmpty) _fileTransfert(t),
+        ],
+      ),
+    );
+  }
+
+  /// Zone d'envoi : champ de chemin (pas de sélecteur natif) + bouton
+  /// « Envoyer » qui appelle `send_files`.
+  Widget _zoneEnvoi(NovaTokens t) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: t.filet)),
+      ),
+      child: Row(
+        children: [
+          NovaIcone(NovaIcones.exporter, taille: 15, couleur: t.texte3),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SizedBox(
+              height: 32,
+              child: TextField(
+                controller: _cheminController,
+                style: const TextStyle(fontSize: 12.5),
+                decoration: const InputDecoration(
+                  hintText: 'Chemin(s) local(aux) à envoyer, séparés par « ; »…',
+                ),
+                onSubmitted: (_) => _envoyerFichiers(),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          NovaBoutonPrimaire(
+            libelle: 'Envoyer',
+            onPressed: _permTransfert ? _envoyerFichiers : null,
+          ),
         ],
       ),
     );
@@ -1523,40 +1734,111 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     );
   }
 
+  /// File de progression réelle, alimentée par `session_transfer_stream` :
+  /// résumé de session (%, débit, ETA) + une ligne par fichier.
   Widget _fileTransfert(NovaTokens t) {
+    final items = _transferts.values.toList()
+      ..sort((a, b) => a.index.compareTo(b.index));
     return Container(
-      height: 58,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      constraints: const BoxConstraints(maxHeight: 108),
       decoration: BoxDecoration(
         border: Border(top: BorderSide(color: t.filet)),
       ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            child: Row(
+              children: [
+                NovaIcone(NovaIcones.dossierSync, taille: 13, couleur: t.texte3),
+                const SizedBox(width: 8),
+                Text(
+                  _transfertActif
+                      ? 'Transfert · ${_pourcentTransfert.toStringAsFixed(0)} %'
+                      : 'File de transfert',
+                  style: TextStyle(fontSize: 11.5, color: t.texte2),
+                ),
+                const Spacer(),
+                if (_transfertActif && _debitTransfert > 0)
+                  Text(
+                    '${_formaterOctets(_debitTransfert.round())}/s · '
+                    '${_formaterDuree(_etaTransfert)}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: t.texte3,
+                      fontFeatures: const [ui.FontFeature.tabularFigures()],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Flexible(
+            child: ListView(
+              padding: const EdgeInsets.only(bottom: 6),
+              shrinkWrap: true,
+              children: [for (final f in items) _ligneTransfert(t, f)],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _ligneTransfert(NovaTokens t, _TransfertFichier f) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
       child: Row(
         children: [
-          NovaIcone(NovaIcones.telecharger, taille: 14, couleur: t.vert),
+          NovaIcone(
+            f.termine ? NovaIcones.coche : NovaIcones.telecharger,
+            taille: 14,
+            couleur: f.termine ? t.vert : t.texte2,
+          ),
           const SizedBox(width: 9),
-          Text('build-9.7.3.zip', style: TextStyle(fontSize: 11.5, color: t.texte)),
-          const SizedBox(width: 12),
+          SizedBox(
+            width: 116,
+            child: Text(
+              f.nom,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11.5, color: t.texte),
+            ),
+          ),
+          const SizedBox(width: 10),
           Expanded(
             child: ClipRRect(
               borderRadius: BorderRadius.circular(2),
               child: LinearProgressIndicator(
-                value: 0.64,
+                value: f.fraction,
                 minHeight: 4,
                 backgroundColor: t.filetFort,
-                color: t.vert,
+                color: f.termine ? t.vert : kNovaRouge,
               ),
             ),
           ),
-          const SizedBox(width: 12),
-          Text('64% · 5,2 Mo/s',
-              style: TextStyle(
-                fontSize: 11.5,
-                color: t.texte2,
-                fontFeatures: const [ui.FontFeature.tabularFigures()],
-              )),
+          const SizedBox(width: 10),
+          Text(
+            f.termine ? 'Terminé' : '${(f.fraction * 100).toStringAsFixed(0)} %',
+            style: TextStyle(
+              fontSize: 11,
+              color: t.texte2,
+              fontFeatures: const [ui.FontFeature.tabularFigures()],
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  /// Durée lisible pour l'ETA (« 12 s », « 1 min 05 s »).
+  String _formaterDuree(double secondes) {
+    if (secondes <= 0) return '0 s';
+    if (secondes < 60) return '${secondes.toStringAsFixed(0)} s';
+    final m = secondes ~/ 60;
+    final s = (secondes % 60).round();
+    return '$m min ${s.toString().padLeft(2, '0')} s';
   }
 
   // ---------------------------------------------------------------------------
@@ -1599,6 +1881,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
           ),
           Expanded(
             child: ListView.builder(
+              controller: _chatScroll,
               padding: const EdgeInsets.all(12),
               itemCount: _messages.length,
               itemBuilder: (context, i) {
@@ -2006,4 +2289,25 @@ class _MessageChat {
 
   final String texte;
   final bool deMoi;
+}
+
+/// Fichier suivi dans la file de transfert (alimenté par `session_transfer_stream`).
+class _TransfertFichier {
+  _TransfertFichier({
+    required this.index,
+    required this.nom,
+    required this.bytesTotal,
+    this.bytesDone = 0,
+  });
+
+  final int index;
+  String nom;
+  int bytesTotal;
+  int bytesDone;
+  bool termine = false;
+
+  /// Fraction accomplie du fichier dans `[0, 1]`.
+  double get fraction => bytesTotal > 0
+      ? (bytesDone / bytesTotal).clamp(0.0, 1.0)
+      : (termine ? 1.0 : 0.0);
 }

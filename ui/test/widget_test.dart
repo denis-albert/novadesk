@@ -178,4 +178,76 @@ void main() {
     await tester.pump(const Duration(seconds: 3));
     await tester.pump(const Duration(milliseconds: 300));
   });
+
+  // -------------------------------------------------------------------------
+  // Canaux média annexes du mock (lot « session media »)
+  // -------------------------------------------------------------------------
+
+  test('discussion mock : sendChat livre l’écho local puis la réponse distante',
+      () async {
+    final api = MockNativeApi();
+    final id = await api.startSession(
+      config: SessionConfigDto(
+        role: SessionRoleDto.controller,
+        localId: 1,
+        peerId: 2,
+        permissions: PermissionsDto.full(),
+      ),
+      endpoint: const SessionEndpointLoopback(),
+    );
+    final recu = <ChatMessageDto>[];
+    final sub = api.sessionChatStream(id).listen(recu.add);
+
+    await api.sendChat(id, 'Bonjour');
+    // Écho local immédiat (fromRemote faux).
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(recu.where((m) => !m.fromRemote).map((m) => m.text), ['Bonjour']);
+
+    // Réponse distante de synthèse ~1,5 s plus tard (fromRemote vrai).
+    await Future<void>.delayed(const Duration(milliseconds: 1600));
+    final distants = recu.where((m) => m.fromRemote).toList();
+    expect(distants, hasLength(1));
+    expect(distants.single.text, contains('Bonjour'));
+
+    await sub.cancel();
+    await api.stopSession(id);
+  });
+
+  test('transfert mock : sendFiles émet une progression jusqu’à « finished »',
+      () async {
+    final api = MockNativeApi();
+    final id = await api.startSession(
+      config: SessionConfigDto(
+        role: SessionRoleDto.controller,
+        localId: 1,
+        peerId: 2,
+        permissions: PermissionsDto.full(),
+      ),
+      endpoint: const SessionEndpointLoopback(),
+    );
+    final evts = <TransferEventDto>[];
+    final sub = api.sessionTransferStream(id).listen(evts.add);
+
+    await api.sendFiles(id, [r'C:\demo\a.bin', r'C:\demo\b.bin']);
+
+    // Attend la fin de la file (borne de sécurité de 8 s).
+    final limite = DateTime.now().add(const Duration(seconds: 8));
+    while (!evts.any((e) => e.kind == 'finished') &&
+        DateTime.now().isBefore(limite)) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+
+    expect(evts.first.kind, 'started');
+    expect(evts.any((e) => e.kind == 'progress'), isTrue);
+    expect(evts.where((e) => e.kind == 'completed'), hasLength(2));
+    expect(evts.last.kind, 'finished');
+    // Le pourcentage de session progresse et atteint 100 %.
+    final pourcents =
+        evts.where((e) => e.percent != null).map((e) => e.percent!).toList();
+    expect(pourcents, isNotEmpty);
+    expect(pourcents.last, closeTo(100.0, 0.001));
+
+    await sub.cancel();
+    await api.stopSession(id);
+  });
 }
