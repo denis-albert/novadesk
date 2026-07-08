@@ -1,20 +1,21 @@
 /// Dialogue d'acceptation d'une connexion **entrante** (côté poste contrôlé,
-/// doc 03 §5.7) : identité + empreinte du connecteur, profil de permissions
-/// (Par défaut / Partage d'écran / Contrôle total / Non surveillé), cases de
-/// permissions ajustables, boutons Refuser / Accepter (vert « accordé » —
-/// le rouge de marque reste réservé).
+/// maquette `novadesk-app.html`, `#bdDlg`) : avatar + identité du connecteur,
+/// empreinte à vérifier hors bande, profil de permissions, cases de permissions
+/// (coche verte « accordé »), boutons Refuser / Accepter (vert « accordé » — le
+/// rouge de marque reste réservé).
 ///
-/// Purement visuel pour l'instant : le câblage réel (requête du cœur via
-/// Stream FRB, réponse `accept/deny`) appartient au lot 04. Un bouton de
-/// démonstration l'ouvre depuis Réglages → Sécurité.
+/// Ouvert par le flux réel des demandes entrantes de l'hôte non surveillé
+/// (`unattended_incoming_stream`) ; sa décision est transmise à
+/// `approve_incoming`.
 library;
 
 import 'package:flutter/material.dart';
 
 import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
+import '../widgets/nova_kit.dart';
 
-/// Profils de permissions proposés à l'acceptation (vocabulaire AnyDesk).
+/// Profils de permissions proposés à l'acceptation.
 enum ProfilPermissions { parDefaut, partageEcran, controleTotal, nonSurveille }
 
 extension _ProfilX on ProfilPermissions {
@@ -39,19 +40,18 @@ class IncomingRequestDialog extends StatefulWidget {
     super.key,
     this.alias = 'pc-marie',
     this.idFormate = '555 240 173',
-    this.empreinte = '3C:9A:F2:04:6B:D8:33:71',
+    this.empreinte = '3F·A9·7C·22·E1·08',
   });
 
   final String alias;
   final String idFormate;
   final String empreinte;
 
-  /// Ouvre le dialogue et renvoie la décision (ou `null` si écarté).
   static Future<ReponseEntrante?> montrer(
     BuildContext context, {
     String alias = 'pc-marie',
     String idFormate = '555 240 173',
-    String empreinte = '3C:9A:F2:04:6B:D8:33:71',
+    String empreinte = '3F·A9·7C·22·E1·08',
   }) {
     return showDialog<ReponseEntrante>(
       context: context,
@@ -68,211 +68,263 @@ class IncomingRequestDialog extends StatefulWidget {
 }
 
 class _IncomingRequestDialogState extends State<IncomingRequestDialog> {
-  ProfilPermissions _profil = ProfilPermissions.parDefaut;
+  ProfilPermissions _profil = ProfilPermissions.controleTotal;
 
   late final Map<String, bool> _permissions = {
-    "Afficher l'écran": true,
-    'Clavier et souris': true,
-    'Presse-papiers': true,
-    'Transfert de fichiers': false,
+    'Contrôler le clavier et la souris': true,
+    'Accéder au presse-papiers': true,
+    'Transférer des fichiers': false,
     'Transmettre le son': false,
     "Bloquer l'entrée locale": false,
   };
 
-  /// Précoche les cases selon le profil retenu.
   void _appliquerProfil(ProfilPermissions profil) {
     setState(() {
       _profil = profil;
       switch (profil) {
         case ProfilPermissions.parDefaut:
           _permissions
-            ..["Afficher l'écran"] = true
-            ..['Clavier et souris'] = true
-            ..['Presse-papiers'] = true
-            ..['Transfert de fichiers'] = false
+            ..['Contrôler le clavier et la souris'] = true
+            ..['Accéder au presse-papiers'] = true
+            ..['Transférer des fichiers'] = false
             ..['Transmettre le son'] = false
             ..["Bloquer l'entrée locale"] = false;
         case ProfilPermissions.partageEcran:
           _permissions.updateAll((_, __) => false);
-          _permissions["Afficher l'écran"] = true;
         case ProfilPermissions.controleTotal:
-          _permissions.updateAll((_, __) => true);
-          _permissions["Bloquer l'entrée locale"] = false;
+          _permissions
+            ..['Contrôler le clavier et la souris'] = true
+            ..['Accéder au presse-papiers'] = true
+            ..['Transférer des fichiers'] = true
+            ..['Transmettre le son'] = true
+            ..["Bloquer l'entrée locale"] = false;
         case ProfilPermissions.nonSurveille:
           _permissions.updateAll((_, __) => true);
       }
     });
   }
 
+  String get _initiales {
+    final mots = widget.alias
+        .split(RegExp(r'[\s\-_.]+'))
+        .where((m) => m.isNotEmpty)
+        .toList();
+    if (mots.isEmpty) return '?';
+    if (mots.length == 1) {
+      return mots.first
+          .substring(0, mots.first.length >= 2 ? 2 : 1)
+          .toUpperCase();
+    }
+    return (mots[0][0] + mots[1][0]).toUpperCase();
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-
     return Dialog(
       child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 420),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(22, 20, 22, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Identité du connecteur.
-              Row(
+        constraints: const BoxConstraints(maxWidth: 400),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Bandeau supérieur : avatar + identité.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 17, 20, 17),
+              child: Row(
                 children: [
                   Container(
-                    width: 40,
-                    height: 40,
+                    width: 42,
+                    height: 42,
                     alignment: Alignment.center,
                     decoration: BoxDecoration(
-                      color: t.champ,
-                      borderRadius: BorderRadius.circular(9),
-                      border: Border.all(color: t.filet),
+                      color: kNovaRouge,
+                      borderRadius: BorderRadius.circular(kNovaRayon),
                     ),
-                    child:
-                        NovaIcone(NovaIcones.utilisateur, couleur: t.texte2),
+                    child: Text(
+                      _initiales,
+                      style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white),
+                    ),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 13),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          widget.alias,
-                          style: TextStyle(
-                            fontSize: 14.5,
-                            fontWeight: FontWeight.w700,
-                            color: t.texte,
-                          ),
-                        ),
+                        Text('Demande de connexion',
+                            style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                                color: t.texte)),
                         const SizedBox(height: 1),
-                        Text(
-                          '${widget.idFormate} · souhaite se connecter '
-                          'à ce poste',
-                          style: TextStyle(fontSize: 12, color: t.texte2),
-                        ),
+                        Text('${widget.alias} · ${widget.idFormate}',
+                            style: TextStyle(fontSize: 12, color: t.texte3)),
                       ],
                     ),
                   ),
                 ],
               ),
-              const SizedBox(height: 14),
-              // Empreinte du connecteur (vérification hors bande).
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                decoration: BoxDecoration(
-                  color: t.panneau,
-                  borderRadius: BorderRadius.circular(7),
-                  border: Border.all(color: t.filet),
-                ),
-                child: Row(
-                  children: [
-                    NovaIcone(NovaIcones.cle, taille: 14, couleur: t.texte3),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Empreinte : ${widget.empreinte}',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          color: t.texte2,
-                          fontFeatures: const [
-                            FontFeature.tabularFigures(),
-                          ],
+            ),
+            Divider(height: 1, color: t.filet),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Empreinte.
+                  Row(
+                    children: [
+                      NovaIcone(NovaIcones.bouclierCoche,
+                          taille: 14, couleur: t.vert),
+                      const SizedBox(width: 8),
+                      Text('Empreinte : ',
+                          style: TextStyle(fontSize: 11.5, color: t.texte2)),
+                      Flexible(
+                        child: Text(
+                          widget.empreinte,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: t.texte2,
+                            letterSpacing: 1,
+                            fontFamily: 'Cascadia Code',
+                            fontFamilyFallback: const ['Consolas', 'monospace'],
+                          ),
                         ),
                       ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-              // Profil de permissions.
-              Row(
-                children: [
-                  Text(
-                    'PROFIL',
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.1,
-                      color: t.texte3,
-                    ),
-                  ),
-                  const Spacer(),
-                  DropdownButton<ProfilPermissions>(
-                    value: _profil,
-                    underline: const SizedBox.shrink(),
-                    style: TextStyle(fontSize: 12.5, color: t.texte),
-                    items: [
-                      for (final profil in ProfilPermissions.values)
-                        DropdownMenuItem(
-                          value: profil,
-                          child: Text(profil.libelle),
-                        ),
                     ],
-                    onChanged: (profil) {
-                      if (profil != null) _appliquerProfil(profil);
-                    },
                   ),
+                  const SizedBox(height: 14),
+                  // Profil.
+                  Row(
+                    children: [
+                      const NovaSectionLabel('Profil'),
+                      const Spacer(),
+                      DropdownButton<ProfilPermissions>(
+                        value: _profil,
+                        underline: const SizedBox.shrink(),
+                        style: TextStyle(fontSize: 12.5, color: t.texte),
+                        items: [
+                          for (final p in ProfilPermissions.values)
+                            DropdownMenuItem(value: p, child: Text(p.libelle)),
+                        ],
+                        onChanged: (p) {
+                          if (p != null) _appliquerProfil(p);
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  for (final entree in _permissions.entries)
+                    _lignePermission(t, entree.key, entree.value,
+                        (v) => setState(() => _permissions[entree.key] = v)),
                 ],
               ),
-              const SizedBox(height: 4),
-              // Cases de permissions demandées.
-              for (final entree in _permissions.entries)
-                SizedBox(
-                  height: 32,
-                  child: Row(
-                    children: [
-                      SizedBox(
-                        width: 28,
-                        child: Checkbox(
-                          value: entree.value,
-                          onChanged: (valeur) => setState(() =>
-                              _permissions[entree.key] = valeur ?? false),
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      Expanded(
-                        child: Text(
-                          entree.key,
-                          style: TextStyle(fontSize: 12.5, color: t.texte),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              const SizedBox(height: 14),
-              // Décision.
-              Row(
+            ),
+            Divider(height: 1, color: t.filet),
+            // Décision.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
+              child: Row(
                 children: [
                   Expanded(
-                    child: Text(
-                      'Session chiffrée de bout en bout.',
-                      style: TextStyle(fontSize: 11, color: t.texte3),
-                    ),
+                    child: Text('Session chiffrée de bout en bout.',
+                        style: TextStyle(fontSize: 11, color: t.texte3)),
                   ),
-                  OutlinedButton(
-                    onPressed: () => Navigator.of(context).pop(
-                      ReponseEntrante(acceptee: false, profil: _profil),
-                    ),
-                    child: const Text('Refuser'),
+                  NovaBoutonSecondaire(
+                    libelle: 'Refuser',
+                    hauteur: 38,
+                    onPressed: () => Navigator.of(context)
+                        .pop(ReponseEntrante(acceptee: false, profil: _profil)),
                   ),
-                  const SizedBox(width: 8),
-                  FilledButton(
-                    onPressed: () => Navigator.of(context).pop(
-                      ReponseEntrante(acceptee: true, profil: _profil),
-                    ),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: kNovaVert,
-                      // Le vert « accordé » garde le rouge de marque réservé.
-                      overlayColor: Colors.black,
-                    ),
-                    child: const Text('Accepter'),
+                  const SizedBox(width: 10),
+                  _BoutonAccepter(
+                    onTap: () => Navigator.of(context)
+                        .pop(ReponseEntrante(acceptee: true, profil: _profil)),
                   ),
                 ],
               ),
-            ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _lignePermission(
+      NovaTokens t, String libelle, bool accorde, ValueChanged<bool> onChanged) {
+    return InkWell(
+      onTap: () => onChanged(!accorde),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            Container(
+              width: 17,
+              height: 17,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: accorde ? t.vert : t.filetFort,
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: accorde
+                  ? const NovaIcone(NovaIcones.coche,
+                      taille: 12, couleur: Colors.white)
+                  : null,
+            ),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(libelle,
+                  style: TextStyle(fontSize: 12.5, color: t.texte)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bouton « Accepter » vert (le rouge de marque reste réservé).
+class _BoutonAccepter extends StatefulWidget {
+  const _BoutonAccepter({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  State<_BoutonAccepter> createState() => _BoutonAccepterState();
+}
+
+class _BoutonAccepterState extends State<_BoutonAccepter> {
+  bool _survole = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _survole = true),
+      onExit: (_) => setState(() => _survole = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: Container(
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: _survole
+                ? Color.alphaBlend(Colors.black.withValues(alpha: 0.12), t.vert)
+                : t.vert,
+            borderRadius: BorderRadius.circular(kNovaRayon),
           ),
+          child: const Text('Accepter',
+              style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white)),
         ),
       ),
     );

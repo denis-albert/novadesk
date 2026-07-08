@@ -1,31 +1,44 @@
-/// Thème NovaDesk « parité AnyDesk » — tokens issus de la maquette validée
-/// (`anydesk-reference.html`) : surfaces neutres à plat, filets 1px, densité
-/// compacte, et rouge de marque en accent **strictement parcimonieux**.
+/// Thème NovaDesk — tokens **exacts** de la maquette validée
+/// (`novadesk-app.html`, variables CSS `:root` clair + `[data-theme="dark"]`) :
+/// géométrie très carrée (`--r` = 4 px), surfaces neutres à plat, filets 1 px,
+/// densité compacte, typographie Segoe UI à chiffres tabulaires.
 ///
-/// Le rouge `#EF443B` est réservé à : logo, bouton « Se connecter », onglet
-/// actif, survol du bouton fermer (+ avatar de pair en session, comme sur la
-/// maquette). Tout le reste est neutre (clair `#FFFFFF`/`#F5F6F8`, sombre
-/// `#1D1F23`/`#17181B`).
+/// Le rouge de marque `#EF443B` reste **strictement parcimonieux** : logo,
+/// bouton « Se connecter », onglet actif, indicateur de rail, survol du bouton
+/// fermer, « Terminer » en session, avatar de pair. Tout le reste est neutre ;
+/// le vert signale l'accès/présence, le bleu les liens et la sélection, l'ambre
+/// les favoris.
 library;
 
 import 'package:flutter/material.dart';
 
-/// Rouge AnyDesk (couleur de marque officielle).
+/// Rayon de base de la maquette (`--r:4px`) — géométrie carrée.
+const double kNovaRayon = 4;
+
+/// Rouge de marque (`--red`).
 const Color kNovaRouge = Color(0xFFEF443B);
 
-/// Rouge pressé / survol du bouton principal.
-const Color kNovaRougePresse = Color(0xFFD83A32);
+/// Rouge pressé / survol du bouton principal (`--redp`).
+const Color kNovaRougePresse = Color(0xFFD93B33);
 
-/// Vert « en ligne / accès accordé » (pastilles, interrupteurs).
-const Color kNovaVert = Color(0xFF2FAE60);
+/// Vert « en ligne / accès accordé » (`--green`, valeur claire ; la variante
+/// sombre `#3FB457` est portée par [NovaTokens.vert]).
+const Color kNovaVert = Color(0xFF37A24B);
 
-/// Jeu de couleurs hors `ColorScheme` (filets, champs, barre de titre,
-/// vignettes…), calqué 1:1 sur les variables CSS de la maquette.
+/// Bleu « lien / sélection » (`--blue`, valeur claire).
+const Color kNovaBleu = Color(0xFF2F6FE0);
+
+/// Ambre « favori » (`--amber`).
+const Color kNovaAmbre = Color(0xFFD98A1F);
+
+/// Jeu de couleurs hors `ColorScheme` (filets, champs, barres, sélection…),
+/// calqué 1:1 sur les variables CSS de la maquette.
 @immutable
 class NovaTokens extends ThemeExtension<NovaTokens> {
   const NovaTokens({
     required this.fenetre,
     required this.panneau,
+    required this.panneau2,
     required this.barre,
     required this.filet,
     required this.filetFort,
@@ -36,88 +49,117 @@ class NovaTokens extends ThemeExtension<NovaTokens> {
     required this.champ,
     required this.champBordure,
     required this.logo,
+    required this.selection,
+    required this.vert,
+    required this.bleu,
+    required this.ambre,
     required this.vignette1,
     required this.vignette2,
     required this.vignette3,
   });
 
-  /// Clair — `:root[data-theme="light"]` de la maquette.
+  /// Clair — `:root` de la maquette.
   const NovaTokens.clair()
       : this(
-          fenetre: const Color(0xFFFFFFFF),
-          panneau: const Color(0xFFF5F6F8),
-          barre: const Color(0xFFFBFBFC),
-          filet: const Color(0xFFE7E9EC),
-          filetFort: const Color(0xFFDADDE1),
-          texte: const Color(0xFF15181D),
-          texte2: const Color(0xFF565C64),
-          texte3: const Color(0xFF9AA0A7),
-          survol: const Color(0xFFF1F3F5),
-          champ: const Color(0xFFF3F5F7),
-          champBordure: const Color(0xFFDCE0E4),
-          logo: const Color(0xFF22262C),
-          vignette1: const Color(0xFF59606B),
-          vignette2: const Color(0xFF4A5560),
-          vignette3: const Color(0xFF5B5560),
+          fenetre: const Color(0xFFFFFFFF), // --win
+          panneau: const Color(0xFFF5F6F8), // --panel
+          panneau2: const Color(0xFFEEF0F3), // --panel2
+          barre: const Color(0xFFF5F6F8), // --panel (tbar / status / rail)
+          filet: const Color(0xFFE1E4E8), // --line
+          filetFort: const Color(0xFFD2D6DC), // --line2
+          texte: const Color(0xFF1F2328), // --t1
+          texte2: const Color(0xFF5B636D), // --t2
+          texte3: const Color(0xFF8B929B), // --t3
+          survol: const Color(0xFFECEEF1), // --hover
+          champ: const Color(0xFFFFFFFF), // --win
+          champBordure: const Color(0xFFD2D6DC), // --line2
+          logo: const Color(0xFF1F2328), // hérite --t1
+          selection: const Color(0xFFE9F0FB), // --sel
+          vert: const Color(0xFF37A24B), // --green
+          bleu: const Color(0xFF2F6FE0), // --blue
+          ambre: const Color(0xFFD98A1F), // --amber
+          vignette1: const Color(0xFFD8DCE2),
+          vignette2: const Color(0xFFD2D6DC),
+          vignette3: const Color(0xFFDCE0E5),
         );
 
   /// Sombre — `:root[data-theme="dark"]` de la maquette.
   const NovaTokens.sombre()
       : this(
-          fenetre: const Color(0xFF1D1F23),
-          panneau: const Color(0xFF17181B),
-          barre: const Color(0xFF191A1D),
-          filet: const Color(0xFF2C2F34),
-          filetFort: const Color(0xFF34383D),
-          texte: const Color(0xFFE7E9EC),
-          texte2: const Color(0xFFA0A6AD),
-          texte3: const Color(0xFF6B7178),
-          survol: const Color(0xFF26292E),
-          champ: const Color(0xFF25282D),
-          champBordure: const Color(0xFF33373C),
-          logo: const Color(0xFFE7E9EC),
-          vignette1: const Color(0xFF3A4149),
-          vignette2: const Color(0xFF333B44),
-          vignette3: const Color(0xFF3D3942),
+          fenetre: const Color(0xFF181B21), // --win
+          panneau: const Color(0xFF1E222A), // --panel
+          panneau2: const Color(0xFF22272F), // --panel2
+          barre: const Color(0xFF1E222A), // --panel
+          filet: const Color(0xFF282E37), // --line
+          filetFort: const Color(0xFF343B45), // --line2
+          texte: const Color(0xFFE6E9ED), // --t1
+          texte2: const Color(0xFF9DA5AF), // --t2
+          texte3: const Color(0xFF69727C), // --t3
+          survol: const Color(0xFF252B34), // --hover
+          champ: const Color(0xFF181B21), // --win
+          champBordure: const Color(0xFF343B45), // --line2
+          logo: const Color(0xFFE6E9ED),
+          selection: const Color(0xFF1C2838), // --sel
+          vert: const Color(0xFF3FB457), // --green (dark)
+          bleu: const Color(0xFF5B93F0), // --blue (dark)
+          ambre: const Color(0xFFD98A1F), // --amber
+          vignette1: const Color(0xFF282E37),
+          vignette2: const Color(0xFF22272F),
+          vignette3: const Color(0xFF2A313B),
         );
 
-  /// Fond de fenêtre / panneaux principaux (`--win`).
+  /// Fond de fenêtre / contenu principal (`--win`).
   final Color fenetre;
 
-  /// Fond secondaire (`--sub`).
+  /// Fond secondaire (`--panel`).
   final Color panneau;
 
-  /// Fond des barres de titre et d'état (`--bar`).
+  /// Fond tertiaire (`--panel2`) — pastilles OS, bulles de discussion.
+  final Color panneau2;
+
+  /// Fond des barres de titre, d'état et du rail (`--panel`).
   final Color barre;
 
-  /// Filet séparateur 1px (`--line`).
+  /// Filet séparateur 1 px (`--line`).
   final Color filet;
 
-  /// Filet appuyé — bordures de fenêtre, survol de vignette (`--line-strong`).
+  /// Filet appuyé — bordures de champ/fenêtre (`--line2`).
   final Color filetFort;
 
-  /// Texte primaire (`--txt`).
+  /// Texte primaire (`--t1`).
   final Color texte;
 
-  /// Texte secondaire (`--txt2`).
+  /// Texte secondaire (`--t2`).
   final Color texte2;
 
-  /// Texte tertiaire / libellés discrets (`--txt3`).
+  /// Texte tertiaire / libellés discrets (`--t3`).
   final Color texte3;
 
   /// Fond de survol des contrôles neutres (`--hover`).
   final Color survol;
 
-  /// Fond des champs de saisie (`--field`).
+  /// Fond des champs de saisie (`--win`).
   final Color champ;
 
-  /// Bordure des champs de saisie (`--field-bd`).
+  /// Bordure des champs de saisie (`--line2`).
   final Color champBordure;
 
-  /// Couleur du mot-symbole « NovaDesk » (`--logo`).
+  /// Couleur du mot-symbole « NovaDesk ».
   final Color logo;
 
-  /// Fonds désaturés des vignettes d'aperçu (`--thumb1..3`).
+  /// Fond de sélection (lignes/onglets/groupes sélectionnés — `--sel`).
+  final Color selection;
+
+  /// Vert « accès / présence » adapté au thème (`--green`).
+  final Color vert;
+
+  /// Bleu « lien / sélection / mode » adapté au thème (`--blue`).
+  final Color bleu;
+
+  /// Ambre « favori » (`--amber`).
+  final Color ambre;
+
+  /// Fonds désaturés des vignettes d'aperçu.
   final Color vignette1;
   final Color vignette2;
   final Color vignette3;
@@ -130,6 +172,7 @@ class NovaTokens extends ThemeExtension<NovaTokens> {
   NovaTokens copyWith({
     Color? fenetre,
     Color? panneau,
+    Color? panneau2,
     Color? barre,
     Color? filet,
     Color? filetFort,
@@ -140,6 +183,10 @@ class NovaTokens extends ThemeExtension<NovaTokens> {
     Color? champ,
     Color? champBordure,
     Color? logo,
+    Color? selection,
+    Color? vert,
+    Color? bleu,
+    Color? ambre,
     Color? vignette1,
     Color? vignette2,
     Color? vignette3,
@@ -147,6 +194,7 @@ class NovaTokens extends ThemeExtension<NovaTokens> {
     return NovaTokens(
       fenetre: fenetre ?? this.fenetre,
       panneau: panneau ?? this.panneau,
+      panneau2: panneau2 ?? this.panneau2,
       barre: barre ?? this.barre,
       filet: filet ?? this.filet,
       filetFort: filetFort ?? this.filetFort,
@@ -157,6 +205,10 @@ class NovaTokens extends ThemeExtension<NovaTokens> {
       champ: champ ?? this.champ,
       champBordure: champBordure ?? this.champBordure,
       logo: logo ?? this.logo,
+      selection: selection ?? this.selection,
+      vert: vert ?? this.vert,
+      bleu: bleu ?? this.bleu,
+      ambre: ambre ?? this.ambre,
       vignette1: vignette1 ?? this.vignette1,
       vignette2: vignette2 ?? this.vignette2,
       vignette3: vignette3 ?? this.vignette3,
@@ -166,29 +218,34 @@ class NovaTokens extends ThemeExtension<NovaTokens> {
   @override
   NovaTokens lerp(NovaTokens? other, double t) {
     if (other == null) return this;
-    Color melanger(Color a, Color b) => Color.lerp(a, b, t)!;
+    Color m(Color a, Color b) => Color.lerp(a, b, t)!;
     return NovaTokens(
-      fenetre: melanger(fenetre, other.fenetre),
-      panneau: melanger(panneau, other.panneau),
-      barre: melanger(barre, other.barre),
-      filet: melanger(filet, other.filet),
-      filetFort: melanger(filetFort, other.filetFort),
-      texte: melanger(texte, other.texte),
-      texte2: melanger(texte2, other.texte2),
-      texte3: melanger(texte3, other.texte3),
-      survol: melanger(survol, other.survol),
-      champ: melanger(champ, other.champ),
-      champBordure: melanger(champBordure, other.champBordure),
-      logo: melanger(logo, other.logo),
-      vignette1: melanger(vignette1, other.vignette1),
-      vignette2: melanger(vignette2, other.vignette2),
-      vignette3: melanger(vignette3, other.vignette3),
+      fenetre: m(fenetre, other.fenetre),
+      panneau: m(panneau, other.panneau),
+      panneau2: m(panneau2, other.panneau2),
+      barre: m(barre, other.barre),
+      filet: m(filet, other.filet),
+      filetFort: m(filetFort, other.filetFort),
+      texte: m(texte, other.texte),
+      texte2: m(texte2, other.texte2),
+      texte3: m(texte3, other.texte3),
+      survol: m(survol, other.survol),
+      champ: m(champ, other.champ),
+      champBordure: m(champBordure, other.champBordure),
+      logo: m(logo, other.logo),
+      selection: m(selection, other.selection),
+      vert: m(vert, other.vert),
+      bleu: m(bleu, other.bleu),
+      ambre: m(ambre, other.ambre),
+      vignette1: m(vignette1, other.vignette1),
+      vignette2: m(vignette2, other.vignette2),
+      vignette3: m(vignette3, other.vignette3),
     );
   }
 }
 
-/// `ColorScheme` **construit à la main** (pas de `fromSeed` : un seed rouge
-/// teinterait toute l'UI en rosé, à l'inverse de la cible neutre — doc 03 §1.1).
+/// `ColorScheme` construit à la main (pas de `fromSeed` : un seed rouge
+/// teinterait toute l'UI en rosé, à l'inverse de la cible neutre).
 ColorScheme _schema(Brightness brillance, NovaTokens t) {
   if (brillance == Brightness.light) {
     return ColorScheme.light(
@@ -200,7 +257,7 @@ ColorScheme _schema(Brightness brillance, NovaTokens t) {
       onSecondary: Colors.white,
       secondaryContainer: t.survol,
       onSecondaryContainer: t.texte,
-      tertiary: kNovaVert,
+      tertiary: t.vert,
       onTertiary: Colors.white,
       error: kNovaRouge,
       onError: Colors.white,
@@ -213,7 +270,7 @@ ColorScheme _schema(Brightness brillance, NovaTokens t) {
       surfaceContainerLow: t.barre,
       surfaceContainer: t.panneau,
       surfaceContainerHigh: t.survol,
-      surfaceContainerHighest: t.champ,
+      surfaceContainerHighest: t.panneau2,
       outline: t.filetFort,
       outlineVariant: t.filet,
       shadow: Colors.black,
@@ -231,7 +288,7 @@ ColorScheme _schema(Brightness brillance, NovaTokens t) {
     onSecondary: const Color(0xFF15181D),
     secondaryContainer: t.survol,
     onSecondaryContainer: t.texte,
-    tertiary: kNovaVert,
+    tertiary: t.vert,
     onTertiary: Colors.white,
     error: kNovaRouge,
     onError: Colors.white,
@@ -244,31 +301,32 @@ ColorScheme _schema(Brightness brillance, NovaTokens t) {
     surfaceContainerLow: t.barre,
     surfaceContainer: t.panneau,
     surfaceContainerHigh: t.survol,
-    surfaceContainerHighest: t.champ,
+    surfaceContainerHighest: t.panneau2,
     outline: t.filetFort,
     outlineVariant: t.filet,
     shadow: Colors.black,
-    inverseSurface: const Color(0xFFE7E9EC),
-    onInverseSurface: const Color(0xFF1D1F23),
+    inverseSurface: const Color(0xFFE6E9ED),
+    onInverseSurface: const Color(0xFF181B21),
     inversePrimary: kNovaRougePresse,
   );
 }
 
-/// Thème Material 3 complet (clair ou sombre) : à plat, dense, filets 1px.
+/// Thème Material 3 complet (clair ou sombre) : à plat, dense, filets 1 px,
+/// rayons carrés à 4 px.
 ThemeData novaTheme(Brightness brillance) {
   final tokens = brillance == Brightness.light
       ? const NovaTokens.clair()
       : const NovaTokens.sombre();
   final schema = _schema(brillance, tokens);
 
-  const rayonChamp = BorderRadius.all(Radius.circular(8));
+  const rayon = BorderRadius.all(Radius.circular(kNovaRayon));
 
   return ThemeData(
     useMaterial3: true,
     colorScheme: schema,
     extensions: [tokens],
 
-    // Densité compacte façon AnyDesk (doc 03 §1.3) + police système Windows.
+    // Densité compacte + police système Windows.
     visualDensity: const VisualDensity(horizontal: -1, vertical: -1),
     materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
     fontFamily: 'Segoe UI',
@@ -276,17 +334,16 @@ ThemeData novaTheme(Brightness brillance) {
     canvasColor: tokens.fenetre,
     dividerColor: tokens.filet,
 
-    // Desktop : pas d'effet d'encre « ripple », survols discrets.
+    // Desktop : pas d'effet d'encre, survols discrets.
     splashFactory: NoSplash.splashFactory,
     hoverColor: tokens.survol,
     highlightColor: tokens.survol,
     focusColor: tokens.survol,
 
-    // Typographie compacte (~13px de corps, titres 600).
     textTheme: const TextTheme(
-      headlineMedium: TextStyle(fontSize: 29, fontWeight: FontWeight.w700),
-      titleLarge: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-      titleMedium: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+      headlineMedium: TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
+      titleLarge: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+      titleMedium: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600),
       titleSmall: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600),
       bodyLarge: TextStyle(fontSize: 14),
       bodyMedium: TextStyle(fontSize: 13),
@@ -296,7 +353,6 @@ ThemeData novaTheme(Brightness brillance) {
       labelSmall: TextStyle(fontSize: 11, fontWeight: FontWeight.w500),
     ),
 
-    // Barres plates : fond « barre », filet bas 1px, aucune ombre.
     appBarTheme: AppBarTheme(
       backgroundColor: tokens.barre,
       foregroundColor: tokens.texte,
@@ -314,14 +370,14 @@ ThemeData novaTheme(Brightness brillance) {
       shape: LinearBorder.bottom(side: BorderSide(color: tokens.filet)),
     ),
 
-    // Cartes À PLAT : bordure 1px, rayon 9, AUCUNE ombre portée.
+    // Cartes à plat : bordure 1 px, rayon 4, aucune ombre.
     cardTheme: CardThemeData(
       elevation: 0,
       color: tokens.fenetre,
       surfaceTintColor: Colors.transparent,
       margin: EdgeInsets.zero,
       shape: RoundedRectangleBorder(
-        borderRadius: const BorderRadius.all(Radius.circular(9)),
+        borderRadius: rayon,
         side: BorderSide(color: tokens.filet),
       ),
     ),
@@ -334,9 +390,7 @@ ThemeData novaTheme(Brightness brillance) {
 
     iconTheme: IconThemeData(color: tokens.texte2, size: 18),
 
-    // Bouton plein par défaut : NEUTRE (anthracite / clair inversé) — le
-    // rouge de marque reste réservé au bouton « Se connecter », stylé
-    // explicitement sur l'accueil.
+    // Bouton plein neutre par défaut (le rouge reste réservé au « Se connecter »).
     filledButtonTheme: FilledButtonThemeData(
       style: ButtonStyle(
         backgroundColor: WidgetStateProperty.resolveWith(
@@ -350,39 +404,38 @@ ThemeData novaTheme(Brightness brillance) {
         foregroundColor: WidgetStatePropertyAll(tokens.fenetre),
         overlayColor: const WidgetStatePropertyAll(Colors.transparent),
         elevation: const WidgetStatePropertyAll(0),
-        minimumSize: const WidgetStatePropertyAll(Size(64, 38)),
+        minimumSize: const WidgetStatePropertyAll(Size(64, 34)),
         padding: const WidgetStatePropertyAll(
-          EdgeInsets.symmetric(horizontal: 16),
+          EdgeInsets.symmetric(horizontal: 14),
         ),
         textStyle: const WidgetStatePropertyAll(
           TextStyle(
-              fontSize: 13.5, fontWeight: FontWeight.w600,
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
               fontFamily: 'Segoe UI'),
         ),
         shape: const WidgetStatePropertyAll(
-          RoundedRectangleBorder(borderRadius: rayonChamp),
+          RoundedRectangleBorder(borderRadius: rayon),
         ),
       ),
     ),
 
-    // Bouton « fantôme » : bordure filet, texte secondaire (maquette .ghost).
+    // Bouton fantôme : bordure filet, texte primaire (maquette `.btn`).
     outlinedButtonTheme: OutlinedButtonThemeData(
       style: OutlinedButton.styleFrom(
-        foregroundColor: tokens.texte2,
-        side: BorderSide(color: tokens.filet),
+        foregroundColor: tokens.texte,
+        backgroundColor: tokens.fenetre,
+        side: BorderSide(color: tokens.filetFort),
         minimumSize: const Size(0, 32),
         padding: const EdgeInsets.symmetric(horizontal: 12),
         textStyle: const TextStyle(
-            fontSize: 12, fontWeight: FontWeight.w500,
-            fontFamily: 'Segoe UI'),
-        shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.all(Radius.circular(7)),
-        ),
+            fontSize: 12.5, fontWeight: FontWeight.w500, fontFamily: 'Segoe UI'),
+        shape: const RoundedRectangleBorder(borderRadius: rayon),
       ).copyWith(
         backgroundColor: WidgetStateProperty.resolveWith(
           (etats) => etats.contains(WidgetState.hovered)
               ? tokens.survol
-              : Colors.transparent,
+              : tokens.fenetre,
         ),
       ),
     ),
@@ -393,15 +446,12 @@ ThemeData novaTheme(Brightness brillance) {
         minimumSize: const Size(0, 32),
         padding: const EdgeInsets.symmetric(horizontal: 10),
         textStyle: const TextStyle(
-            fontSize: 12.5, fontWeight: FontWeight.w500,
-            fontFamily: 'Segoe UI'),
-        shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.all(Radius.circular(6)),
-        ),
+            fontSize: 12.5, fontWeight: FontWeight.w500, fontFamily: 'Segoe UI'),
+        shape: const RoundedRectangleBorder(borderRadius: rayon),
       ),
     ),
 
-    // Champs : fond « field », bordure 1px, focus = liseré rouge (maquette).
+    // Champs : fond « champ », bordure 1 px, focus = liseré rouge (maquette).
     inputDecorationTheme: InputDecorationTheme(
       isDense: true,
       filled: true,
@@ -409,31 +459,31 @@ ThemeData novaTheme(Brightness brillance) {
       hoverColor: tokens.champ,
       hintStyle: TextStyle(color: tokens.texte3, fontSize: 13),
       labelStyle: TextStyle(color: tokens.texte2, fontSize: 13),
-      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 11, vertical: 10),
       enabledBorder: OutlineInputBorder(
-        borderRadius: rayonChamp,
+        borderRadius: rayon,
         borderSide: BorderSide(color: tokens.champBordure),
       ),
       focusedBorder: const OutlineInputBorder(
-        borderRadius: rayonChamp,
+        borderRadius: rayon,
         borderSide: BorderSide(color: kNovaRouge, width: 1.4),
       ),
       border: OutlineInputBorder(
-        borderRadius: rayonChamp,
+        borderRadius: rayon,
         borderSide: BorderSide(color: tokens.champBordure),
       ),
       disabledBorder: OutlineInputBorder(
-        borderRadius: rayonChamp,
+        borderRadius: rayon,
         borderSide: BorderSide(color: tokens.filet),
       ),
     ),
 
-    // Interrupteurs : vert « accès » (le rouge reste réservé).
+    // Interrupteurs : vert « accès » adapté au thème.
     switchTheme: SwitchThemeData(
       trackColor: WidgetStateProperty.resolveWith(
         (etats) => etats.contains(WidgetState.selected)
-            ? kNovaVert
-            : tokens.champBordure,
+            ? tokens.vert
+            : tokens.filetFort,
       ),
       thumbColor: const WidgetStatePropertyAll(Colors.white),
       trackOutlineColor: const WidgetStatePropertyAll(Colors.transparent),
@@ -442,49 +492,47 @@ ThemeData novaTheme(Brightness brillance) {
     checkboxTheme: CheckboxThemeData(
       fillColor: WidgetStateProperty.resolveWith(
         (etats) => etats.contains(WidgetState.selected)
-            ? kNovaVert
+            ? tokens.vert
             : Colors.transparent,
       ),
       checkColor: const WidgetStatePropertyAll(Colors.white),
       side: BorderSide(color: tokens.champBordure, width: 1.4),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.all(Radius.circular(4)),
+        borderRadius: BorderRadius.all(Radius.circular(3)),
       ),
     ),
     radioTheme: RadioThemeData(
       fillColor: WidgetStateProperty.resolveWith(
         (etats) => etats.contains(WidgetState.selected)
-            ? kNovaVert
+            ? tokens.vert
             : tokens.champBordure,
       ),
     ),
 
-    // Menus contextuels : panneau net, filet 1px, ombre courte.
     popupMenuTheme: PopupMenuThemeData(
       color: tokens.fenetre,
       surfaceTintColor: Colors.transparent,
-      elevation: 6,
-      shadowColor: Colors.black.withValues(alpha: 0.25),
+      elevation: 8,
+      shadowColor: Colors.black.withValues(alpha: 0.22),
       textStyle: TextStyle(
           fontSize: 12.5, color: tokens.texte, fontFamily: 'Segoe UI'),
       labelTextStyle: WidgetStatePropertyAll(
-        TextStyle(fontSize: 12.5, color: tokens.texte,
-            fontFamily: 'Segoe UI'),
+        TextStyle(fontSize: 12.5, color: tokens.texte, fontFamily: 'Segoe UI'),
       ),
       shape: RoundedRectangleBorder(
-        borderRadius: const BorderRadius.all(Radius.circular(8)),
-        side: BorderSide(color: tokens.filet),
+        borderRadius: const BorderRadius.all(Radius.circular(6)),
+        side: BorderSide(color: tokens.filetFort),
       ),
     ),
     menuTheme: MenuThemeData(
       style: MenuStyle(
         backgroundColor: WidgetStatePropertyAll(tokens.fenetre),
         surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
-        elevation: const WidgetStatePropertyAll(6),
+        elevation: const WidgetStatePropertyAll(8),
         shape: WidgetStatePropertyAll(
           RoundedRectangleBorder(
-            borderRadius: const BorderRadius.all(Radius.circular(8)),
-            side: BorderSide(color: tokens.filet),
+            borderRadius: const BorderRadius.all(Radius.circular(6)),
+            side: BorderSide(color: tokens.filetFort),
           ),
         ),
       ),
@@ -494,20 +542,19 @@ ThemeData novaTheme(Brightness brillance) {
       backgroundColor: tokens.fenetre,
       surfaceTintColor: Colors.transparent,
       elevation: 10,
-      shadowColor: Colors.black.withValues(alpha: 0.35),
+      shadowColor: Colors.black.withValues(alpha: 0.4),
       shape: RoundedRectangleBorder(
-        borderRadius: const BorderRadius.all(Radius.circular(10)),
+        borderRadius: const BorderRadius.all(Radius.circular(8)),
         side: BorderSide(color: tokens.filetFort),
       ),
       titleTextStyle: TextStyle(
         fontSize: 15,
-        fontWeight: FontWeight.w700,
+        fontWeight: FontWeight.w600,
         color: tokens.texte,
         fontFamily: 'Segoe UI',
       ),
     ),
 
-    // Onglets : indicateur rouge 2px (usage autorisé : onglet actif).
     tabBarTheme: TabBarThemeData(
       labelColor: tokens.texte,
       unselectedLabelColor: tokens.texte2,
@@ -517,35 +564,31 @@ ThemeData novaTheme(Brightness brillance) {
       dividerHeight: 1,
       overlayColor: WidgetStatePropertyAll(tokens.survol),
       labelStyle: const TextStyle(
-          fontSize: 12.5, fontWeight: FontWeight.w600,
-          fontFamily: 'Segoe UI'),
+          fontSize: 12.5, fontWeight: FontWeight.w600, fontFamily: 'Segoe UI'),
       unselectedLabelStyle: const TextStyle(
-          fontSize: 12.5, fontWeight: FontWeight.w400,
-          fontFamily: 'Segoe UI'),
+          fontSize: 12.5, fontWeight: FontWeight.w400, fontFamily: 'Segoe UI'),
     ),
 
     segmentedButtonTheme: SegmentedButtonThemeData(
       style: ButtonStyle(
         backgroundColor: WidgetStateProperty.resolveWith(
           (etats) => etats.contains(WidgetState.selected)
-              ? tokens.fenetre
+              ? kNovaRouge
               : tokens.champ,
         ),
         foregroundColor: WidgetStateProperty.resolveWith(
           (etats) => etats.contains(WidgetState.selected)
-              ? tokens.texte
+              ? Colors.white
               : tokens.texte2,
         ),
-        side: WidgetStatePropertyAll(BorderSide(color: tokens.filet)),
+        side: WidgetStatePropertyAll(BorderSide(color: tokens.filetFort)),
         textStyle: const WidgetStatePropertyAll(
-          TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
-              fontFamily: 'Segoe UI'),
+          TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w500, fontFamily: 'Segoe UI'),
         ),
         visualDensity: const VisualDensity(horizontal: -2, vertical: -2),
         shape: const WidgetStatePropertyAll(
-          RoundedRectangleBorder(
-            borderRadius: BorderRadius.all(Radius.circular(7)),
-          ),
+          RoundedRectangleBorder(borderRadius: rayon),
         ),
       ),
     ),
@@ -555,22 +598,27 @@ ThemeData novaTheme(Brightness brillance) {
       iconColor: tokens.texte2,
       textColor: tokens.texte,
       titleTextStyle: TextStyle(
-          fontSize: 13, fontWeight: FontWeight.w500, color: tokens.texte,
+          fontSize: 13,
+          fontWeight: FontWeight.w500,
+          color: tokens.texte,
           fontFamily: 'Segoe UI'),
-      subtitleTextStyle: TextStyle(fontSize: 11.5, color: tokens.texte3,
-          fontFamily: 'Segoe UI'),
+      subtitleTextStyle: TextStyle(
+          fontSize: 11.5, color: tokens.texte3, fontFamily: 'Segoe UI'),
       contentPadding: const EdgeInsets.symmetric(horizontal: 16),
     ),
 
     tooltipTheme: TooltipThemeData(
       waitDuration: const Duration(milliseconds: 350),
       decoration: BoxDecoration(
-        color: const Color(0xFF0C0D10),
-        borderRadius: BorderRadius.circular(5),
+        color: const Color(0xFF05070A),
+        borderRadius: BorderRadius.circular(3),
       ),
-      textStyle: const TextStyle(color: Colors.white, fontSize: 11,
+      textStyle: const TextStyle(
+          color: Colors.white,
+          fontSize: 10.5,
+          fontWeight: FontWeight.w500,
           fontFamily: 'Segoe UI'),
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
     ),
 
     snackBarTheme: SnackBarThemeData(
@@ -580,25 +628,25 @@ ThemeData novaTheme(Brightness brillance) {
           : const Color(0xFF33373C),
       contentTextStyle: const TextStyle(
           color: Colors.white, fontSize: 12.5, fontFamily: 'Segoe UI'),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
     ),
 
     progressIndicatorTheme: ProgressIndicatorThemeData(
-      color: kNovaVert,
-      linearTrackColor: tokens.champ,
+      color: tokens.vert,
+      linearTrackColor: tokens.filetFort,
       circularTrackColor: tokens.champ,
     ),
 
     dropdownMenuTheme: DropdownMenuThemeData(
-      textStyle: TextStyle(fontSize: 13, color: tokens.texte,
-          fontFamily: 'Segoe UI'),
+      textStyle:
+          TextStyle(fontSize: 13, color: tokens.texte, fontFamily: 'Segoe UI'),
     ),
 
     scrollbarTheme: ScrollbarThemeData(
       thumbColor: WidgetStatePropertyAll(
-        tokens.texte3.withValues(alpha: 0.45),
+        tokens.filetFort.withValues(alpha: 0.9),
       ),
-      radius: const Radius.circular(4),
+      radius: const Radius.circular(6),
       thickness: const WidgetStatePropertyAll(6),
     ),
 

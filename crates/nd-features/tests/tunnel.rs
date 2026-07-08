@@ -4,9 +4,10 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
 
-use nd_features::tunnel::{pipe_bidirectional, LocalForwarder};
+use nd_features::tunnel::{pipe_bidirectional, LocalForwarder, TunnelStats};
 
 /// Crée une paire de flux TCP connectés l'un à l'autre via l'interface locale.
 fn paire_tcp() -> (TcpStream, TcpStream) {
@@ -89,4 +90,44 @@ fn local_forwarder_relaie_une_connexion() {
 
     serveur.join().unwrap();
     relais.join().unwrap().unwrap();
+}
+
+#[test]
+fn local_forwarder_stats_comptent_la_session() {
+    // « Service distant » en écho : renvoie la requête telle quelle.
+    let distant = TcpListener::bind("127.0.0.1:0").unwrap();
+    let adresse_distante = distant.local_addr().unwrap();
+    let serveur = thread::spawn(move || {
+        let (mut flux, _) = distant.accept().unwrap();
+        let mut requete = Vec::new();
+        flux.read_to_end(&mut requete).unwrap();
+        flux.write_all(&requete).unwrap();
+    });
+
+    let forwarder = LocalForwarder::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let adresse_locale = forwarder.local_addr().unwrap();
+    let stats = Arc::new(TunnelStats::new());
+    let relais = {
+        let stats = Arc::clone(&stats);
+        thread::spawn(move || {
+            forwarder.forward_one_stats(|_| TcpStream::connect(adresse_distante), &stats)
+        })
+    };
+
+    let mut client = TcpStream::connect(adresse_locale).unwrap();
+    client.write_all(b"1234567").unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut reponse = Vec::new();
+    client.read_to_end(&mut reponse).unwrap();
+    assert_eq!(reponse, b"1234567");
+
+    serveur.join().unwrap();
+    relais.join().unwrap().unwrap();
+
+    // Une session ; 7 octets client → distant, 7 octets distant → client (écho).
+    let instantane = stats.snapshot();
+    assert_eq!(instantane.connexions, 1);
+    assert_eq!(instantane.octets_a_vers_b, 7);
+    assert_eq!(instantane.octets_b_vers_a, 7);
+    assert_eq!(instantane.octets_total(), 14);
 }

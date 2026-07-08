@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ed25519_dalek::VerifyingKey;
 use nd_proto::{NdError, Result};
 use quinn::{Endpoint, VarInt};
 
@@ -57,6 +58,7 @@ use crate::quic::{
     accept_sur_endpoint, client_config, connect_sur_endpoint, endpoint_sur_socket, ensure_provider,
     runtime, server_config, spawn_transport, ServerIdentity,
 };
+use crate::ticket::TicketRelais;
 use crate::{QuicTransport, Transport};
 
 /// Taille maximale d'un ticket acceptée par `nd-relay` (annonce plus grande
@@ -295,6 +297,100 @@ pub fn accept_quic_via_relay(
 }
 
 // ---------------------------------------------------------------------------
+// Repli relais à ticket **signé** (plan 05, lot 07)
+// ---------------------------------------------------------------------------
+
+/// Vérifie localement le ticket signé (format, signature de l'autorité,
+/// expiration) et le mappe en erreur transport en cas de rejet.
+///
+/// Le contrôle a lieu **avant tout réseau** : un ticket altéré/expiré échoue
+/// sans même contacter le relais. Le relais reste un tuyau aveugle ; c'est le
+/// pair qui présente — et ici valide — le ticket.
+fn refuser_si_ticket_invalide(
+    ticket: &[u8],
+    autorite: &VerifyingKey,
+    maintenant: u64,
+) -> Result<()> {
+    TicketRelais::verifier(ticket, autorite, maintenant)
+        .map(|_| ())
+        .map_err(|e| NdError::Transport(format!("ticket de relais refusé : {e}")))
+}
+
+/// Comme [`connect_via_relay`], mais **vérifie d'abord le ticket signé**
+/// (`autorite` = clé publique du déploiement, `maintenant` = secondes UNIX,
+/// voir [`crate::ticket::maintenant_unix`]). Les octets exacts de `ticket` —
+/// tels que reçus du courtier de session — sont ensuite présentés au relais
+/// (les deux pairs présentent les mêmes).
+///
+/// # Errors
+/// [`NdError::Transport`] si le ticket est refusé (mal formé, signature
+/// invalide, expiré) — avant tout réseau — puis les erreurs de
+/// [`connect_via_relay`].
+pub fn connect_via_relay_signe(
+    relay_addr: SocketAddr,
+    ticket: &[u8],
+    autorite: &VerifyingKey,
+    maintenant: u64,
+    server_cert_der: &[u8],
+) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(connect_quic_via_relay_signe(
+        relay_addr,
+        ticket,
+        autorite,
+        maintenant,
+        server_cert_der,
+    )?))
+}
+
+/// Comme [`connect_via_relay_signe`], mais renvoie le type concret.
+///
+/// # Errors
+/// Voir [`connect_via_relay_signe`].
+pub fn connect_quic_via_relay_signe(
+    relay_addr: SocketAddr,
+    ticket: &[u8],
+    autorite: &VerifyingKey,
+    maintenant: u64,
+    server_cert_der: &[u8],
+) -> Result<QuicTransport> {
+    refuser_si_ticket_invalide(ticket, autorite, maintenant)?;
+    connect_quic_via_relay(relay_addr, ticket, server_cert_der)
+}
+
+/// Comme [`accept_via_relay`], mais **vérifie d'abord le ticket signé** (voir
+/// [`connect_via_relay_signe`] pour les paramètres). Côté appelé.
+///
+/// # Errors
+/// [`NdError::Transport`] si le ticket est refusé (avant tout réseau), puis les
+/// erreurs de [`accept_via_relay`].
+pub fn accept_via_relay_signe(
+    relay_addr: SocketAddr,
+    ticket: &[u8],
+    autorite: &VerifyingKey,
+    maintenant: u64,
+    identity: &ServerIdentity,
+) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(accept_quic_via_relay_signe(
+        relay_addr, ticket, autorite, maintenant, identity,
+    )?))
+}
+
+/// Comme [`accept_via_relay_signe`], mais renvoie le type concret.
+///
+/// # Errors
+/// Voir [`accept_via_relay_signe`].
+pub fn accept_quic_via_relay_signe(
+    relay_addr: SocketAddr,
+    ticket: &[u8],
+    autorite: &VerifyingKey,
+    maintenant: u64,
+    identity: &ServerIdentity,
+) -> Result<QuicTransport> {
+    refuser_si_ticket_invalide(ticket, autorite, maintenant)?;
+    accept_quic_via_relay(relay_addr, ticket, identity)
+}
+
+// ---------------------------------------------------------------------------
 // Tests — relais de test protocole-compatible (`[u32 len][ticket]` + tuyau
 // aveugle), sans vérification de signature (celle du vrai nd-relay, lot 07).
 // ---------------------------------------------------------------------------
@@ -302,6 +398,7 @@ pub fn accept_quic_via_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use nd_proto::{ChannelKind, Reliability};
     use std::collections::HashMap;
     use std::net::TcpListener;
@@ -458,5 +555,73 @@ mod tests {
         assert!(connect_quic_via_relay(relais, &[], identite.cert_der()).is_err());
         let trop_grand = vec![0u8; 1025];
         assert!(connect_quic_via_relay(relais, &trop_grand, identite.cert_der()).is_err());
+    }
+
+    /// Chemin relais **à ticket signé** de bout en bout : un ticket valide passe
+    /// la vérification locale des deux côtés puis traverse le relais aveugle.
+    #[test]
+    fn ticket_signe_valide_traverse_le_relais() {
+        let relais = mini_relais();
+        let identite = ServerIdentity::generate().expect("identité");
+        let cert = identite.cert_der().to_vec();
+
+        let cle = SigningKey::from_bytes(&[42u8; 32]);
+        let autorite = cle.verifying_key();
+        let maintenant = 1_000u64;
+        // Ed25519 déterministe : le même (portée, expiration) donne les mêmes
+        // octets des deux côtés ; on émet une fois et on partage les octets.
+        let ticket = TicketRelais::signer(&cle, 7, 9, maintenant + 3_600).to_bytes();
+
+        let ticket_appele = ticket.clone();
+        let appele = thread::spawn(move || {
+            accept_quic_via_relay_signe(relais, &ticket_appele, &autorite, maintenant, &identite)
+                .expect("accept signé")
+        });
+        let mut appelant =
+            connect_quic_via_relay_signe(relais, &ticket, &autorite, maintenant, &cert)
+                .expect("connect signé");
+        let mut appele = appele.join().expect("thread appelé");
+        assert!(appelant.is_connected());
+        assert!(appele.is_connected());
+
+        let h = appelant.open_channel(ChannelKind::Control);
+        appelant
+            .send(h, b"ticket-signe".to_vec(), Reliability::Reliable)
+            .expect("send appelant");
+        let (_, data) = attendre_message(&mut appele, Duration::from_secs(5))
+            .expect("message via relais signé");
+        assert_eq!(data, b"ticket-signe");
+    }
+
+    /// Un ticket signé altéré, expiré ou d'une autre autorité est refusé
+    /// **avant tout réseau** : l'adresse de relais (jamais contactée) est
+    /// injoignable, la vérification échoue en amont.
+    #[test]
+    fn ticket_signe_invalide_refuse_avant_reseau() {
+        let identite = ServerIdentity::generate().expect("identité");
+        let cert = identite.cert_der().to_vec();
+        let cle = SigningKey::from_bytes(&[42u8; 32]);
+        let autorite = cle.verifying_key();
+        // Port 1 : jamais contacté puisque la vérification échoue en amont.
+        let relais: SocketAddr = "127.0.0.1:1".parse().expect("adresse");
+
+        // Expiré (comparaison inclusive à l'instant `maintenant`).
+        let expire = TicketRelais::signer(&cle, 1, 2, 100).to_bytes();
+        assert!(connect_quic_via_relay_signe(relais, &expire, &autorite, 100, &cert).is_err());
+        assert!(accept_quic_via_relay_signe(relais, &expire, &autorite, 100, &identite).is_err());
+
+        // Altéré : la signature ne couvre plus la portée.
+        let mut altere = TicketRelais::signer(&cle, 1, 2, 10_000).to_bytes();
+        altere[8] ^= 1;
+        assert!(connect_quic_via_relay_signe(relais, &altere, &autorite, 100, &cert).is_err());
+
+        // Autre autorité : signature invérifiable.
+        let bon = TicketRelais::signer(&cle, 1, 2, 10_000).to_bytes();
+        let autre = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert!(connect_quic_via_relay_signe(relais, &bon, &autre, 100, &cert).is_err());
+
+        // Valide : accepté par la vérification (échouera ensuite, faute de
+        // relais joignable — mais la vérification, elle, est passée).
+        assert!(TicketRelais::verifier(&bon, &autorite, 100).is_ok());
     }
 }

@@ -1,49 +1,54 @@
-/// Chrome applicatif NovaDesk (maquette `anydesk-reference.html`) :
-/// barre de titre 40px à onglets (logo pastille rouge + « Accueil » + onglet
-/// de session + bouton « + » + contrôles fenêtre ─ ▢ ✕) et barre d'état 28px
-/// (« En ligne · Chiffrement de bout en bout · NovaDesk x.y »).
+/// Chrome applicatif NovaDesk (maquette `novadesk-app.html`) : barre de titre
+/// 38 px à onglets (logo pastille rouge + « NovaDesk » + onglet Accueil +
+/// onglet de session + « + » + « Compte » + contrôles fenêtre ─ ▢ ✕), **rail
+/// de navigation** 50 px (Accueil, Carnet, Enregistrements, Accès non
+/// surveillé, Réglages) et barre d'état 26 px.
 ///
-/// Contrainte no-admin (doc 03 §5.6) : sans plugin natif de fenêtrage, cette
-/// barre est **applicative** (dessinée sous le chrome OS) ; les boutons ─ ▢
-/// passent par le shim no-op `window_shim.dart`, ✕ ferme l'application.
+/// Contrainte no-admin : sans plugin natif de fenêtrage, cette barre est
+/// applicative (dessinée sous le chrome OS) ; ─ ▢ passent par le shim no-op
+/// `window_shim.dart`, ✕ ferme l'application.
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../app_routes.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
 import 'nova_icons.dart';
 
-/// Onglet actif de la barre de titre.
-enum NovaOnglet { accueil, session, reglages }
+/// Vue active — pilote la mise en évidence du rail et de l'onglet.
+enum NovaVue { accueil, carnet, enregistrements, nonSurveille, reglages, session }
 
-/// Habillage commun des écrans : titre + onglets en haut, contenu au centre,
-/// barre d'état en bas. `masquerChrome` (plein écran) ne laisse que le corps.
+/// Habillage commun des écrans : barre de titre + rail + contenu + barre d'état.
 class NovaAppFrame extends StatelessWidget {
   const NovaAppFrame({
     super.key,
     required this.corps,
-    this.ongletActif = NovaOnglet.accueil,
+    this.vue = NovaVue.accueil,
     this.libelleSession,
     this.masquerChrome = false,
+    this.afficherRail = true,
     this.etatGauche,
   });
 
   /// Contenu principal de l'écran.
   final Widget corps;
 
-  /// Onglet mis en évidence (soulignement rouge — usage réservé autorisé).
-  final NovaOnglet ongletActif;
+  /// Vue active (rail + onglet).
+  final NovaVue vue;
 
   /// Si non nul : un onglet de session (pastille verte + alias) est affiché.
   final String? libelleSession;
 
-  /// Plein écran : masque barre de titre et barre d'état.
+  /// Plein écran : masque tout le chrome, ne laisse que le corps.
   final bool masquerChrome;
 
-  /// Contenu additionnel à gauche de la barre d'état (état de session…).
+  /// Affiche le rail de navigation (masqué en session : la surface le couvre).
+  final bool afficherRail;
+
+  /// Contenu additionnel à gauche de la barre d'état (stats de session…).
   final Widget? etatGauche;
 
   @override
@@ -51,14 +56,32 @@ class NovaAppFrame extends StatelessWidget {
     if (masquerChrome) return corps;
     return Column(
       children: [
-        _BarreTitre(
-          ongletActif: ongletActif,
-          libelleSession: libelleSession,
+        _BarreTitre(vue: vue, libelleSession: libelleSession),
+        Expanded(
+          child: afficherRail
+              ? Row(
+                  children: [
+                    _RailNavigation(vue: vue),
+                    Expanded(child: corps),
+                  ],
+                )
+              : corps,
         ),
-        Expanded(child: corps),
         _BarreEtat(gauche: etatGauche),
       ],
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Navigation partagée : pile ≤ 2 (accueil = base, une vue au-dessus au plus).
+// ---------------------------------------------------------------------------
+
+void naviguerVersVue(BuildContext context, String route) {
+  final nav = Navigator.of(context);
+  nav.popUntil((r) => r.isFirst);
+  if (route != NovaRoutes.accueil) {
+    nav.pushNamed(route);
   }
 }
 
@@ -67,23 +90,17 @@ class NovaAppFrame extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _BarreTitre extends StatelessWidget {
-  const _BarreTitre({required this.ongletActif, this.libelleSession});
+  const _BarreTitre({required this.vue, this.libelleSession});
 
-  final NovaOnglet ongletActif;
+  final NovaVue vue;
   final String? libelleSession;
-
-  /// Revenir à l'accueil = dépiler jusqu'à la première route.
-  void _versAccueil(BuildContext context) {
-    if (ongletActif != NovaOnglet.accueil) {
-      Navigator.of(context).popUntil((route) => route.isFirst);
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
+    final enSession = vue == NovaVue.session;
     return Container(
-      height: 40,
+      height: 38,
       decoration: BoxDecoration(
         color: t.barre,
         border: Border(bottom: BorderSide(color: t.filet)),
@@ -96,46 +113,32 @@ class _BarreTitre extends StatelessWidget {
           Text(
             'NovaDesk',
             style: TextStyle(
-              fontSize: 13.5,
-              fontWeight: FontWeight.w700,
-              color: t.logo,
-            ),
+                fontSize: 13.5, fontWeight: FontWeight.w700, color: t.logo),
           ),
-          const SizedBox(width: 20),
-          _Onglet(
+          const SizedBox(width: 14),
+          _OngletTitre(
             libelle: 'Accueil',
-            actif: ongletActif == NovaOnglet.accueil,
-            onTap: () => _versAccueil(context),
+            icone: NovaIcones.accueil,
+            actif: !enSession,
+            onTap: () => naviguerVersVue(context, NovaRoutes.accueil),
           ),
           if (libelleSession != null)
-            _Onglet(
+            _OngletSession(
               libelle: libelleSession!,
-              actif: ongletActif == NovaOnglet.session,
-              pastilleVerte: true,
-              onTap: () {},
+              actif: enSession,
+              onFermer: () => Navigator.of(context).maybePop(),
             ),
-          if (ongletActif == NovaOnglet.reglages)
-            _Onglet(libelle: 'Réglages', actif: true, onTap: () {}),
-          _BoutonOngletPlus(
-            onTap: () {
-              // Multi-onglets de session : à venir (une session à la fois).
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Connexions multiples en onglets — à venir.'),
-                ),
-              );
-            },
+          _BoutonPlus(
+            onTap: () => ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                  content: Text('Connexions multiples en onglets — à venir.')),
+            ),
           ),
           const Spacer(),
-          _BoutonFenetre(
-            icone: NovaIcones.reglages,
-            taille: 15,
-            infobulle: 'Réglages',
-            onTap: () {
-              if (ongletActif != NovaOnglet.reglages) {
-                Navigator.of(context).pushNamed('/parametres');
-              }
-            },
+          _BoutonCompte(
+            onTap: () => ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Gestion du compte — à venir.')),
+            ),
           ),
           const _ControlesFenetre(),
         ],
@@ -144,25 +147,25 @@ class _BarreTitre extends StatelessWidget {
   }
 }
 
-/// Onglet de la barre de titre : hauteur pleine, filet actif rouge 2px.
-class _Onglet extends StatefulWidget {
-  const _Onglet({
+/// Onglet de la barre de titre (hauteur pleine, filet actif rouge 2 px bas).
+class _OngletTitre extends StatefulWidget {
+  const _OngletTitre({
     required this.libelle,
+    required this.icone,
     required this.actif,
     required this.onTap,
-    this.pastilleVerte = false,
   });
 
   final String libelle;
+  final IconData icone;
   final bool actif;
-  final bool pastilleVerte;
   final VoidCallback onTap;
 
   @override
-  State<_Onglet> createState() => _OngletState();
+  State<_OngletTitre> createState() => _OngletTitreState();
 }
 
-class _OngletState extends State<_Onglet> {
+class _OngletTitreState extends State<_OngletTitre> {
   bool _survole = false;
 
   @override
@@ -176,10 +179,12 @@ class _OngletState extends State<_Onglet> {
         onTap: widget.onTap,
         behavior: HitTestBehavior.opaque,
         child: Container(
-          height: 40,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
           decoration: BoxDecoration(
+            color: widget.actif ? t.fenetre : Colors.transparent,
             border: Border(
+              right: BorderSide(color: t.filet),
               bottom: BorderSide(
                 width: 2,
                 color: widget.actif ? kNovaRouge : Colors.transparent,
@@ -189,23 +194,15 @@ class _OngletState extends State<_Onglet> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (widget.pastilleVerte) ...[
-                Container(
-                  width: 6,
-                  height: 6,
-                  decoration: const BoxDecoration(
-                    color: kNovaVert,
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                const SizedBox(width: 8),
-              ],
+              NovaIcone(widget.icone,
+                  taille: 14,
+                  couleur: widget.actif || _survole ? t.texte : t.texte2),
+              const SizedBox(width: 8),
               Text(
                 widget.libelle,
                 style: TextStyle(
                   fontSize: 12.5,
-                  fontWeight:
-                      widget.actif ? FontWeight.w600 : FontWeight.w400,
+                  fontWeight: widget.actif ? FontWeight.w600 : FontWeight.w400,
                   color: widget.actif || _survole ? t.texte : t.texte2,
                 ),
               ),
@@ -217,17 +214,105 @@ class _OngletState extends State<_Onglet> {
   }
 }
 
-/// Bouton « + » : nouvelle connexion en onglet.
-class _BoutonOngletPlus extends StatefulWidget {
-  const _BoutonOngletPlus({required this.onTap});
+/// Onglet de session : pastille verte + alias + croix de fermeture.
+class _OngletSession extends StatelessWidget {
+  const _OngletSession({
+    required this.libelle,
+    required this.actif,
+    required this.onFermer,
+  });
 
+  final String libelle;
+  final bool actif;
+  final VoidCallback onFermer;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return Container(
+      height: 38,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: actif ? t.fenetre : Colors.transparent,
+        border: Border(
+          right: BorderSide(color: t.filet),
+          bottom: BorderSide(
+            width: 2,
+            color: actif ? kNovaRouge : Colors.transparent,
+          ),
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(color: t.vert, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            libelle,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: actif ? FontWeight.w600 : FontWeight.w400,
+              color: actif ? t.texte : t.texte2,
+            ),
+          ),
+          const SizedBox(width: 8),
+          _CroixOnglet(onTap: onFermer),
+        ],
+      ),
+    );
+  }
+}
+
+class _CroixOnglet extends StatefulWidget {
+  const _CroixOnglet({required this.onTap});
   final VoidCallback onTap;
 
   @override
-  State<_BoutonOngletPlus> createState() => _BoutonOngletPlusState();
+  State<_CroixOnglet> createState() => _CroixOngletState();
 }
 
-class _BoutonOngletPlusState extends State<_BoutonOngletPlus> {
+class _CroixOngletState extends State<_CroixOnglet> {
+  bool _survole = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _survole = true),
+      onExit: (_) => setState(() => _survole = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: Container(
+          width: 16,
+          height: 16,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: _survole ? t.survol : Colors.transparent,
+            borderRadius: BorderRadius.circular(3),
+          ),
+          child: NovaIcone(NovaIcones.fermer,
+              taille: 11, couleur: _survole ? t.texte : t.texte3),
+        ),
+      ),
+    );
+  }
+}
+
+/// Bouton « + » (nouvelle connexion en onglet).
+class _BoutonPlus extends StatefulWidget {
+  const _BoutonPlus({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  State<_BoutonPlus> createState() => _BoutonPlusState();
+}
+
+class _BoutonPlusState extends State<_BoutonPlus> {
   bool _survole = false;
 
   @override
@@ -241,13 +326,51 @@ class _BoutonOngletPlusState extends State<_BoutonOngletPlus> {
         onTap: widget.onTap,
         behavior: HitTestBehavior.opaque,
         child: Container(
-          height: 40,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
           alignment: Alignment.center,
-          child: NovaIcone(
-            NovaIcones.plus,
-            taille: 15,
-            couleur: _survole ? t.texte : t.texte3,
+          child: NovaIcone(NovaIcones.plus,
+              taille: 15, couleur: _survole ? t.texte : t.texte3),
+        ),
+      ),
+    );
+  }
+}
+
+/// « Compte » à droite de la barre de titre (maquette `.acct`).
+class _BoutonCompte extends StatefulWidget {
+  const _BoutonCompte({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  State<_BoutonCompte> createState() => _BoutonCompteState();
+}
+
+class _BoutonCompteState extends State<_BoutonCompte> {
+  bool _survole = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _survole = true),
+      onExit: (_) => setState(() => _survole = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          height: 38,
+          padding: const EdgeInsets.symmetric(horizontal: 11),
+          color: _survole ? t.survol : Colors.transparent,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              NovaIcone(NovaIcones.utilisateur, taille: 15, couleur: t.texte2),
+              const SizedBox(width: 7),
+              Text('Compte',
+                  style: TextStyle(fontSize: 12, color: t.texte2)),
+            ],
           ),
         ),
       ),
@@ -255,7 +378,7 @@ class _BoutonOngletPlusState extends State<_BoutonOngletPlus> {
   }
 }
 
-/// Contrôles fenêtre ─ ▢ ✕ (44×40, survol discret, fermer = rouge).
+/// Contrôles fenêtre ─ ▢ ✕ (38×38, survol discret, fermer = rouge).
 class _ControlesFenetre extends StatelessWidget {
   const _ControlesFenetre();
 
@@ -266,21 +389,16 @@ class _ControlesFenetre extends StatelessWidget {
       children: [
         _BoutonFenetre(
           icone: NovaIcones.reduire,
-          taille: 12,
           infobulle: 'Réduire',
-          // Shim no-op : le contrôle réel de fenêtre est un chantier
-          // packaging (doc 03 §5.6) — aucun plugin natif ici.
           onTap: () {},
         ),
         _BoutonFenetre(
           icone: NovaIcones.agrandir,
-          taille: 11,
           infobulle: 'Agrandir',
           onTap: () {},
         ),
         _BoutonFenetre(
           icone: NovaIcones.fermer,
-          taille: 12,
           infobulle: 'Fermer',
           fermeture: true,
           onTap: () => SystemNavigator.pop(),
@@ -293,18 +411,14 @@ class _ControlesFenetre extends StatelessWidget {
 class _BoutonFenetre extends StatefulWidget {
   const _BoutonFenetre({
     required this.icone,
-    required this.taille,
     required this.infobulle,
     required this.onTap,
     this.fermeture = false,
   });
 
-  final NovaIconeData icone;
-  final double taille;
+  final IconData icone;
   final String infobulle;
   final VoidCallback onTap;
-
-  /// Le bouton fermer vire au rouge au survol (seul usage autorisé ici).
   final bool fermeture;
 
   @override
@@ -334,12 +448,11 @@ class _BoutonFenetreState extends State<_BoutonFenetre> {
           onTap: widget.onTap,
           behavior: HitTestBehavior.opaque,
           child: Container(
-            width: 44,
-            height: 40,
+            width: 38,
+            height: 38,
             color: fond,
             alignment: Alignment.center,
-            child: NovaIcone(widget.icone,
-                taille: widget.taille, couleur: couleur),
+            child: NovaIcone(widget.icone, taille: 15, couleur: couleur),
           ),
         ),
       ),
@@ -348,12 +461,146 @@ class _BoutonFenetreState extends State<_BoutonFenetre> {
 }
 
 // ---------------------------------------------------------------------------
-// Logo
+// Rail de navigation
 // ---------------------------------------------------------------------------
 
-/// Pastille de marque : disque rouge + arc blanc ouvert (maquette `.brand .m`).
+class _RailNavigation extends StatelessWidget {
+  const _RailNavigation({required this.vue});
+
+  final NovaVue vue;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return Container(
+      width: 50,
+      decoration: BoxDecoration(
+        color: t.barre,
+        border: Border(right: BorderSide(color: t.filet)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Column(
+        children: [
+          _RailItem(
+            icone: NovaIcones.accueil,
+            infobulle: 'Accueil',
+            actif: vue == NovaVue.accueil,
+            onTap: () => naviguerVersVue(context, NovaRoutes.accueil),
+          ),
+          _RailItem(
+            icone: NovaIcones.carnet,
+            infobulle: 'Carnet',
+            actif: vue == NovaVue.carnet,
+            onTap: () => naviguerVersVue(context, NovaRoutes.carnet),
+          ),
+          _RailItem(
+            icone: NovaIcones.enregistrements,
+            infobulle: 'Enregistrements',
+            actif: vue == NovaVue.enregistrements,
+            onTap: () => naviguerVersVue(context, NovaRoutes.enregistrements),
+          ),
+          _RailItem(
+            icone: NovaIcones.cadenas,
+            infobulle: 'Accès non surveillé',
+            actif: vue == NovaVue.nonSurveille,
+            onTap: () => naviguerVersVue(context, NovaRoutes.nonSurveille),
+          ),
+          const Spacer(),
+          _RailItem(
+            icone: NovaIcones.reglages,
+            infobulle: 'Réglages',
+            actif: vue == NovaVue.reglages,
+            onTap: () => naviguerVersVue(context, NovaRoutes.reglages),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RailItem extends StatefulWidget {
+  const _RailItem({
+    required this.icone,
+    required this.infobulle,
+    required this.actif,
+    required this.onTap,
+  });
+
+  final IconData icone;
+  final String infobulle;
+  final bool actif;
+  final VoidCallback onTap;
+
+  @override
+  State<_RailItem> createState() => _RailItemState();
+}
+
+class _RailItemState extends State<_RailItem> {
+  bool _survole = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    final couleur = widget.actif
+        ? kNovaRouge
+        : (_survole ? t.texte : t.texte3);
+    return Tooltip(
+      message: widget.infobulle,
+      preferBelow: false,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _survole = true),
+        onExit: (_) => setState(() => _survole = false),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          behavior: HitTestBehavior.opaque,
+          child: SizedBox(
+            width: 50,
+            height: 40,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (widget.actif)
+                  Positioned(
+                    left: 0,
+                    top: 8,
+                    bottom: 8,
+                    child: Container(
+                      width: 3,
+                      decoration: const BoxDecoration(
+                        color: kNovaRouge,
+                        borderRadius:
+                            BorderRadius.horizontal(right: Radius.circular(2)),
+                      ),
+                    ),
+                  ),
+                Container(
+                  width: 36,
+                  height: 36,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: widget.actif
+                        ? t.fenetre
+                        : (_survole ? t.survol : Colors.transparent),
+                    borderRadius: BorderRadius.circular(kNovaRayon),
+                  ),
+                  child: NovaIcone(widget.icone, taille: 19, couleur: couleur),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logo (pastille de marque : disque rouge + arc blanc ouvert)
+// ---------------------------------------------------------------------------
+
 class NovaLogo extends StatelessWidget {
-  const NovaLogo({super.key, this.taille = 18});
+  const NovaLogo({super.key, this.taille = 17});
 
   final double taille;
 
@@ -374,19 +621,17 @@ class _PeintreLogo extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final centre = Offset(size.width / 2, size.height / 2);
     canvas.drawCircle(centre, size.width / 2, Paint()..color = kNovaRouge);
-    // Arc blanc : anneau inset 5/18, ouvert sur ~90° (bord droit),
-    // pivoté de 40° comme dans la maquette.
-    final rayon = size.width / 2 - size.width * (5 / 18) + 1;
+    final rayon = size.width / 2 - size.width * (4.5 / 17) + 1;
     final trait = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = size.width * (2 / 18)
+      ..strokeWidth = size.width * (2 / 17)
       ..strokeCap = StrokeCap.round
       ..color = Colors.white;
-    const depart = (40 - 45) * 3.14159265 / 180; // rotation 40° − ouverture
+    const depart = (42 - 45) * 3.14159265 / 180;
     canvas.drawArc(
       Rect.fromCircle(center: centre, radius: rayon),
       depart,
-      3.14159265 * 1.5, // 270° dessinés, 90° ouverts
+      3.14159265 * 1.5,
       false,
       trait,
     );
@@ -414,7 +659,7 @@ class _BarreEtat extends ConsumerWidget {
         );
     final styleDiscret = TextStyle(fontSize: 11, color: t.texte3);
     return Container(
-      height: 28,
+      height: 26,
       padding: const EdgeInsets.symmetric(horizontal: 14),
       decoration: BoxDecoration(
         color: t.barre,
@@ -425,28 +670,34 @@ class _BarreEtat extends ConsumerWidget {
           Container(
             width: 7,
             height: 7,
-            decoration: const BoxDecoration(
-              color: kNovaVert,
-              shape: BoxShape.circle,
-            ),
+            decoration: BoxDecoration(color: t.vert, shape: BoxShape.circle),
           ),
           const SizedBox(width: 6),
-          Text('En ligne',
-              style: TextStyle(fontSize: 11, color: t.texte2)),
-          if (gauche != null) ...[
-            const SizedBox(width: 14),
-            Expanded(child: gauche!),
-          ] else
-            const Spacer(),
+          if (gauche != null)
+            Expanded(child: gauche!)
+          else
+            Expanded(
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text('Prêt · connecté au rendez-vous',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 11, color: t.texte2)),
+                  ),
+                  const SizedBox(width: 8),
+                  Text('·', style: styleDiscret),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text('Chiffrement de bout en bout',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: styleDiscret),
+                  ),
+                ],
+              ),
+            ),
           const SizedBox(width: 8),
-          Text('Chiffrement de bout en bout', style: styleDiscret),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4),
-            child: Text('·',
-                style: TextStyle(
-                    fontSize: 11,
-                    color: t.texte3.withValues(alpha: 0.5))),
-          ),
           Text('NovaDesk $version', style: styleDiscret),
         ],
       ),

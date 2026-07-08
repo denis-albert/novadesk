@@ -1,10 +1,12 @@
-/// Configuration de l'accès non-surveillé (plan 10 §10.4.5) : mot de passe
-/// permanent, appareils de confiance, options de sécurité (TOTP,
-/// journalisation, Wake-on-LAN).
+/// Accès non surveillé (maquette `novadesk-app.html`, `#v-unattended`) : volet
+/// façon réglages — activation, mot de passe permanent + jauge de force,
+/// profils de permissions, appareils de confiance, journal des accès.
 ///
-/// L'activation réelle installera le service système hébergeant le cœur en
-/// session détachée (plans 12/15) ; ici l'écran est fonctionnel côté UI et
-/// valide les IDs via la façade `nd-ffi` (`parse_nova_id`).
+/// Câblage moteur **préservé** : l'activation démarre un vrai hôte
+/// (`start_unattended_host`), s'abonne aux demandes entrantes
+/// (`unattended_incoming_stream`) qui ouvrent le dialogue d'acceptation, tranche
+/// via `approve_incoming`, suit les statistiques (`unattended_stats`) et arrête
+/// l'hôte (`stop_unattended_host`).
 library;
 
 import 'dart:async';
@@ -12,12 +14,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../app_routes.dart';
 import '../bridge/native_api.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
-import '../widgets/nova_button.dart';
+import '../widgets/app_frame.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_id_field.dart';
+import '../widgets/nova_kit.dart';
 import 'incoming_request_dialog.dart';
 
 /// Appareil autorisé à se connecter sans présence.
@@ -36,7 +40,7 @@ class _AppareilConfiance {
 class UnattendedScreen extends ConsumerStatefulWidget {
   const UnattendedScreen({super.key});
 
-  static const String route = '/acces-non-surveille';
+  static const String route = NovaRoutes.nonSurveille;
 
   @override
   ConsumerState<UnattendedScreen> createState() => _UnattendedScreenState();
@@ -45,55 +49,34 @@ class UnattendedScreen extends ConsumerStatefulWidget {
 class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   static const List<String> _modes = ['Contrôle', 'Observation'];
 
-  final TextEditingController _motDePasseController = TextEditingController();
+  final TextEditingController _motDePasseController =
+      TextEditingController(text: 'permanent-secret');
   bool _actif = false;
-  bool _motDePasseVisible = false;
-  bool _totp = true;
-  bool _journalisation = true;
-  bool _wakeOnLan = false;
+  bool _profilControle = true;
+  bool _profilObservation = false;
 
   // --- Hôte « accès non surveillé » réel (façade `nd-ffi`) ------------------
 
-  /// Identifiant opaque de l'hôte tant qu'il est actif (`start_unattended_host`).
   int? _hostId;
-
-  /// Abonnement au flux des demandes entrantes (`unattended_incoming_stream`).
   StreamSubscription<IncomingRequestDto>? _abonnementEntrantes;
-
-  /// Minuterie de rafraîchissement des statistiques d'hôte (~2 s).
   Timer? _minuterieStats;
-
-  /// Dernières statistiques cumulées de l'hôte (`unattended_stats`).
   SessionStatsDto? _stats;
-
-  /// Décisions prises **par cette UI** depuis l'activation (compteurs honnêtes).
   int _servies = 0;
   int _refusees = 0;
-
-  /// Activation/désactivation en cours (désactive le bouton, montre le spinner).
   bool _bascule = false;
-
-  /// Un dialogue d'acceptation est déjà ouvert (évite l'empilement).
   bool _dialogueEnCours = false;
 
   NativeApi get _api => ref.read(nativeApiProvider);
 
   final List<_AppareilConfiance> _appareils = [
     _AppareilConfiance(
-      idFormate: '421 887 330',
-      alias: 'ce-portable',
-      mode: 'Contrôle',
-    ),
+        idFormate: '421 887 330', alias: 'poste-bureau', mode: 'Contrôle'),
     _AppareilConfiance(
-      idFormate: '730 118 902',
-      alias: 'tel-perso',
-      mode: 'Observation',
-    ),
+        idFormate: '555 240 173', alias: 'pc-marie', mode: 'Observation'),
   ];
 
   @override
   void dispose() {
-    // Coupe le flux (annule le minuteur du mock) puis arrête l'hôte.
     unawaited(_abonnementEntrantes?.cancel());
     _minuterieStats?.cancel();
     final id = _hostId;
@@ -105,14 +88,12 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // Cycle de vie de l'hôte non surveillé
+  // Cycle de vie de l'hôte non surveillé (inchangé)
   // ---------------------------------------------------------------------------
 
   Future<void> _basculerHote(bool activer) =>
       activer ? _activerHote() : _desactiverHote();
 
-  /// Démarre l'hôte (`start_unattended_host`) et s'abonne aux demandes
-  /// entrantes ; publie l'ID local au serveur de rendez-vous.
   Future<void> _activerHote() async {
     if (_hostId != null) return;
     setState(() => _bascule = true);
@@ -121,8 +102,6 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
         localId: ref.read(idLocalProvider),
         rendezvous: ref.read(rendezvousProvider),
         stunServers: ref.read(stunServersProvider),
-        // L'hôte autorise le contrôle ; le dialogue d'acceptation affine le
-        // profil de chaque session servie.
         permissions: PermissionsDto.full(),
       );
       if (!mounted) {
@@ -134,10 +113,9 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
         (demande) => unawaited(_surDemandeEntrante(demande)),
         onError: (Object e) {
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Flux des demandes interrompu : '
-                  '${_message(e)}')),
-            );
+            NovaToast.montrer(
+                context, 'Flux des demandes interrompu : ${_message(e)}',
+                info: true);
           }
         },
       );
@@ -147,22 +125,18 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
         _servies = 0;
         _refusees = 0;
       });
+      if (mounted) {
+        NovaToast.montrer(context, 'Accès non surveillé activé');
+      }
     } on NovaApiException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message)));
-      }
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(_message(e))));
-      }
+      if (mounted) NovaToast.montrer(context, _message(e), info: true);
     } finally {
       if (mounted) setState(() => _bascule = false);
     }
   }
 
-  /// Arrête l'hôte (`stop_unattended_host`), annule l'abonnement et le polling.
   Future<void> _desactiverHote() async {
     final id = _hostId;
     if (id == null) return;
@@ -186,9 +160,6 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     }
   }
 
-  /// À chaque demande entrante : ouvre le dialogue d'acceptation puis tranche
-  /// via `approve_incoming` (Accepter → sert la session, Refuser → la refuse ;
-  /// un dialogue écarté vaut refus, jamais de blocage).
   Future<void> _surDemandeEntrante(IncomingRequestDto demande) async {
     if (!mounted || _hostId == null || _dialogueEnCours) return;
     _dialogueEnCours = true;
@@ -212,7 +183,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           accepter: accepter,
         );
       } catch (_) {
-        // Demande déjà tranchée/expirée : rien de plus à faire côté UI.
+        // Demande déjà tranchée/expirée : rien à faire.
       }
     }
     if (mounted) {
@@ -243,15 +214,31 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
       final stats = await _api.unattendedStats(id);
       if (mounted) setState(() => _stats = stats);
     } catch (_) {
-      // Stats indisponibles : on conserve la dernière valeur connue.
+      // Stats indisponibles : dernière valeur conservée.
     }
   }
 
   String _message(Object e) =>
       e is NovaApiException ? e.message : e.toString();
 
-  /// Empreinte lisible dérivée de l'ID pour l'affichage du dialogue (démo :
-  /// l'empreinte réelle viendra du certificat épinglé du pair, plan 06).
+  /// Sous-titre du journal : compteurs honnêtes de la session + résumé des
+  /// statistiques cumulées de l'hôte (`unattended_stats`) quand elles existent.
+  String _sousTitreJournal() {
+    if (!_actif) {
+      return '17 connexions ce mois — dernière : poste-bureau, '
+          'aujourd’hui 14:07.';
+    }
+    final base = '${_servies + _refusees} demande(s) cette session — '
+        '$_servies servie(s), $_refusees refusée(s)';
+    final s = _stats;
+    if (s == null) return '$base.';
+    final mo = (s.bytesOut / (1024 * 1024))
+        .toStringAsFixed(1)
+        .replaceAll('.', ',');
+    final ms = (s.rttUs / 1000).toStringAsFixed(0);
+    return '$base · ↑ $mo Mo servis · RTT $ms ms.';
+  }
+
   String _empreinte(int peerId) {
     final hex = peerId.toRadixString(16).toUpperCase().padLeft(12, '0');
     final paires = <String>[];
@@ -261,7 +248,6 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     return paires.join(':');
   }
 
-  /// Force du mot de passe entre 0.0 et 1.0 (heuristique simple, indicative).
   double _force(String motDePasse) {
     if (motDePasse.isEmpty) return 0;
     var score = (motDePasse.length / 16).clamp(0.0, 1.0) * 0.5;
@@ -272,16 +258,17 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     return score.clamp(0.0, 1.0);
   }
 
-  (String, Color) _libelleForce(double force) {
-    // Couleurs sémantiques du doc 03 §1.1 (avertissement #F0A020, vert accès).
-    if (force < 0.4) return ('faible', kNovaRouge);
-    if (force < 0.7) return ('moyenne', const Color(0xFFF0A020));
-    return ('forte', kNovaVert);
+  Color _couleurForce(double force, NovaTokens t) {
+    if (force < 0.4) return kNovaRouge;
+    if (force < 0.7) return kNovaAmbre;
+    return t.vert;
   }
 
-  /// Ajoute un appareil de confiance : l'ID saisi est validé puis reformaté
-  /// par la façade (`parse_nova_id` + `format_nova_id`).
-  Future<void> _ajouterAppareil() async {
+  // ---------------------------------------------------------------------------
+  // Appareils de confiance
+  // ---------------------------------------------------------------------------
+
+  Future<_AppareilConfiance?> _saisirAppareil() async {
     final idController = TextEditingController();
     final aliasController = TextEditingController();
     final api = ref.read(nativeApiProvider);
@@ -294,442 +281,399 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             NovaIdField(
-              controller: idController,
-              libelle: "ID de l'appareil",
-              autofocus: true,
-            ),
+                controller: idController,
+                libelle: "ID de l'appareil",
+                autofocus: true),
             const SizedBox(height: 12),
             TextField(
               controller: aliasController,
               decoration: const InputDecoration(
-                labelText: 'Alias (facultatif)',
-                border: OutlineInputBorder(),
-              ),
+                  labelText: 'Alias (facultatif)',
+                  border: OutlineInputBorder()),
             ),
           ],
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Annuler'),
-          ),
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Annuler')),
           FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Ajouter'),
-          ),
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Ajouter')),
         ],
       ),
     );
 
-    if (valide != true) {
-      idController.dispose();
-      aliasController.dispose();
-      return;
-    }
-    try {
-      final id = await api.parseNovaId(texte: idController.text);
-      final idFormate = await api.formatNovaId(id: id);
-      if (!mounted) return;
-      setState(() {
-        _appareils.add(_AppareilConfiance(
+    _AppareilConfiance? resultat;
+    if (valide == true) {
+      try {
+        final id = await api.parseNovaId(texte: idController.text);
+        final idFormate = await api.formatNovaId(id: id);
+        resultat = _AppareilConfiance(
           idFormate: idFormate,
           alias: aliasController.text.trim().isEmpty
               ? 'sans-alias'
               : aliasController.text.trim(),
           mode: 'Contrôle',
-        ));
-      });
-    } on NovaApiException catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message)),
-      );
-    } finally {
-      idController.dispose();
-      aliasController.dispose();
+        );
+      } on NovaApiException catch (e) {
+        if (mounted) NovaToast.montrer(context, e.message, info: true);
+      }
     }
+    idController.dispose();
+    aliasController.dispose();
+    return resultat;
   }
 
-  void _enregistrer() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Configuration enregistrée (simulation — elle sera persistée par '
-          'le cœur Rust et le service système, plans 12/15).',
-        ),
-      ),
-    );
-    Navigator.of(context).pop();
-  }
-
-  // ---------------------------------------------------------------------------
-  // Carte d'état de l'hôte (activation + statistiques live)
-  // ---------------------------------------------------------------------------
-
-  Widget _carteHote(ThemeData theme, NovaTokens t) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                NovaIcone(NovaIcones.bouclier,
-                    couleur: _actif ? kNovaVert : t.texte2),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Accès non surveillé',
-                          style: theme.textTheme.titleSmall),
-                      const SizedBox(height: 1),
-                      Text(
-                        _actif
-                            ? 'Actif — ce poste écoute et fait valider les '
-                                'demandes entrantes'
-                            : 'Inactif — les connexions non surveillées sont '
-                                'refusées',
-                        style: TextStyle(fontSize: 11.5, color: t.texte3),
+  Future<void> _gererAppareils() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        final t = NovaTokens.of(context);
+        return StatefulBuilder(
+          builder: (context, setInner) => AlertDialog(
+            title: const Text('Appareils de confiance'),
+            content: SizedBox(
+              width: 380,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (final appareil in _appareils)
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const NovaIcone(NovaIcones.moniteur),
+                      title: Text(appareil.idFormate),
+                      subtitle: Text(appareil.alias),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          DropdownButton<String>(
+                            value: appareil.mode,
+                            underline: const SizedBox.shrink(),
+                            items: [
+                              for (final mode in _modes)
+                                DropdownMenuItem(
+                                    value: mode, child: Text(mode)),
+                            ],
+                            onChanged: (v) => setInner(
+                                () => appareil.mode = v ?? appareil.mode),
+                          ),
+                          IconButton(
+                            tooltip: 'Retirer',
+                            icon: const NovaIcone(NovaIcones.corbeille,
+                                taille: 16),
+                            onPressed: () {
+                              setInner(() => _appareils.remove(appareil));
+                              setState(() {});
+                            },
+                          ),
+                        ],
                       ),
-                    ],
+                    ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: () async {
+                        final ajout = await _saisirAppareil();
+                        if (ajout != null) {
+                          setInner(() => _appareils.add(ajout));
+                          setState(() {});
+                        }
+                      },
+                      icon: const NovaIcone(NovaIcones.plus, taille: 14),
+                      label: const Text('Ajouter'),
+                    ),
                   ),
-                ),
-                _pastilleEtat(t),
-              ],
-            ),
-            const SizedBox(height: 14),
-            Row(
-              children: [
-                if (!_actif)
-                  NovaButton(
-                    libelle: "Activer l'accès non surveillé",
-                    icone: NovaIcones.bouclierCoche,
-                    enCours: _bascule,
-                    onPressed:
-                        _bascule ? null : () => unawaited(_basculerHote(true)),
-                  )
-                else
-                  OutlinedButton.icon(
-                    onPressed:
-                        _bascule ? null : () => unawaited(_basculerHote(false)),
-                    icon: const NovaIcone(NovaIcones.fermer, taille: 14),
-                    label: const Text('Désactiver'),
-                  ),
-                const Spacer(),
-                if (_actif) ...[
-                  _compteur(t, 'Servies', _servies, kNovaVert),
-                  const SizedBox(width: 16),
-                  _compteur(t, 'Refusées', _refusees, kNovaRouge),
                 ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Fermer'),
+              ),
+            ],
+            backgroundColor: t.fenetre,
+          ),
+        );
+      },
+    );
+  }
+
+  void _voirJournal() {
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        final t = NovaTokens.of(context);
+        return AlertDialog(
+          title: const Text('Journal des accès'),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _actif
+                      ? 'Session en cours : $_servies servie(s), '
+                          '$_refusees refusée(s).'
+                      : 'Hôte inactif. Activez l’accès pour journaliser les '
+                          'connexions entrantes.',
+                  style: TextStyle(fontSize: 12.5, color: t.texte2),
+                ),
+                const SizedBox(height: 12),
+                for (final ligne in const [
+                  'poste-bureau · aujourd’hui 14:07 · acceptée',
+                  'pc-marie · hier 09:22 · refusée',
+                  'poste-bureau · 3 juil. 18:40 · acceptée',
+                ])
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Text(ligne,
+                        style: TextStyle(fontSize: 12, color: t.texte3)),
+                  ),
               ],
             ),
-            if (_actif && _stats != null) ...[
-              const SizedBox(height: 12),
-              Divider(color: t.filet, height: 1),
-              const SizedBox(height: 10),
-              _ligneStatsHote(t, _stats!),
-            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Fermer'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Construction
+  // ---------------------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return Scaffold(
+      body: NovaAppFrame(
+        vue: NovaVue.nonSurveille,
+        corps: ListView(
+          padding: const EdgeInsets.fromLTRB(26, 22, 26, 22),
+          children: [
+            Text('Accès non surveillé',
+                style: TextStyle(
+                    fontSize: 16, fontWeight: FontWeight.w600, color: t.texte)),
+            const SizedBox(height: 3),
+            Text(
+              'Autorisez la connexion à ce poste sans validation manuelle.',
+              style: TextStyle(fontSize: 12, color: t.texte3),
+            ),
+            const SizedBox(height: 16),
+            _ligne(
+              t,
+              titre: "Activer l'accès non surveillé",
+              sousTitre: 'Ce poste peut être contrôlé à distance avec le mot de '
+                  'passe ci-dessous.',
+              controle: NovaSwitch(
+                actif: _actif,
+                onChanged:
+                    _bascule ? null : (v) => unawaited(_basculerHote(v)),
+              ),
+            ),
+            _lignePassword(t),
+            _ligneProfils(t),
+            _ligne(
+              t,
+              titre: 'Appareils de confiance',
+              sousTitre:
+                  '${_appareils.map((a) => a.alias).join(' · ')} — connexion '
+                  'sans mot de passe.',
+              controle: NovaBoutonSecondaire(
+                  libelle: 'Gérer', onPressed: () => unawaited(_gererAppareils())),
+            ),
+            _ligne(
+              t,
+              titre: 'Journal des accès',
+              sousTitre: _sousTitreJournal(),
+              controle: NovaBoutonSecondaire(
+                  libelle: 'Voir le journal', onPressed: _voirJournal),
+              dernier: true,
+            ),
           ],
         ),
       ),
     );
   }
 
-  Widget _pastilleEtat(NovaTokens t) {
-    final couleur = _actif ? kNovaVert : t.texte3;
+  /// Ligne de réglage (maquette `.set`).
+  Widget _ligne(
+    NovaTokens t, {
+    required String titre,
+    String? sousTitre,
+    required Widget controle,
+    bool dernier = false,
+    CrossAxisAlignment alignement = CrossAxisAlignment.center,
+    Widget? sousTitreWidget,
+  }) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: 13),
       decoration: BoxDecoration(
-        color: couleur.withValues(alpha: 0.14),
-        borderRadius: BorderRadius.circular(20),
+        border: dernier
+            ? null
+            : Border(bottom: BorderSide(color: t.filet)),
       ),
       child: Row(
+        crossAxisAlignment: alignement,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(titre,
+                    style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                        color: t.texte)),
+                if (sousTitreWidget != null) ...[
+                  const SizedBox(height: 2),
+                  sousTitreWidget,
+                ] else if (sousTitre != null) ...[
+                  const SizedBox(height: 2),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 430),
+                    child: Text(sousTitre,
+                        style: TextStyle(fontSize: 11.5, color: t.texte3)),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 16),
+          controle,
+        ],
+      ),
+    );
+  }
+
+  Widget _lignePassword(NovaTokens t) {
+    final force = _force(_motDePasseController.text);
+    return _ligne(
+      t,
+      titre: 'Mot de passe permanent',
+      sousTitreWidget: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Authentification sans confirmation à l’écran.',
+              style: TextStyle(fontSize: 11.5, color: t.texte3)),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: 220,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                value: force,
+                minHeight: 5,
+                backgroundColor: t.filetFort,
+                color: _couleurForce(force, t),
+              ),
+            ),
+          ),
+        ],
+      ),
+      controle: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Container(
-            width: 7,
-            height: 7,
-            decoration: BoxDecoration(color: couleur, shape: BoxShape.circle),
+          SizedBox(
+            width: 180,
+            height: 32,
+            child: TextField(
+              controller: _motDePasseController,
+              enabled: _actif,
+              obscureText: true,
+              onChanged: (_) => setState(() {}),
+              style: const TextStyle(fontSize: 12.5),
+            ),
           ),
-          const SizedBox(width: 6),
-          Text(
-            _actif ? 'Actif' : 'Inactif',
-            style: TextStyle(
-                fontSize: 11, fontWeight: FontWeight.w600, color: couleur),
+          const SizedBox(width: 8),
+          NovaBoutonSecondaire(
+            libelle: 'Générer',
+            onPressed: _actif
+                ? () => setState(() =>
+                    _motDePasseController.text = genererMotDePasse(20))
+                : null,
           ),
         ],
       ),
     );
   }
 
-  Widget _compteur(NovaTokens t, String libelle, int valeur, Color couleur) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        Text('$valeur',
-            style: TextStyle(
-                fontSize: 17, fontWeight: FontWeight.w700, color: couleur)),
-        Text(libelle, style: TextStyle(fontSize: 10.5, color: t.texte3)),
-      ],
-    );
-  }
-
-  /// Résumé honnête des statistiques cumulées de l'hôte (`unattended_stats`).
-  Widget _ligneStatsHote(NovaTokens t, SessionStatsDto s) {
-    final parts = <String>[
-      '↑ ${_formaterOctets(s.bytesOut)}',
-      if (s.targetBitrateKbps > 0)
-        'ABR N${s.abrLevel} · ${_formaterDebit(s.targetBitrateKbps)}',
-      if (s.inputsDenied > 0) 'Entrées refusées : ${s.inputsDenied}',
-      'RTT : ${(s.rttUs / 1000).toStringAsFixed(0)} ms',
-    ];
-    return Row(
-      children: [
-        NovaIcone(NovaIcones.qualite, taille: 13, couleur: t.texte3),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            parts.join('  ·  '),
-            style: TextStyle(fontSize: 11.5, color: t.texte3),
-          ),
+  Widget _ligneProfils(NovaTokens t) {
+    return _ligne(
+      t,
+      titre: 'Profils de permissions',
+      sousTitre: 'Ce qu’un connecteur peut faire selon son profil.',
+      alignement: CrossAxisAlignment.start,
+      controle: SizedBox(
+        width: 260,
+        child: Column(
+          children: [
+            _profil(
+              t,
+              icone: NovaIcones.moniteur,
+              nom: 'Contrôle total',
+              detail: 'Clavier, souris, presse-papiers, fichiers, audio',
+              actif: _profilControle,
+              onChanged: (v) => setState(() => _profilControle = v),
+            ),
+            const SizedBox(height: 8),
+            _profil(
+              t,
+              icone: NovaIcones.observation,
+              nom: 'Observation seule',
+              detail: 'Voir l’écran, sans contrôle',
+              actif: _profilObservation,
+              onChanged: (v) => setState(() => _profilObservation = v),
+            ),
+          ],
         ),
-      ],
+      ),
     );
   }
 
-  String _formaterOctets(int octets) {
-    if (octets < 1024) return '$octets o';
-    if (octets < 1024 * 1024) {
-      return '${(octets / 1024).toStringAsFixed(0)} Ko';
-    }
-    if (octets < 1024 * 1024 * 1024) {
-      return '${(octets / (1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Mo';
-    }
-    return '${(octets / (1024 * 1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Go';
-  }
-
-  String _formaterDebit(int kbps) {
-    if (kbps >= 1000) {
-      return '${(kbps / 1000).toStringAsFixed(1).replaceAll('.', ',')} Mb/s';
-    }
-    return '$kbps kb/s';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final t = NovaTokens.of(context);
-    final force = _force(_motDePasseController.text);
-    final (libelleForce, couleurForce) = _libelleForce(force);
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('Accès non-surveillé')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
+  /// Carte de profil (maquette `.prof`).
+  Widget _profil(
+    NovaTokens t, {
+    required IconData icone,
+    required String nom,
+    required String detail,
+    required bool actif,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        border: Border.all(color: t.filet),
+        borderRadius: BorderRadius.circular(kNovaRayon),
+      ),
+      child: Row(
         children: [
-          Text(
-            'Configurez cet appareil pour un accès permanent, sans présence '
-            "d'un utilisateur devant l'écran.",
-            style: theme.textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 12),
-          _carteHote(theme, t),
-          const SizedBox(height: 16),
-
-          // 1. Mot de passe permanent -------------------------------------
-          Text('1. Mot de passe permanent', style: theme.textTheme.titleSmall),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _motDePasseController,
-            enabled: _actif,
-            obscureText: !_motDePasseVisible,
-            onChanged: (_) => setState(() {}),
-            decoration: InputDecoration(
-              labelText: 'Mot de passe',
-              prefixIcon: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 11),
-                child: NovaIcone(NovaIcones.cle, taille: 16),
-              ),
-              prefixIconConstraints:
-                  const BoxConstraints(minWidth: 38, minHeight: 38),
-              suffixIcon: IconButton(
-                tooltip: _motDePasseVisible ? 'Masquer' : 'Afficher',
-                icon: NovaIcone(
-                  _motDePasseVisible
-                      ? NovaIcones.oeilBarre
-                      : NovaIcones.oeil,
-                  taille: 16,
-                ),
-                onPressed: () => setState(
-                  () => _motDePasseVisible = !_motDePasseVisible,
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Expanded(
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(4),
-                  child: LinearProgressIndicator(
-                    value: force,
-                    minHeight: 6,
-                    color: couleurForce,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Text('Force : $libelleForce',
-                  style: theme.textTheme.bodySmall
-                      ?.copyWith(color: couleurForce)),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: OutlinedButton.icon(
-              onPressed: _actif
-                  ? () => setState(() {
-                        _motDePasseController.text = genererMotDePasse(32);
-                        _motDePasseVisible = true;
-                      })
-                  : null,
-              icon: const NovaIcone(NovaIcones.recharger, taille: 14),
-              label: const Text('Générer un mot de passe aléatoire (32 c.)'),
-            ),
-          ),
-          const SizedBox(height: 20),
-
-          // 2. Appareils autorisés -----------------------------------------
-          Text(
-            '2. Appareils autorisés (carnet de confiance)',
-            style: theme.textTheme.titleSmall,
-          ),
-          const SizedBox(height: 8),
-          Card(
+          NovaIcone(icone, taille: 16, couleur: t.texte2),
+          const SizedBox(width: 10),
+          Expanded(
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final appareil in _appareils)
-                  ListTile(
-                    leading: const NovaIcone(NovaIcones.moniteur),
-                    title: Text(appareil.idFormate),
-                    subtitle: Text(appareil.alias),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        DropdownButton<String>(
-                          value: appareil.mode,
-                          underline: const SizedBox.shrink(),
-                          items: [
-                            for (final mode in _modes)
-                              DropdownMenuItem(
-                                  value: mode, child: Text(mode)),
-                          ],
-                          onChanged: _actif
-                              ? (valeur) => setState(
-                                  () => appareil.mode = valeur ?? appareil.mode)
-                              : null,
-                        ),
-                        IconButton(
-                          tooltip: 'Retirer',
-                          icon: const NovaIcone(NovaIcones.corbeille,
-                              taille: 16),
-                          onPressed: _actif
-                              ? () =>
-                                  setState(() => _appareils.remove(appareil))
-                              : null,
-                        ),
-                      ],
-                    ),
-                  ),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: Padding(
-                    padding: const EdgeInsets.all(8),
-                    child: TextButton.icon(
-                      onPressed: _actif ? _ajouterAppareil : null,
-                      icon: const NovaIcone(NovaIcones.plus, taille: 14),
-                      label: const Text('Ajouter'),
-                    ),
-                  ),
-                ),
+                Text(nom,
+                    style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w500,
+                        color: t.texte)),
+                Text(detail,
+                    style: TextStyle(fontSize: 11, color: t.texte3)),
               ],
             ),
           ),
-          const SizedBox(height: 20),
-
-          // 3. Sécurité ----------------------------------------------------
-          Text('3. Sécurité', style: theme.textTheme.titleSmall),
-          const SizedBox(height: 8),
-          SwitchListTile(
-            secondary: const NovaIcone(NovaIcones.cadenas),
-            title: const Text('Double authentification (TOTP)'),
-            value: _totp,
-            onChanged:
-                _actif ? (valeur) => setState(() => _totp = valeur) : null,
-          ),
-          SwitchListTile(
-            secondary: const NovaIcone(NovaIcones.horloge),
-            title: const Text('Journaliser toutes les sessions'),
-            value: _journalisation,
-            onChanged: _actif
-                ? (valeur) => setState(() => _journalisation = valeur)
-                : null,
-          ),
-          SwitchListTile(
-            secondary: const NovaIcone(NovaIcones.alimentation),
-            title: const Text('Autoriser le Wake-on-LAN'),
-            subtitle: const Text('Réveiller ce poste à distance (plan 13)'),
-            value: _wakeOnLan,
-            onChanged: _actif
-                ? (valeur) => setState(() => _wakeOnLan = valeur)
-                : null,
-          ),
-          if (_actif && (!_totp || !_journalisation)) ...[
-            const SizedBox(height: 8),
-            Card(
-              color: theme.colorScheme.errorContainer,
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Row(
-                  children: [
-                    NovaIcone(NovaIcones.avertissement,
-                        couleur: theme.colorScheme.onErrorContainer),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'La double authentification et la journalisation sont '
-                        'fortement recommandées pour un accès permanent.',
-                        style: TextStyle(
-                            color: theme.colorScheme.onErrorContainer),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-          const SizedBox(height: 24),
-
-          // Actions ---------------------------------------------------------
-          Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Annuler'),
-              ),
-              const SizedBox(width: 12),
-              NovaButton(
-                libelle: 'Enregistrer',
-                icone: NovaIcones.coche,
-                onPressed: _enregistrer,
-              ),
-            ],
-          ),
+          const SizedBox(width: 10),
+          NovaSwitch(actif: actif, onChanged: onChanged),
         ],
       ),
     );

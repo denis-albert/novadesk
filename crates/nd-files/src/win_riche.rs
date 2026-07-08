@@ -9,7 +9,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 use nd_proto::{NdError, Result};
@@ -99,6 +99,35 @@ pub(crate) fn get_files() -> Result<Vec<PathBuf>> {
         chemins.push(PathBuf::from(OsString::from_wide(&tampon[..copie])));
     }
     Ok(chemins)
+}
+
+/// Place la liste `paths` dans le presse-papiers sous forme de `CF_HDROP` :
+/// structure `DROPFILES` (en-tête de 20 octets) suivie des chemins en UTF-16
+/// terminés par NUL, la liste étant close par un NUL supplémentaire (double NUL
+/// final). Remplace le contenu courant.
+pub(crate) fn set_files(paths: &[PathBuf]) -> Result<()> {
+    // En-tête DROPFILES : pFiles (offset de la liste = 20), pt.x, pt.y, fNC,
+    // fWide=1 (chemins larges/UTF-16). Chaque champ est un entier 32 bits LE.
+    let mut bloc: Vec<u8> = Vec::new();
+    bloc.extend_from_slice(&20u32.to_le_bytes()); // pFiles : la liste suit l'en-tête
+    bloc.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    bloc.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    bloc.extend_from_slice(&0i32.to_le_bytes()); // fNC = FALSE
+    bloc.extend_from_slice(&1i32.to_le_bytes()); // fWide = TRUE (UTF-16)
+
+    // Liste : chaque chemin en UTF-16 terminé par NUL, puis un NUL de clôture.
+    for p in paths {
+        for unite in p.as_os_str().encode_wide() {
+            bloc.extend_from_slice(&unite.to_le_bytes());
+        }
+        bloc.extend_from_slice(&0u16.to_le_bytes());
+    }
+    bloc.extend_from_slice(&0u16.to_le_bytes()); // NUL final de la liste
+
+    let _ouvert = OpenedClipboard::open()?;
+    // SAFETY : presse-papiers ouvert par le guard ci-dessus.
+    unsafe { EmptyClipboard() }.map_err(|e| clip_err("EmptyClipboard", e))?;
+    poser_bloc(CF_HDROP, &bloc)
 }
 
 // ---------------------------------------------------------------------------

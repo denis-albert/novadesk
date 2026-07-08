@@ -82,6 +82,9 @@ String genererMotDePasse(int longueur) {
       .join();
 }
 
+/// Système d'exploitation d'un poste (choix de l'icône OS au carnet).
+enum OsAppareil { windows, linux, android, macos }
+
 /// Entrée du carnet d'adresses / des sessions récentes.
 class EntreeCarnet {
   const EntreeCarnet({
@@ -90,6 +93,9 @@ class EntreeCarnet {
     required this.derniereConnexion,
     this.favori = false,
     this.enLigne = false,
+    this.groupe = 'Travail',
+    this.etiquettes = const [],
+    this.os = OsAppareil.windows,
   });
 
   /// ID NovaDesk du poste distant.
@@ -108,21 +114,32 @@ class EntreeCarnet {
   /// FICTIF : viendra du service de rendez-vous (plan 11).
   final bool enLigne;
 
+  /// Groupe du carnet (« Travail », « Serveurs », « Perso »…).
+  final String groupe;
+
+  /// Étiquettes libres (affichées en pastilles bleues au carnet).
+  final List<String> etiquettes;
+
+  /// Système d'exploitation (icône OS du carnet).
+  final OsAppareil os;
+
   EntreeCarnet copyWith({String? alias, bool? favori}) => EntreeCarnet(
         id: id,
         alias: alias ?? this.alias,
         derniereConnexion: derniereConnexion,
         favori: favori ?? this.favori,
         enLigne: enLigne,
+        groupe: groupe,
+        etiquettes: etiquettes,
+        os: os,
       );
 }
 
-/// Sessions récentes + carnet d'adresses. `StateProvider` : les vignettes
-/// permettent favori / renommage / suppression en local (état de
-/// présentation).
+/// Sessions récentes + carnet d'adresses. `StateProvider` : favori / renommage
+/// / suppression en local (état de présentation).
 ///
 /// FICTIF : sera synchronisé via le backend (plan 11), entrées chiffrées
-/// côté client (plan 06).
+/// côté client (plan 06). Données calquées sur la maquette `novadesk-app.html`.
 final carnetProvider = StateProvider<List<EntreeCarnet>>((ref) {
   return const [
     EntreeCarnet(
@@ -131,24 +148,43 @@ final carnetProvider = StateProvider<List<EntreeCarnet>>((ref) {
       derniereConnexion: 'il y a 2 h',
       favori: true,
       enLigne: true,
+      groupe: 'Travail',
+      etiquettes: ['bureau', 'windows'],
+      os: OsAppareil.windows,
     ),
     EntreeCarnet(
       id: 730118902,
       alias: 'serveur-nas',
-      derniereConnexion: 'hier',
+      derniereConnexion: 'hier, 18:40',
       enLigne: true,
+      groupe: 'Serveurs',
+      etiquettes: ['nas', 'linux'],
+      os: OsAppareil.linux,
     ),
     EntreeCarnet(
       id: 555240173,
       alias: 'pc-marie',
       derniereConnexion: 'lun. 14:07',
+      groupe: 'Travail',
+      etiquettes: ['support'],
+      os: OsAppareil.windows,
     ),
     EntreeCarnet(
       id: 190774025,
-      alias: 'atelier-01',
-      derniereConnexion: 'mer. 09:42',
-      favori: true,
+      alias: 'mobile-atelier',
+      derniereConnexion: '3 juil.',
       enLigne: true,
+      groupe: 'Perso',
+      etiquettes: ['android'],
+      os: OsAppareil.android,
+    ),
+    EntreeCarnet(
+      id: 308552641,
+      alias: 'vm-build-01',
+      derniereConnexion: '28 juin',
+      groupe: 'Serveurs',
+      etiquettes: ['ci'],
+      os: OsAppareil.linux,
     ),
   ];
 });

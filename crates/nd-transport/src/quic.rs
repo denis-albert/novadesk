@@ -25,8 +25,8 @@
 //! chemin (NAT) et borne la détection de coupure au délai d'inactivité ; l'état est
 //! exposé par [`QuicTransport::is_connected`] / [`QuicTransport::close_reason`], et
 //! [`QuicTransport::on_disconnect`] fournit le point d'ancrage (rappel de coupure).
-//! La **reconnexion transparente** (reprise de session après coupure) est reportée à
-//! un jet ultérieur : elle se branchera sur ce rappel.
+//! La **reconnexion transparente** (rétablissement après coupure) est fournie par
+//! [`crate::ReconnectingTransport`], qui scrute [`Transport::is_connected`].
 //!
 //! Sécurité : QUIC fournit ici le chiffrement TLS 1.3 « de saut ». Le certificat est
 //! auto-signé et **épinglé** (le client fait confiance au certificat exact du serveur).
@@ -732,6 +732,13 @@ impl Transport for QuicTransport {
             loss_ratio,
             estimated_bandwidth_kbps: debit_kbps(stats.path.cwnd, rtt_us),
         }
+    }
+
+    /// État réel de la connexion QUIC : c'est le signal que
+    /// [`crate::ReconnectingTransport`] scrute pour la reconnexion transparente
+    /// (voir aussi la méthode inhérente [`QuicTransport::is_connected`]).
+    fn is_connected(&self) -> bool {
+        self.conn.close_reason().is_none()
     }
 }
 

@@ -22,6 +22,17 @@ pub use win::WindowsClipboard;
 /// découpage en chunks ci-dessous. Voir la documentation du module.
 pub mod transfer;
 
+/// Session de transfert pilotable par canal (file multi-fichiers, progression,
+/// annulation, pause/reprise) au-dessus de [`transfer`]. Voir le module.
+pub mod session;
+
+/// Synchronisation du presse-papiers de session : sérialisation du contenu pour
+/// un canal fiable et application du contenu reçu. Voir le module.
+pub mod clipboard_sync;
+
+pub use clipboard_sync::{ClipboardContent, ClipboardSync};
+pub use session::{SessionProgress, TransferEvent, TransferProgressInfo, TransferSession};
+
 /// Entrée d'un listing de système de fichiers distant.
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {
@@ -128,6 +139,14 @@ pub trait Clipboard: Send {
     /// vide si le presse-papiers n'en contient pas. Sous Windows : `CF_HDROP`.
     fn get_files(&self) -> Result<Vec<PathBuf>> {
         Err(NdError::NotImplemented("Clipboard::get_files"))
+    }
+
+    /// Place la liste de fichiers `paths` dans le presse-papiers (« Copier »
+    /// façon explorateur, remplace le contenu courant). Sous Windows : `CF_HDROP`
+    /// (structure `DROPFILES`). Nécessaire pour appliquer un contenu « fichiers »
+    /// reçu via [`ClipboardSync`](crate::ClipboardSync).
+    fn set_files(&self, _paths: &[PathBuf]) -> Result<()> {
+        Err(NdError::NotImplemented("Clipboard::set_files"))
     }
 }
 

@@ -18,6 +18,11 @@ reed-solomon-erasure = "6"
 # Tampons partagés : `quinn::Connection::send_datagram` prend un `bytes::Bytes`.
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+# Vérification (et signature côté émetteur/tests) des tickets de relais signés
+# Ed25519. Le format est aligné sur `server/nd-api` (auth.rs, lot 07), source de
+# vérité : on ne dépend pas du serveur (graphe à l'envers, poids), on duplique la
+# structure de vérification minimale — voir `src/ticket.rs`.
+ed25519-dalek = "2"
 
 [lints]
 workspace = true

@@ -25,12 +25,7 @@ dependencies:
   # Annotations freezed : le binding FRB généré modélise les enums Rust à
   # variantes porteuses (ex. InputEventDto) en classes scellées freezed.
   freezed_annotation: ^2.4.4
-  # NOTE : `window_manager` (fenêtrage desktop) a été retiré car son build natif
-  # exige le mode développeur Windows (liens symboliques), indisponible sans
-  # droits admin. Il est remplacé par la façade locale `lib/platform/window_shim.dart`.
-  # Pour restaurer le contrôle de fenêtre : rajouter `window_manager: ^0.4.3` ici
-  # et réimporter le paquet à la place du shim.
-
+  lucide_icons_flutter: ^3.1.14+2
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -12,7 +12,8 @@
 //! - le protocole TCP ([`protocol`]) : trames `u32` BE + un octet de tag,
 //!   au même format que `nd-signaling` — **tous** les magasins ci-dessus sont
 //!   réellement appelables par un client via [`protocol::Request`] ;
-//! - l'état assemblé et le serveur ([`services`]) ;
+//! - l'état assemblé et le serveur ([`services`]), ainsi que son client TCP
+//!   synchrone de haut niveau ([`client::ApiClient`]) destiné à `nd-ffi` ;
 //! - la persistance légère ([`storage`]) : JSON pur Rust, écriture atomique
 //!   (fichier temporaire + renommage).
 //!
@@ -27,6 +28,7 @@
 
 pub mod allocation;
 pub mod auth;
+pub mod client;
 pub mod config;
 pub mod groups;
 pub mod protocol;
@@ -36,6 +38,7 @@ pub mod sharing;
 pub mod storage;
 pub mod update;
 
+pub use client::{ApiClient, ErreurClient, IdAlloue};
 pub use services::{serve, Services};
 
 use std::collections::HashMap;

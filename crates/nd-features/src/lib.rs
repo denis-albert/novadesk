@@ -20,10 +20,16 @@
 //! - **Reconnexion** : [`ReconnectController`] (`on_disconnect` /
 //!   `next_delay` / `reset`) pilote le backoff sans dormir. Contrat en tête
 //!   de [`reconnect`].
+//! - **Tunnel** : [`LocalForwarder`] relaie une redirection de port TCP réelle
+//!   et [`TunnelStats`] compte les octets relayés dans chaque sens ainsi que
+//!   les connexions. Contrat en tête de [`tunnel`].
+//! - **Wake-on-LAN** : [`send_wol`] émet le paquet magique en UDP (diffusion
+//!   ports 9/7) et [`MacAddr`] parse l'adresse. Contrat en tête de [`wol`].
 //!
-//! Restent des modèles purs sans effet système, à brancher côté plateforme :
-//! [`privacy`] (exécution des `PrivacyAction`) et [`hotkeys`] (dispatch dans
-//! la boucle d'événements de l'UI) — voir leurs docs de module respectives.
+//! Restent des points à brancher côté plateforme : [`privacy`] (exécution des
+//! `PrivacyAction` ; le cache d'écran [`ScreenCache`] est déjà rendu ici) et
+//! [`hotkeys`] (alimentation de [`HotkeyMap::action_for`] depuis la boucle
+//! d'événements de l'UI) — voir leurs docs de module respectives.
 
 pub mod annotation;
 pub mod hotkeys;
@@ -37,13 +43,13 @@ pub mod tunnel;
 pub mod wol;
 
 pub use annotation::{AnnotationLayer, RgbaCanvas, Stroke};
-pub use hotkeys::{ActionCodec, HostAction, Hotkey, HotkeyMap};
+pub use hotkeys::{ActionCodec, HostAction, Hotkey, HotkeyMap, KeyEvent, KeyState};
 pub use invite::{generate_invite, InviteStore, RedeemResult, SessionInvite};
 pub use permissions::{
     AuditEntry, AuditEvent, Capability, PermissionBroker, PermissionDecision, PermissionRequest,
     PermissionSet,
 };
-pub use privacy::{PrivacyAction, PrivacyState};
+pub use privacy::{PrivacyAction, PrivacyState, ScreenCache};
 pub use reconnect::{ReconnectController, ReconnectPolicy, ReconnectState};
 pub use recording::mp4::{ndr_to_mp4, Mp4Muxer, Mp4Reader, Mp4Sample, Mp4ValidationReport};
 pub use recording::{
@@ -51,8 +57,13 @@ pub use recording::{
     SessionRecorder, ValidationReport,
 };
 pub use settings::{QualityParams, QualityPreset, SessionSettings};
-pub use tunnel::{pipe_bidirectional, LocalForwarder};
-pub use wol::{magic_packet, wake_on_lan};
+pub use tunnel::{
+    pipe_bidirectional, pipe_bidirectional_stats, LocalForwarder, TunnelStats, TunnelStatsSnapshot,
+};
+pub use wol::{
+    limited_broadcast, magic_packet, send_wol, wake_on_lan, MacAddr, WOL_PORT_DISCARD,
+    WOL_PORT_ECHO,
+};
 
 /// Permissions accordées à une session par le poste contrôlé.
 ///

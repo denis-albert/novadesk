@@ -7,21 +7,24 @@
 //! - puis `u32 nombre_de_liens`, et pour chaque lien :
 //!   `[u8 modificateurs][u32 touche][u32 code_action]`.
 //!
-//! # Intégration — le dispatch N'EST PAS implémenté ici
+//! # Intégration — résolution fournie, câblage restant côté UI
 //!
-//! Ce module fournit la table et sa persistance ; il n'écoute aucun clavier.
-//! Le branchement attendu, côté **contrôleur** (fenêtre de session de l'UI) :
-//! 1. dans la boucle d'événements clavier de la fenêtre, normaliser
-//!    l'événement en [`Hotkey`] (mêmes bits de modificateurs, code de touche
-//!    du protocole d'entrées `nd-proto`) ;
-//! 2. si [`HotkeyMap::lookup`] rend une [`HostAction`], **consommer**
-//!    l'événement localement (ne pas l'envoyer au poste distant) et exécuter
-//!    l'action via l'orchestrateur — `SendCtrlAltDel` et `ToggleInputBlock`
-//!    repassent par les permissions ([`crate::Capability`]) côté contrôlé ;
-//! 3. sinon, laisser l'événement suivre le chemin normal d'injection.
+//! Ce module fournit la table, sa persistance **et** la résolution
+//! évènement → action ([`HotkeyMap::action_for`]) ; il n'écoute toujours aucun
+//! clavier. Le branchement attendu, côté **contrôleur** (fenêtre de session) :
+//! 1. dans la boucle d'évènements clavier de la fenêtre, normaliser chaque
+//!    évènement en [`KeyEvent`] (mêmes bits de modificateurs et code de touche
+//!    que [`Hotkey`], issus du protocole d'entrées `nd-proto`) ;
+//! 2. le passer à [`HotkeyMap::action_for`] : s'il rend une action (ici une
+//!    [`HostAction`]), **consommer** l'évènement localement (ne pas l'envoyer
+//!    au poste distant) et l'exécuter via l'orchestrateur — `SendCtrlAltDel` et
+//!    `ToggleInputBlock` repassent par les permissions ([`crate::Capability`])
+//!    côté contrôlé ;
+//! 3. sinon (`None`), laisser l'évènement suivre le chemin normal d'injection.
 //!
-//! TODO(nd-core/UI) : point de branchement du lookup dans la boucle
-//! d'événements de la fenêtre de session — rien n'est câblé ici.
+//! `action_for` ne se déclenche que sur l'appui et masque les modificateurs
+//! inconnus : elle est testable sans boucle d'évènements. TODO(nd-core/UI) :
+//! seul reste à câbler son alimentation depuis la boucle réelle de la fenêtre.
 
 use std::collections::BTreeMap;
 
@@ -92,6 +95,60 @@ pub enum HostAction {
     ToggleRecording,
     /// Fermer la session en cours.
     Disconnect,
+    /// Libérer la capture de la souris locale du contrôleur (rendre le curseur
+    /// à son bureau, sans fermer la session — utile en plein écran).
+    ReleaseMouse,
+}
+
+/// État d'une touche dans un évènement clavier normalisé fourni par l'UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyState {
+    /// Touche enfoncée (front descendant).
+    Pressed,
+    /// Touche relâchée (front montant).
+    Released,
+}
+
+/// Évènement clavier normalisé, tel que la fenêtre de session le présente à la
+/// résolution des raccourcis. `modifiers` et `key` suivent la convention de
+/// [`Hotkey`] (bits de modificateurs, code de touche du protocole `nd-proto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyEvent {
+    /// Modificateurs actifs au moment de l'évènement.
+    pub modifiers: u8,
+    /// Code de la touche concernée.
+    pub key: u32,
+    /// Appui ou relâchement de la touche.
+    pub state: KeyState,
+}
+
+impl KeyEvent {
+    /// Évènement d'appui (`Pressed`).
+    #[must_use]
+    pub fn pressed(modifiers: u8, key: u32) -> Self {
+        KeyEvent {
+            modifiers,
+            key,
+            state: KeyState::Pressed,
+        }
+    }
+
+    /// Évènement de relâchement (`Released`).
+    #[must_use]
+    pub fn released(modifiers: u8, key: u32) -> Self {
+        KeyEvent {
+            modifiers,
+            key,
+            state: KeyState::Released,
+        }
+    }
+
+    /// Raccourci canonique correspondant à cet évènement (modificateurs
+    /// masqués comme dans [`Hotkey::new`]).
+    #[must_use]
+    pub fn hotkey(self) -> Hotkey {
+        Hotkey::new(self.modifiers, self.key)
+    }
 }
 
 /// Action encodable en `u32` pour la sérialisation de la configuration.
@@ -112,6 +169,7 @@ impl ActionCodec for HostAction {
             HostAction::TakeScreenshot => 4,
             HostAction::ToggleRecording => 5,
             HostAction::Disconnect => 6,
+            HostAction::ReleaseMouse => 7,
         }
     }
 
@@ -124,6 +182,7 @@ impl ActionCodec for HostAction {
             4 => HostAction::TakeScreenshot,
             5 => HostAction::ToggleRecording,
             6 => HostAction::Disconnect,
+            7 => HostAction::ReleaseMouse,
             _ => return None,
         })
     }
@@ -186,6 +245,24 @@ impl<A> HotkeyMap<A> {
     /// Itère sur les liens, dans l'ordre canonique des raccourcis.
     pub fn iter(&self) -> impl Iterator<Item = (&Hotkey, &A)> {
         self.liens.iter()
+    }
+}
+
+impl<A: Copy> HotkeyMap<A> {
+    /// Résout un évènement clavier en action de raccourci.
+    ///
+    /// Ne déclenche **que sur l'appui** (`KeyState::Pressed`) — un raccourci ne
+    /// doit pas se re-déclencher au relâchement — après normalisation des
+    /// modificateurs. Fonction pure (aucune boucle d'évènements), donc testable
+    /// directement. Renvoie l'action à exécuter localement, ou `None` si
+    /// l'évènement doit suivre le chemin d'injection normal vers le poste
+    /// distant (voir le branchement décrit en tête de module).
+    #[must_use]
+    pub fn action_for(&self, event: KeyEvent) -> Option<A> {
+        if event.state != KeyState::Pressed {
+            return None;
+        }
+        self.lookup(event.hotkey()).copied()
     }
 }
 
@@ -366,10 +443,48 @@ mod tests {
             HostAction::TakeScreenshot,
             HostAction::ToggleRecording,
             HostAction::Disconnect,
+            HostAction::ReleaseMouse,
         ] {
             assert_eq!(HostAction::decode(action.encode()), Some(action));
         }
         assert_eq!(HostAction::decode(999), None);
+    }
+
+    #[test]
+    fn action_for_ne_declenche_que_sur_appui() {
+        let mut table = HotkeyMap::new();
+        table.bind(ctrl_alt_f(), HostAction::ToggleFullscreen);
+
+        // Appui exact → action résolue.
+        assert_eq!(
+            table.action_for(KeyEvent::pressed(Hotkey::CTRL | Hotkey::ALT, 0x46)),
+            Some(HostAction::ToggleFullscreen)
+        );
+        // Relâchement du même raccourci → rien (pas de double déclenchement).
+        assert_eq!(
+            table.action_for(KeyEvent::released(Hotkey::CTRL | Hotkey::ALT, 0x46)),
+            None
+        );
+        // Modificateurs incomplets → rien.
+        assert_eq!(
+            table.action_for(KeyEvent::pressed(Hotkey::CTRL, 0x46)),
+            None
+        );
+        // Touche non liée → rien (l'évènement suivra l'injection normale).
+        assert_eq!(
+            table.action_for(KeyEvent::pressed(Hotkey::CTRL | Hotkey::ALT, 0x47)),
+            None
+        );
+    }
+
+    #[test]
+    fn action_for_normalise_les_modificateurs_inconnus() {
+        let mut table = HotkeyMap::new();
+        table.bind(Hotkey::new(Hotkey::WIN, 0x50), HostAction::ReleaseMouse);
+        // Des bits de modificateurs parasites sont masqués avant la recherche.
+        let evenement = KeyEvent::pressed(0xF0 | Hotkey::WIN, 0x50);
+        assert_eq!(evenement.hotkey(), Hotkey::new(Hotkey::WIN, 0x50));
+        assert_eq!(table.action_for(evenement), Some(HostAction::ReleaseMouse));
     }
 
     #[test]

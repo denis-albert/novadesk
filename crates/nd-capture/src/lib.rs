@@ -18,6 +18,13 @@ use nd_proto::{MonitorId, Result};
 
 #[cfg(target_os = "linux")]
 mod linux;
+// Backend Wayland (PipeWire + portail xdg-desktop-portal), derrière la fonction
+// `wayland-pipewire` (désactivée par défaut : lie `libpipewire`, bibliothèque C
+// non vérifiable en compilation croisée depuis Windows — voir `linux_pipewire`).
+#[cfg(all(target_os = "linux", feature = "wayland-pipewire"))]
+mod linux_pipewire;
+#[cfg(all(target_os = "linux", feature = "wayland-pipewire"))]
+mod linux_portal;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -193,7 +200,26 @@ pub struct CapturedFrame {
     /// Moniteur d'où provient la frame.
     pub monitor: MonitorId,
     pub format: PixelFormat,
-    /// Régions modifiées depuis la frame précédente (vide = rien n'a changé).
+    /// Régions modifiées depuis la frame précédente, **en coordonnées de la frame
+    /// capturée** (origine au coin haut-gauche de la sous-région si
+    /// [`ScreenCapturer::set_region`] en fixe une, sinon du moniteur), bornées à
+    /// `width`×`height`.
+    ///
+    /// **Format (contrat pour nd-codec / mode delta)** — liste des rectangles à
+    /// ré-encoder pour reconstruire la frame à partir de la précédente. Le backend
+    /// Windows/DXGI y **fusionne** deux sources (voir `win::read_damage`) :
+    /// - les **régions redessinées** (`IDXGIOutputDuplication::GetFrameDirtyRects`) ;
+    /// - la **destination des blocs déplacés** (`GetFrameMoveRects` — défilement,
+    ///   fenêtre déplacée) : le contenu a été copié *vers* ce rectangle, il y est
+    ///   donc neuf par rapport à la frame précédente.
+    ///
+    /// Les recouvrements ne sont pas dédupliqués (ré-encoder deux fois un pixel est
+    /// idempotent, et les listes DXGI sont courtes). **`dirty` vide ⇔ rien n'a
+    /// changé** : une source qui renseigne fidèlement ce champ (DXGI) permet à
+    /// nd-codec d'activer le mode delta *par défaut* (saut des trames inchangées +
+    /// conversion couleur restreinte). Les sources qui ne détectent pas encore les
+    /// dommages (X11 `GetImage`, CoreGraphics) renvoient **un unique rectangle plein
+    /// cadre** — jamais vide sur changement — pour rester correctes sans delta.
     pub dirty: Vec<Rect>,
     pub cursor: Option<CursorState>,
     /// Horodatage de capture (microsecondes, horloge monotone commune A/V).
@@ -221,14 +247,41 @@ pub trait ScreenCapturer: Send {
     fn poll_event(&mut self) -> Option<CaptureEvent>;
     /// Arrête la capture et libère les ressources.
     fn stop(&mut self);
+
+    /// Restreint la capture à une **sous-région** du moniteur — le « cadre d'écran »
+    /// (*screen frame*) qu'AnyDesk laisse délimiter pour ne partager qu'une portion
+    /// de l'écran.
+    ///
+    /// `region` est en **pixels, dans l'espace du moniteur** (origine au coin
+    /// haut-gauche) ; elle est **bornée** aux dimensions réelles au moment de la
+    /// capture. `None` (défaut) = plein écran. Peut être appelée avant ou après
+    /// [`start`](Self::start) : l'effet vaut pour la frame suivante. Les frames
+    /// renvoyées ont alors `width`/`height` égales à la sous-région, et `dirty`
+    /// (comme `cursor`) est exprimé dans ses coordonnées.
+    ///
+    /// Ajout **rétro-compatible** : plutôt qu'un nouveau champ de [`CaptureConfig`]
+    /// — qui casserait les littéraux `CaptureConfig { .. }` déjà écrits chez nd-core
+    /// —, l'option passe par cette méthode à implémentation par défaut. Le défaut
+    /// honore `None` (plein écran) et renvoie `NotImplemented` pour toute sous-région
+    /// qu'un backend ne sait pas restreindre : jamais de fuite silencieuse de la
+    /// zone hors-cadre (garantie de confidentialité).
+    fn set_region(&mut self, region: Option<Rect>) -> Result<()> {
+        match region {
+            None => Ok(()),
+            Some(_) => Err(nd_proto::NdError::NotImplemented(
+                "ScreenCapturer::set_region (sous-région non gérée par ce backend)",
+            )),
+        }
+    }
 }
 
 /// Crée le capteur adapté à la plateforme courante.
 ///
 /// Windows : DXGI Desktop Duplication. macOS : CoreGraphics
 /// (`CGDisplayCreateImage` ; ScreenCaptureKit au jet suivant). Linux : X11
-/// `GetImage` via `x11rb` (Wayland/PipeWire au jet suivant — `NotImplemented`
-/// en session Wayland pure).
+/// `GetImage` via `x11rb` ; en session **Wayland pure**, le backend PipeWire +
+/// portail `xdg-desktop-portal` est utilisé si la fonction `wayland-pipewire` est
+/// activée (sinon `NotImplemented`, voir `linux_pipewire`).
 pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
     #[cfg(windows)]
     {
@@ -240,7 +293,7 @@ pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(linux::X11Capturer::new()?))
+        linux::create_capturer()
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {

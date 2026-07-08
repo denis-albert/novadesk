@@ -49,9 +49,38 @@ use crate::{
 };
 
 /// Session Wayland « pure » : `WAYLAND_DISPLAY` défini sans serveur X joignable
-/// (`DISPLAY` absent). La capture y exige PipeWire + portail — jet ultérieur.
+/// (`DISPLAY` absent). La capture y exige PipeWire + portail.
 fn session_wayland_pure() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none()
+}
+
+/// Crée le capteur Linux : X11 par défaut, PipeWire + portail en session Wayland
+/// pure **si** la fonction `wayland-pipewire` est activée (sinon `X11Capturer::new`
+/// renvoie honnêtement `NotImplemented`, voir `linux_pipewire`).
+pub(crate) fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
+    #[cfg(feature = "wayland-pipewire")]
+    if session_wayland_pure() {
+        return Ok(Box::new(crate::linux_pipewire::PipeWireCapturer::new()));
+    }
+    Ok(Box::new(X11Capturer::new()?))
+}
+
+/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
+/// `(x, y, largeur, hauteur)` toujours non vide et dans les bornes (`None` = plein
+/// cadre). Une origine hors cadre est ramenée au dernier pixel valide — jamais
+/// d'agrandissement au plein écran (la zone hors-cadre ne doit pas fuiter).
+fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    match region {
+        None => (0, 0, w, h),
+        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
+        Some(r) => {
+            let x = r.x.min(w - 1);
+            let y = r.y.min(h - 1);
+            let rw = r.w.min(w - x).max(1);
+            let rh = r.h.min(h - y).max(1);
+            (x, y, rw, rh)
+        }
+    }
 }
 
 /// Énumère les moniteurs X11 de l'écran par défaut (RandR ≥ 1.5).
@@ -128,6 +157,9 @@ pub(crate) struct X11Capturer {
     monitor: MonitorId,
     /// Géométrie du moniteur capturé ; `None` tant que `start` n'a pas été appelé.
     region: Option<Region>,
+    /// Sous-région partagée (« cadre d'écran »), en pixels moniteur ; `None` = plein
+    /// moniteur. Bornée à la géométrie réelle à chaque frame ([`clamp_region`]).
+    cadre: Option<Rect>,
     capture_cursor: bool,
     /// Intervalle entre deux instantanés (dérivé de `target_fps`).
     intervalle: Duration,
@@ -152,6 +184,7 @@ impl X11Capturer {
             screen_num,
             monitor: MonitorId(0),
             region: None,
+            cadre: None,
             capture_cursor: false,
             intervalle: Duration::from_millis(16),
             prochain_tick: None,
@@ -212,6 +245,22 @@ impl ScreenCapturer for X11Capturer {
         }
         self.prochain_tick = Some(Instant::now() + self.intervalle);
 
+        // Sous-rectangle effectif (« cadre d'écran ») borné au moniteur, exprimé en
+        // coordonnées de la fenêtre racine.
+        let (ox, oy, rw, rh) = clamp_region(
+            self.cadre,
+            u32::from(region.largeur),
+            u32::from(region.hauteur),
+        );
+        let cadre = Region {
+            x: i16::try_from(i32::from(region.x) + ox as i32)
+                .map_err(|e| NdError::Capture(format!("cadre hors bornes X11 : {e}")))?,
+            y: i16::try_from(i32::from(region.y) + oy as i32)
+                .map_err(|e| NdError::Capture(format!("cadre hors bornes X11 : {e}")))?,
+            largeur: rw as u16,
+            hauteur: rh as u16,
+        };
+
         let setup = self.conn.setup();
         let screen = &setup.roots[self.screen_num];
         let root = screen.root;
@@ -220,22 +269,22 @@ impl ScreenCapturer for X11Capturer {
             .get_image(
                 ImageFormat::Z_PIXMAP,
                 root,
-                region.x,
-                region.y,
-                region.largeur,
-                region.hauteur,
+                cadre.x,
+                cadre.y,
+                cadre.largeur,
+                cadre.hauteur,
                 u32::MAX,
             )
             .map_err(|e| NdError::Capture(format!("GetImage : {e}")))?
             .reply()
             .map_err(|e| NdError::Capture(format!("GetImage : {e}")))?;
 
-        let largeur = u32::from(region.largeur);
-        let hauteur = u32::from(region.hauteur);
+        let largeur = u32::from(cadre.largeur);
+        let hauteur = u32::from(cadre.hauteur);
         let bgra = zpixmap_en_bgra(setup, screen, &reply, largeur, hauteur)?;
 
         let cursor = if self.capture_cursor {
-            self.interroge_curseur(root, region)
+            self.interroge_curseur(root, cadre)
         } else {
             None
         };
@@ -271,6 +320,13 @@ impl ScreenCapturer for X11Capturer {
     fn stop(&mut self) {
         self.region = None;
         self.prochain_tick = None;
+    }
+
+    /// Fixe le « cadre d'écran » (sous-région, en pixels moniteur). Borné à la
+    /// géométrie réelle à la frame suivante ([`clamp_region`]).
+    fn set_region(&mut self, region: Option<Rect>) -> Result<()> {
+        self.cadre = region;
+        Ok(())
     }
 }
 

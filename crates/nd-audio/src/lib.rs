@@ -13,6 +13,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod mixing;
+pub mod session;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -32,6 +33,7 @@ pub use linux::{PulseLoopbackCapturer, PulseMicCapturer, PulsePlayer};
 #[cfg(target_os = "macos")]
 pub use macos::{CoreAudioPlayer, SckSystemCapturer};
 pub use mixing::{mix, mix_into, soft_clip, Mixer, SEUIL_SOFT_CLIP};
+pub use session::{AudioSession, EmetteurAudio, EvenementLecture, RecepteurAudio, SourceAudio};
 #[cfg(windows)]
 pub use win::WasapiLoopbackCapturer;
 #[cfg(windows)]

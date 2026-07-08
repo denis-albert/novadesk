@@ -1,8 +1,11 @@
 //! Implémentation Windows de [`ScreenCapturer`] via **DXGI Desktop Duplication**.
 //!
-//! Séquence par frame : `AcquireNextFrame` → copie de la texture du bureau vers une
-//! texture de *staging* CPU-lisible → lecture des régions modifiées (`GetFrameDirtyRects`)
-//! → `Map`/lecture des pixels → `ReleaseFrame`. Voir plan 02 §Windows.
+//! Séquence par frame : `AcquireNextFrame` → copie (éventuellement restreinte à une
+//! sous-région, [`ScreenCapturer::set_region`]) de la texture du bureau vers une
+//! texture de *staging* CPU-lisible → lecture des **régions modifiées** — dommages
+//! (`GetFrameDirtyRects`) **et** destinations des blocs déplacés (`GetFrameMoveRects`,
+//! défilement / fenêtre déplacée), fusionnés dans [`CapturedFrame::dirty`] → `Map` /
+//! lecture des pixels → `ReleaseFrame`. Voir plan 02 §Windows.
 //!
 //! Ce module concentre tout le `unsafe` FFI de la capture Windows ; il est isolé
 //! derrière le trait pour que le reste du moteur reste 100 % sûr.
@@ -18,14 +21,14 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
 
 use crate::{
@@ -36,6 +39,48 @@ use crate::{
 /// Convertit une erreur `windows` en `NdError::Capture` (partagé avec [`crate::win_cursor`]).
 pub(crate) fn cap(e: windows::core::Error) -> NdError {
     NdError::Capture(e.to_string())
+}
+
+/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
+/// `(x, y, largeur, hauteur)` **toujours non vide et dans les bornes**.
+///
+/// `None` ⇒ plein cadre `(0, 0, w, h)`. Une région partiellement hors cadre est
+/// rognée ; une origine hors cadre est ramenée au dernier pixel valide (jamais
+/// d'agrandissement au plein écran — la zone hors-cadre ne doit pas fuiter).
+fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    match region {
+        None => (0, 0, w, h),
+        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
+        Some(r) => {
+            let x = r.x.min(w - 1);
+            let y = r.y.min(h - 1);
+            let rw = r.w.min(w - x).max(1);
+            let rh = r.h.min(h - y).max(1);
+            (x, y, rw, rh)
+        }
+    }
+}
+
+/// Intersecte un `RECT` DXGI (coordonnées moniteur) avec la fenêtre de capture
+/// `[ox, ox+rw) × [oy, oy+rh)` et le **translate** dans le repère de la sous-région.
+/// Renvoie `None` si l'intersection est vide. Calcul en `i64` (les bords DXGI
+/// peuvent être négatifs ou déborder après addition).
+fn clip_rect_into_region(r: &RECT, ox: u32, oy: u32, rw: u32, rh: u32) -> Option<Rect> {
+    let (ox, oy) = (i64::from(ox), i64::from(oy));
+    let (rx1, ry1) = (ox + i64::from(rw), oy + i64::from(rh));
+    let l = i64::from(r.left).max(ox);
+    let t = i64::from(r.top).max(oy);
+    let right = i64::from(r.right).min(rx1);
+    let bottom = i64::from(r.bottom).min(ry1);
+    if right <= l || bottom <= t {
+        return None;
+    }
+    Some(Rect {
+        x: (l - ox) as u32,
+        y: (t - oy) as u32,
+        w: (right - l) as u32,
+        h: (bottom - t) as u32,
+    })
 }
 
 /// Énumère les moniteurs via DXGI : `IDXGIFactory1` → adaptateur 0 → `EnumOutputs`.
@@ -98,6 +143,9 @@ pub struct DxgiCapturer {
     output_index: u32,
     monitor: MonitorId,
     capture_cursor: bool,
+    /// Sous-région partagée (« cadre d'écran »), en pixels moniteur ; `None` = plein
+    /// écran. Bornée aux dimensions réelles à chaque frame (voir [`clamp_region`]).
+    region: Option<Rect>,
     start: Instant,
 }
 
@@ -140,6 +188,7 @@ impl DxgiCapturer {
             output_index: 0,
             monitor: MonitorId(0),
             capture_cursor: false,
+            region: None,
             start: Instant::now(),
         })
     }
@@ -162,11 +211,13 @@ impl DxgiCapturer {
         Ok(())
     }
 
-    /// Frame « vide » : rien n'a changé depuis la dernière capture.
+    /// Frame « vide » : rien n'a changé depuis la dernière capture. Ses dimensions
+    /// suivent la sous-région active (cohérence avec les frames pleines).
     fn empty_frame(&self) -> CapturedFrame {
+        let (_, _, rw, rh) = clamp_region(self.region, self.width, self.height);
         CapturedFrame {
-            width: self.width,
-            height: self.height,
+            width: rw,
+            height: rh,
             monitor: self.monitor,
             format: PixelFormat::Bgra8,
             dirty: Vec::new(),
@@ -176,38 +227,104 @@ impl DxgiCapturer {
         }
     }
 
-    /// Lit les régions modifiées associées à la frame courante.
-    fn read_dirty(
+    /// Lit **toutes** les régions modifiées de la frame courante et les fusionne dans
+    /// une liste [`Rect`] en coordonnées de la sous-région `[ox, oy, rw, rh]` :
+    ///
+    /// 1. **Blocs déplacés** (`GetFrameMoveRects`) : on retient la `DestinationRect`
+    ///    de chaque déplacement — le contenu y est neuf (défilement, fenêtre bougée).
+    /// 2. **Dommages** (`GetFrameDirtyRects`) : régions redessinées.
+    ///
+    /// Chaque rectangle est intersecté avec la sous-région et translaté ; ceux qui en
+    /// sortent sont ignorés. Les deux listes sont lues dans des tampons **typés**
+    /// (donc correctement alignés — pas d'accès non aligné), chacun dimensionné à
+    /// partir de `TotalMetadataBufferSize` (borne haute commune aux deux listes).
+    ///
+    /// **Correction pour le delta** : si la frame a bien été *présentée*
+    /// (`LastPresentTime != 0`) mais qu'aucune métadonnée de rectangle n'est fournie,
+    /// on renvoie un plein cadre (sous-région entière) — une trame présentée ne doit
+    /// jamais avoir un `dirty` vide, sous peine d'être sautée à tort par nd-codec.
+    fn read_damage(
         &self,
         dupl: &IDXGIOutputDuplication,
         info: &DXGI_OUTDUPL_FRAME_INFO,
+        ox: u32,
+        oy: u32,
+        rw: u32,
+        rh: u32,
     ) -> Vec<Rect> {
-        let size = info.TotalMetadataBufferSize;
-        let mut dirty = Vec::new();
-        if size == 0 {
-            return dirty;
+        let bytes = info.TotalMetadataBufferSize as usize;
+        let mut out = Vec::new();
+        // Nombre de rectangles bruts rapportés par DXGI (avant intersection) : sert à
+        // distinguer « aucune métadonnée » de « métadonnée entièrement hors sous-région ».
+        let mut raw_count = 0usize;
+
+        if bytes > 0 {
+            // 1. Blocs déplacés — chaque élément fait `size_of::<DXGI_OUTDUPL_MOVE_RECT>()`.
+            let sz_move = std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+            let cap_move = bytes / sz_move;
+            if cap_move > 0 {
+                let mut moves = vec![DXGI_OUTDUPL_MOVE_RECT::default(); cap_move];
+                let mut required = 0u32;
+                // SAFETY : `moves` est un tampon typé de `cap_move` éléments ; l'API y
+                // écrit au plus `cap_move * sz_move` octets et renseigne `required`.
+                let res = unsafe {
+                    dupl.GetFrameMoveRects(
+                        (cap_move * sz_move) as u32,
+                        moves.as_mut_ptr(),
+                        &mut required,
+                    )
+                };
+                if res.is_ok() {
+                    let n = (required as usize / sz_move).min(cap_move);
+                    raw_count += n;
+                    for m in &moves[..n] {
+                        if let Some(rc) = clip_rect_into_region(&m.DestinationRect, ox, oy, rw, rh)
+                        {
+                            out.push(rc);
+                        }
+                    }
+                }
+            }
+
+            // 2. Dommages — chaque élément fait `size_of::<RECT>()`.
+            let sz_dirty = std::mem::size_of::<RECT>();
+            let cap_dirty = bytes / sz_dirty;
+            if cap_dirty > 0 {
+                let mut dirties = vec![RECT::default(); cap_dirty];
+                let mut required = 0u32;
+                // SAFETY : `dirties` est un tampon typé de `cap_dirty` éléments ; l'API y
+                // écrit au plus `cap_dirty * sz_dirty` octets et renseigne `required`.
+                let res = unsafe {
+                    dupl.GetFrameDirtyRects(
+                        (cap_dirty * sz_dirty) as u32,
+                        dirties.as_mut_ptr(),
+                        &mut required,
+                    )
+                };
+                if res.is_ok() {
+                    let n = (required as usize / sz_dirty).min(cap_dirty);
+                    raw_count += n;
+                    for r in &dirties[..n] {
+                        if let Some(rc) = clip_rect_into_region(r, ox, oy, rw, rh) {
+                            out.push(rc);
+                        }
+                    }
+                }
+            }
         }
-        let mut buf = vec![0u8; size as usize];
-        let mut required = 0u32;
-        // SAFETY : `buf` fait `size` octets ; l'API écrit au plus `size` et renseigne `required`.
-        let res = unsafe {
-            dupl.GetFrameDirtyRects(size, buf.as_mut_ptr().cast::<RECT>(), &mut required)
-        };
-        if res.is_err() {
-            return dirty;
-        }
-        let count = required as usize / std::mem::size_of::<RECT>();
-        // SAFETY : `buf` contient `count` `RECT` valides écrits par l'API.
-        let rects = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<RECT>(), count) };
-        for r in rects {
-            dirty.push(Rect {
-                x: r.left.max(0) as u32,
-                y: r.top.max(0) as u32,
-                w: (r.right - r.left).max(0) as u32,
-                h: (r.bottom - r.top).max(0) as u32,
+
+        // Present réel sans aucun rectangle exploitable → plein cadre conservateur.
+        // (Si des rectangles existaient mais tombaient tous hors sous-région, `out`
+        // reste vide à raison : la sous-région, elle, n'a pas changé.)
+        if info.LastPresentTime != 0 && raw_count == 0 {
+            out.push(Rect {
+                x: 0,
+                y: 0,
+                w: rw,
+                h: rh,
             });
         }
-        dirty
+        out
     }
 }
 
@@ -257,6 +374,13 @@ impl ScreenCapturer for DxgiCapturer {
     fn stop(&mut self) {
         self.dupl = None;
     }
+
+    /// Fixe le « cadre d'écran ». Aucune (ré)initialisation : la sous-région est
+    /// simplement rognée aux dimensions réelles à la frame suivante ([`clamp_region`]).
+    fn set_region(&mut self, region: Option<Rect>) -> Result<()> {
+        self.region = region;
+        Ok(())
+    }
 }
 
 impl DxgiCapturer {
@@ -277,8 +401,15 @@ impl DxgiCapturer {
         let w = desc.Width;
         let h = desc.Height;
 
-        // Texture de staging CPU-lisible, même format/dimensions.
+        // Sous-région partagée (« cadre d'écran »), bornée aux dimensions réelles.
+        let (ox, oy, rw, rh) = clamp_region(self.region, w, h);
+        let plein_cadre = ox == 0 && oy == 0 && rw == w && rh == h;
+
+        // Texture de staging CPU-lisible, aux dimensions de la sous-région : on ne
+        // recopie (et ne lit) que la zone partagée.
         let mut sdesc = desc;
+        sdesc.Width = rw;
+        sdesc.Height = rh;
         sdesc.Usage = D3D11_USAGE_STAGING;
         sdesc.BindFlags = 0;
         sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
@@ -293,16 +424,46 @@ impl DxgiCapturer {
         .map_err(cap)?;
         let staging = staging.ok_or_else(|| NdError::Capture("texture de staging nulle".into()))?;
 
-        // SAFETY : source et destination sont des textures compatibles.
-        unsafe { self.context.CopyResource(&staging, &frame_tex) };
+        if plein_cadre {
+            // SAFETY : source et destination sont des textures compatibles (mêmes dims).
+            unsafe { self.context.CopyResource(&staging, &frame_tex) };
+        } else {
+            // Recopie du seul rectangle `[ox, oy, rw, rh]` du bureau vers (0, 0).
+            let boite = D3D11_BOX {
+                left: ox,
+                top: oy,
+                front: 0,
+                right: ox + rw,
+                bottom: oy + rh,
+                back: 1,
+            };
+            // SAFETY : `boite` est incluse dans la texture source ; la destination
+            // (staging) mesure exactement `rw`×`rh` ; sous-ressource 0 dans les deux.
+            unsafe {
+                self.context.CopySubresourceRegion(
+                    &staging,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &frame_tex,
+                    0,
+                    Some(&boite),
+                );
+            }
+        }
 
-        let dirty = self.read_dirty(dupl, info);
+        let dirty = self.read_damage(dupl, info, ox, oy, rw, rh);
 
+        // Position du curseur ramenée dans le repère de la sous-région ; visible
+        // seulement s'il tombe dedans (pas de fuite hors cadre).
         let cursor = if self.capture_cursor && info.PointerPosition.Visible.as_bool() {
+            let cx = info.PointerPosition.Position.x - ox as i32;
+            let cy = info.PointerPosition.Position.y - oy as i32;
             Some(CursorState {
-                x: info.PointerPosition.Position.x,
-                y: info.PointerPosition.Position.y,
-                visible: true,
+                x: cx,
+                y: cy,
+                visible: cx >= 0 && cy >= 0 && (cx as u32) < rw && (cy as u32) < rh,
             })
         } else {
             None
@@ -316,13 +477,13 @@ impl DxgiCapturer {
         }
         .map_err(cap)?;
 
-        let row_bytes = w as usize * 4;
+        let row_bytes = rw as usize * 4;
         let pitch = mapped.RowPitch as usize;
         let base = mapped.pData as *const u8;
-        let mut data = vec![0u8; row_bytes * h as usize];
+        let mut data = vec![0u8; row_bytes * rh as usize];
         for (y, row) in data.chunks_mut(row_bytes).enumerate() {
             // SAFETY : chaque ligne source fait `row_bytes` octets, à l'offset `y*pitch`
-            // dans un buffer de `pitch * h` octets fourni par `Map`.
+            // dans un buffer de `pitch * rh` octets fourni par `Map`.
             let src = unsafe { std::slice::from_raw_parts(base.add(y * pitch), row_bytes) };
             row.copy_from_slice(src);
         }
@@ -331,8 +492,8 @@ impl DxgiCapturer {
         unsafe { self.context.Unmap(&staging, 0) };
 
         Ok(CapturedFrame {
-            width: w,
-            height: h,
+            width: rw,
+            height: rh,
             monitor: self.monitor,
             format: PixelFormat::Bgra8,
             dirty,
@@ -372,6 +533,108 @@ mod tests {
         assert!(
             monitors.is_empty() || primaries == 1,
             "exactement un moniteur principal attendu, trouvé {primaries}"
+        );
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// `clamp_region` : plein cadre par défaut, rognage dans les bornes, jamais vide,
+    /// jamais d'agrandissement au plein écran sur origine hors cadre.
+    #[test]
+    fn clamp_region_borne_sans_deborder() {
+        // None → plein cadre.
+        assert_eq!(clamp_region(None, 1920, 1080), (0, 0, 1920, 1080));
+        // Région interne inchangée.
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 100,
+                    y: 50,
+                    w: 640,
+                    h: 480
+                }),
+                1920,
+                1080
+            ),
+            (100, 50, 640, 480)
+        );
+        // Débordement droite/bas → rogné à la limite.
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 1800,
+                    y: 1000,
+                    w: 400,
+                    h: 400
+                }),
+                1920,
+                1080
+            ),
+            (1800, 1000, 120, 80)
+        );
+        // Origine hors cadre → ramenée au dernier pixel, largeur/hauteur ≥ 1
+        // (pas de repli plein écran : la zone hors-cadre ne fuite pas).
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 5000,
+                    y: 5000,
+                    w: 10,
+                    h: 10
+                }),
+                1920,
+                1080
+            ),
+            (1919, 1079, 1, 1)
+        );
+    }
+
+    /// `clip_rect_into_region` : intersection + translation dans le repère de la
+    /// sous-région ; `None` hors cadre ; bords négatifs/débordants bornés.
+    #[test]
+    fn clip_rect_translate_dans_la_region() {
+        // Sous-région [100,100, 200x200]. Rect moniteur [150,150, 400,400] →
+        // intersection [150,150,300,300] → translaté (50,50, 150x150).
+        assert_eq!(
+            clip_rect_into_region(&rect(150, 150, 400, 400), 100, 100, 200, 200),
+            Some(Rect {
+                x: 50,
+                y: 50,
+                w: 150,
+                h: 150
+            })
+        );
+        // Rect englobant toute la sous-région → sous-région entière (0,0,rw,rh).
+        assert_eq!(
+            clip_rect_into_region(&rect(0, 0, 10000, 10000), 100, 100, 200, 200),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 200
+            })
+        );
+        // Rect entièrement hors sous-région → None.
+        assert_eq!(
+            clip_rect_into_region(&rect(0, 0, 50, 50), 100, 100, 200, 200),
+            None
+        );
+        // Bords négatifs bornés (l'intersection démarre à l'origine de la région).
+        assert_eq!(
+            clip_rect_into_region(&rect(-40, -40, 120, 120), 0, 0, 200, 200),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                w: 120,
+                h: 120
+            })
         );
     }
 }

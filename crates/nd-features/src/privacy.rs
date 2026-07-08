@@ -17,12 +17,18 @@
 //!    [`crate::PermissionBroker`] avant toute transition ;
 //! 2. dérouler `transition_to(...)` **dans l'ordre rendu**, en traduisant
 //!    chaque [`PrivacyAction`] en appel plateforme :
-//!    - `EnableBlackScreen`/`DisableBlackScreen` → nd-capture
-//!      (TODO(nd-capture) : extinction/masquage de la sortie physique —
-//!      `SetDisplayConfig`/DDC sous Windows ; rien ici) ;
-//!    - `BlockLocalInput`/`UnblockLocalInput` → nd-input
-//!      (TODO(nd-input) : filtre d'entrées locales — hooks bas niveau
-//!      `WH_KEYBOARD_LL`/`WH_MOUSE_LL` ou `BlockInput` ; rien ici) ;
+//!    - `EnableBlackScreen`/`DisableBlackScreen` → nd-capture / fenêtre hôte.
+//!      Volet **sans droits admin déjà rendu ici** :
+//!      [`PrivacyState::render_screen_cache`] fournit le tampon opaque
+//!      ([`ScreenCache`]) que la fenêtre hôte affiche en recouvrement de son
+//!      propre bureau. TODO(nd-capture) : extinction de la **sortie physique**
+//!      elle-même (`SetDisplayConfig`/DDC sous Windows), hors de portée sans
+//!      privilèges — rien ici ;
+//!    - `BlockLocalInput`/`UnblockLocalInput` → nd-input. **Exige des droits
+//!      élevés** : un blocage robuste (y compris Ctrl+Alt+Suppr / bureau
+//!      sécurisé) passe par `BlockInput` ou des hooks bas niveau
+//!      `WH_KEYBOARD_LL`/`WH_MOUSE_LL` avec UIAccess/élévation.
+//!      TODO(nd-input) : rien ici, faute de privilèges dans ce jet ;
 //!    - `HideWallpaper`/`RestoreWallpaper` → intégration OS
 //!      (TODO(intégration OS) : `SystemParametersInfo(SPI_SETDESKWALLPAPER)`
 //!      avec sauvegarde/restauration ; rien ici) ;
@@ -131,12 +137,92 @@ impl PrivacyState {
     pub fn release_actions(self) -> Vec<PrivacyAction> {
         self.transition_to(PrivacyState::off())
     }
+
+    /// Rend le **cache d'écran** de confidentialité à superposer : le tampon
+    /// opaque que la fenêtre hôte doit afficher par-dessus le bureau réel tant
+    /// que l'écran est masqué. Renvoie `None` (rien à recouvrir) si
+    /// `black_screen` est faux.
+    ///
+    /// C'est le volet du masquage d'écran **réalisable sans droits
+    /// administrateur** : recouvrir son propre bureau d'une fenêtre opaque, au
+    /// lieu d'éteindre la sortie physique (DDC/CCD, réservé à l'OS — voir le
+    /// TODO en tête de module). `largeur`/`hauteur` sont celles de l'écran à
+    /// recouvrir.
+    #[must_use]
+    pub fn render_screen_cache(self, largeur: u32, hauteur: u32) -> Option<ScreenCache> {
+        self.black_screen
+            .then(|| ScreenCache::opaque_noir(largeur, hauteur))
+    }
 }
 
 impl Default for PrivacyState {
     fn default() -> Self {
         // Défaut : rideau levé tant que le contrôleur ne demande rien.
         PrivacyState::off()
+    }
+}
+
+/// Cache d'écran de confidentialité : image que la **fenêtre hôte** affiche
+/// par-dessus le bureau réel du poste contrôlé pendant le masquage (volet du
+/// rideau réalisable sans privilèges — cf.
+/// [`PrivacyState::render_screen_cache`]).
+///
+/// Format : RGBA 8 bits par canal (`[R, G, B, A]` par pixel, lignes de haut en
+/// bas), identique à [`crate::RgbaCanvas`] — directement téléversable en
+/// texture par la couche d'affichage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenCache {
+    largeur: u32,
+    hauteur: u32,
+    pixels: Vec<u8>,
+}
+
+impl ScreenCache {
+    /// Cache entièrement noir et **opaque** de `largeur × hauteur` pixels.
+    fn opaque_noir(largeur: u32, hauteur: u32) -> Self {
+        let mut pixels = vec![0u8; largeur as usize * hauteur as usize * 4];
+        // R = G = B = 0 (déjà à zéro) ; seul l'alpha passe à 255 (opaque).
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+        ScreenCache {
+            largeur,
+            hauteur,
+            pixels,
+        }
+    }
+
+    /// Largeur du cache, en pixels.
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.largeur
+    }
+
+    /// Hauteur du cache, en pixels.
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.hauteur
+    }
+
+    /// Les octets RGBA bruts (`largeur × hauteur × 4`), lignes de haut en bas.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Le pixel `(x, y)` sous forme `[R, G, B, A]`, ou `None` hors du cache.
+    #[must_use]
+    pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.largeur || y >= self.hauteur {
+            return None;
+        }
+        let base = (y as usize * self.largeur as usize + x as usize) * 4;
+        Some([
+            self.pixels[base],
+            self.pixels[base + 1],
+            self.pixels[base + 2],
+            self.pixels[base + 3],
+        ])
     }
 }
 
@@ -233,5 +319,44 @@ mod tests {
             PrivacyState::curtain().transition_to(PrivacyState::off())
         );
         assert!(PrivacyState::off().release_actions().is_empty());
+    }
+
+    #[test]
+    fn cache_ecran_noir_opaque_quand_masque() {
+        let etat = PrivacyState {
+            black_screen: true,
+            block_local_input: false,
+            disable_wallpaper: false,
+        };
+        let cache = etat
+            .render_screen_cache(4, 3)
+            .expect("écran masqué → un cache à afficher");
+        assert_eq!((cache.width(), cache.height()), (4, 3));
+        assert_eq!(cache.pixels().len(), 4 * 3 * 4);
+        assert_eq!(cache.pixel(0, 0), Some([0, 0, 0, 255]));
+        assert_eq!(cache.pixel(3, 2), Some([0, 0, 0, 255]));
+        assert_eq!(cache.pixel(4, 0), None); // hors cadre
+                                             // Tout le tampon est noir opaque.
+        assert!(cache.pixels().chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn pas_de_cache_sans_ecran_noir() {
+        // Sans `black_screen`, la fenêtre hôte n'a rien à recouvrir, même si
+        // d'autres mesures de confidentialité sont actives.
+        let etat = PrivacyState {
+            black_screen: false,
+            block_local_input: true,
+            disable_wallpaper: true,
+        };
+        assert!(etat.render_screen_cache(8, 8).is_none());
+        assert!(PrivacyState::off().render_screen_cache(8, 8).is_none());
+    }
+
+    #[test]
+    fn cache_ecran_dimensions_nulles_sans_panique() {
+        let cache = PrivacyState::curtain().render_screen_cache(0, 0).unwrap();
+        assert!(cache.pixels().is_empty());
+        assert_eq!(cache.pixel(0, 0), None);
     }
 }

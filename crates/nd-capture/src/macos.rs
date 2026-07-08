@@ -36,6 +36,24 @@ fn cap_cg(contexte: &str, code: CGError) -> NdError {
     NdError::Capture(format!("{contexte} : CGError {code}"))
 }
 
+/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
+/// `(x, y, largeur, hauteur)` toujours non vide et dans les bornes (`None` = plein
+/// cadre). Une origine hors cadre est ramenée au dernier pixel valide — jamais
+/// d'agrandissement au plein écran (la zone hors-cadre ne doit pas fuiter).
+fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    match region {
+        None => (0, 0, w, h),
+        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
+        Some(r) => {
+            let x = r.x.min(w - 1);
+            let y = r.y.min(h - 1);
+            let rw = r.w.min(w - x).max(1);
+            let rh = r.h.min(h - y).max(1);
+            (x, y, rw, rh)
+        }
+    }
+}
+
 /// Énumère les écrans actifs via `CGGetActiveDisplayList`.
 ///
 /// `MonitorId(i)` = index dans la liste des écrans actifs — exactement la
@@ -70,6 +88,9 @@ pub(crate) struct CgCapturer {
     display: Option<CGDirectDisplayID>,
     monitor: MonitorId,
     capture_cursor: bool,
+    /// Sous-région partagée (« cadre d'écran »), en pixels écran ; `None` = plein
+    /// écran. Bornée aux dimensions réelles à chaque frame ([`clamp_region`]).
+    cadre: Option<Rect>,
     /// Intervalle entre deux instantanés (dérivé de `target_fps`).
     intervalle: Duration,
     /// Prochaine échéance de capture (cadence « tirer »).
@@ -84,6 +105,7 @@ impl CgCapturer {
             display: None,
             monitor: MonitorId(0),
             capture_cursor: false,
+            cadre: None,
             intervalle: Duration::from_millis(16),
             prochain_tick: None,
             start: Instant::now(),
@@ -184,15 +206,42 @@ impl ScreenCapturer for CgCapturer {
             dest.copy_from_slice(&src[..stride_dest]);
         }
 
-        let cursor = if self.capture_cursor {
+        // Curseur dans le repère de l'écran, translaté ensuite dans le cadre.
+        let cursor_plein = if self.capture_cursor {
             Self::interroge_curseur(display, largeur, hauteur)
         } else {
             None
         };
 
+        // Sous-région partagée (« cadre d'écran ») : CoreGraphics ne restreint pas la
+        // capture, on recadre le tampon BGRA déjà lu (le plein écran n'est jamais
+        // exposé — seule la découpe entre dans la frame).
+        let (ox, oy, rw, rh) = clamp_region(self.cadre, largeur, hauteur);
+        let (data, out_w, out_h) = if rw == largeur && rh == hauteur {
+            (bgra, largeur, hauteur)
+        } else {
+            let dst_stride = rw as usize * 4;
+            let mut crop = vec![0u8; dst_stride * rh as usize];
+            for ligne in 0..rh as usize {
+                let s = (oy as usize + ligne) * stride_dest + ox as usize * 4;
+                let d = ligne * dst_stride;
+                crop[d..d + dst_stride].copy_from_slice(&bgra[s..s + dst_stride]);
+            }
+            (crop, rw, rh)
+        };
+        let cursor = cursor_plein.map(|c| {
+            let x = c.x - ox as i32;
+            let y = c.y - oy as i32;
+            CursorState {
+                x,
+                y,
+                visible: x >= 0 && y >= 0 && (x as u32) < rw && (y as u32) < rh,
+            }
+        });
+
         Ok(CapturedFrame {
-            width: largeur,
-            height: hauteur,
+            width: out_w,
+            height: out_h,
             monitor: self.monitor,
             format: PixelFormat::Bgra8,
             // Pas de détection de dommages avec CGDisplayCreateImage : toute la
@@ -200,14 +249,14 @@ impl ScreenCapturer for CgCapturer {
             dirty: vec![Rect {
                 x: 0,
                 y: 0,
-                w: largeur,
-                h: hauteur,
+                w: out_w,
+                h: out_h,
             }],
             cursor,
             timestamp_us: self.start.elapsed().as_micros() as u64,
             image: Some(FrameImage::Cpu {
-                data: bgra,
-                stride: stride_dest,
+                data,
+                stride: out_w as usize * 4,
             }),
         })
     }
@@ -221,5 +270,12 @@ impl ScreenCapturer for CgCapturer {
     fn stop(&mut self) {
         self.display = None;
         self.prochain_tick = None;
+    }
+
+    /// Fixe le « cadre d'écran » (sous-région, en pixels écran). Borné aux dimensions
+    /// réelles à la frame suivante ([`clamp_region`]).
+    fn set_region(&mut self, region: Option<Rect>) -> Result<()> {
+        self.cadre = region;
+        Ok(())
     }
 }

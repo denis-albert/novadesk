@@ -208,4 +208,8 @@ impl Clipboard for WindowsClipboard {
     fn get_files(&self) -> Result<Vec<std::path::PathBuf>> {
         crate::win_riche::get_files()
     }
+
+    fn set_files(&self, paths: &[std::path::PathBuf]) -> Result<()> {
+        crate::win_riche::set_files(paths)
+    }
 }

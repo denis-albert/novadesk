@@ -1,101 +1,97 @@
-/// Test de fumée : l'application démarre sur l'accueil « parité AnyDesk »
-/// (fenêtre à onglets + deux colonnes) avec l'ID local formaté par la
-/// façade (mock `MockNativeApi`).
+/// Tests de fumée : navigabilité sous mock ([MockNativeApi]) de l'UI
+/// « novadesk-app » — accueil (ID local formaté, liste après squelette),
+/// connexion → session → retour, réglages en onglets, décodage vidéo pur Dart,
+/// et hôte non surveillé (dialogue d'acceptation → `approve_incoming`).
+///
+/// Note : les squelettes de chargement et les flux de session sont des
+/// animations/minuteurs perpétuels ; on avance donc par `pump` bornés (jamais
+/// `pumpAndSettle` tant qu'une animation perpétuelle est à l'écran).
 library;
 
 import 'dart:async';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart' show TextField;
+import 'package:flutter/material.dart' show TextField, Widget, Size;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:novadesk_ui/bridge/mock_api.dart';
 import 'package:novadesk_ui/bridge/native_api.dart';
 import 'package:novadesk_ui/main.dart';
 import 'package:novadesk_ui/state/providers.dart';
+import 'package:novadesk_ui/widgets/nova_kit.dart';
+
+/// Avance au-delà du squelette de chargement de l'accueil (~780 ms) et de la
+/// résolution des `FutureProvider`, sans `pumpAndSettle` (shimmer perpétuel).
+Future<void> _demarrer(WidgetTester tester, {Widget? app}) async {
+  // Fenêtre desktop réaliste (cible NovaDesk ≥ 1120 px de large).
+  tester.view.physicalSize = const Size(1280, 800);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+  await tester.pumpWidget(app ?? const ProviderScope(child: NovaDeskApp()));
+  for (var i = 0; i < 10; i++) {
+    await tester.pump(const Duration(milliseconds: 120));
+  }
+}
 
 void main() {
   testWidgets("l'accueil affiche l'ID local formaté par groupes de 3",
       (tester) async {
-    await tester.pumpWidget(const ProviderScope(child: NovaDeskApp()));
-    await tester.pumpAndSettle();
+    await _demarrer(tester);
 
-    // Barre de titre : marque + onglet Accueil.
+    // Barre de titre + onglet.
     expect(find.text('NovaDesk'), findsOneWidget);
-    expect(find.text('Accueil'), findsOneWidget);
-    // Colonne « Poste distant » : champ d'adresse + bouton rouge.
-    expect(find.text('POSTE DISTANT'), findsOneWidget);
+    expect(find.text('Accueil'), findsWidgets);
+    // Colonne « Poste distant » + bouton rouge.
+    expect(find.text('Poste distant'), findsOneWidget);
     expect(find.text('Se connecter'), findsOneWidget);
-    expect(find.text('SESSIONS RÉCENTES'), findsOneWidget);
-    // Colonne « Ce poste » : 936271048 -> « 936 271 048 »
-    // (même rendu que format_nova_id côté Rust).
-    expect(find.text('CE POSTE'), findsOneWidget);
+    // Colonne « Ce poste » : 936271048 -> « 936 271 048 ».
+    expect(find.text('Ce poste'), findsOneWidget);
     expect(find.text('936 271 048'), findsOneWidget);
   });
 
   testWidgets('la connexion ouvre la session (mock) puis revient à l’accueil',
       (tester) async {
-    await tester.pumpWidget(const ProviderScope(child: NovaDeskApp()));
-    await tester.pumpAndSettle();
+    await _demarrer(tester);
 
     await tester.enterText(find.byType(TextField).first, '421887330');
     await tester.tap(find.text('Se connecter'));
-    // La session live du mock émet un flux vidéo continu (~30 IPS) : on pompe
-    // par durées bornées (pas de pumpAndSettle tant que la session est ouverte,
-    // sinon l'animation perpétuelle ne « settle » jamais). Le flux d'états du
-    // mock atteint « active » en ~1,3 s.
-    for (var i = 0; i < 20; i++) {
+    // Le flux d'états du mock atteint « active » en ~1,3 s ; on pompe par
+    // durées bornées (flux vidéo perpétuel).
+    for (var i = 0; i < 24; i++) {
       await tester.pump(const Duration(milliseconds: 120));
     }
 
-    // Onglet de session + bloc pair de la barre d'outils flottante.
+    // Onglet de session + bouton « Terminer » de la barre d'outils.
     expect(find.text('poste-bureau'), findsWidgets);
-    expect(find.text('active'), findsOneWidget); // badge de la barre d'état
     expect(find.byTooltip('Terminer'), findsOneWidget);
 
-    // Terminer : arrêt du moteur puis retour à l'accueil.
-    // (La barre d'outils défile horizontalement si la fenêtre est étroite.)
     await tester.ensureVisible(find.byTooltip('Terminer'));
     await tester.pump();
     await tester.tap(find.byTooltip('Terminer'));
-    // Le dispose annule les flux : une fois de retour à l'accueil, plus
-    // d'animation → pumpAndSettle peut de nouveau se stabiliser.
     for (var i = 0; i < 8; i++) {
       await tester.pump(const Duration(milliseconds: 150));
     }
-    await tester.pumpAndSettle();
-    expect(find.text('POSTE DISTANT'), findsOneWidget);
+    // Vide le minuteur du toast « Connecté » (3 s) avant la fin du test.
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    expect(find.text('Poste distant'), findsOneWidget);
   });
 
-  testWidgets(
-      'réglages en onglets, dialogue d’acceptation et accès non surveillé',
+  testWidgets('les réglages présentent les onglets (rail + volet)',
       (tester) async {
-    await tester.pumpWidget(const ProviderScope(child: NovaDeskApp()));
-    await tester.pumpAndSettle();
+    await _demarrer(tester);
 
-    // Réglages (bouton discret de la barre de titre).
+    // Réglages via le rail de navigation.
     await tester.tap(find.byTooltip('Réglages'));
     await tester.pumpAndSettle();
-    expect(find.text('Interface'), findsOneWidget);
-    expect(find.text('À propos'), findsOneWidget);
+    expect(find.text('Interface'), findsWidgets);
 
-    // Onglet Sécurité : dialogue d'acceptation entrante (démo).
+    // Onglet Sécurité : le volet affiche ses lignes de réglage.
     await tester.tap(find.text('Sécurité'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text("Tester le dialogue d'acceptation"));
-    await tester.pumpAndSettle();
-    expect(find.text('pc-marie'), findsOneWidget);
-    expect(find.text('Accepter'), findsOneWidget);
-    await tester.tap(find.text('Refuser'));
-    await tester.pumpAndSettle();
-    // Laisse la SnackBar de confirmation se résorber (minuteur interne).
-    await tester.pump(const Duration(seconds: 5));
-    await tester.pumpAndSettle();
-
-    // Écran « Accès non surveillé » : le bouton d'activation est présent.
-    await tester.tap(find.text('Accès non surveillé'));
-    await tester.pumpAndSettle();
-    expect(find.text("Activer l'accès non surveillé"), findsOneWidget);
+    expect(find.text('Double authentification (TOTP)'), findsOneWidget);
   });
 
   testWidgets('le flux vidéo du mock se décode en ui.Image (rendu pur Dart)',
@@ -111,16 +107,14 @@ void main() {
       endpoint: const SessionEndpointLoopback(),
     );
 
-    // Le mock émet une mire 320×180 en RGBA (4 octets/pixel).
-    final trames = await api.collectVideoFrames(id, maxFrames: 1, timeoutMs: 100);
+    final trames =
+        await api.collectVideoFrames(id, maxFrames: 1, timeoutMs: 100);
     expect(trames, isNotEmpty);
     final trame = trames.first;
     expect(trame.width, 320);
     expect(trame.height, 180);
     expect(trame.rgba.length, 320 * 180 * 4);
 
-    // Chemin exact du rendu de la surface : RGBA → ui.Image via
-    // decodeImageFromPixels (runAsync car le décodage natif sort du FakeAsync).
     await tester.runAsync(() async {
       final completer = Completer<ui.Image>();
       ui.decodeImageFromPixels(
@@ -140,50 +134,48 @@ void main() {
   });
 
   testWidgets(
-      "l'hôte non surveillé mock ouvre le dialogue entrant et « Accepter » "
+      "l'hôte non surveillé ouvre le dialogue entrant et « Accepter » "
       'appelle approveIncoming',
       (tester) async {
-    // Mock injecté pour observer les décisions transmises à approve_incoming.
     final mock = MockNativeApi();
-    await tester.pumpWidget(
-      ProviderScope(
+    await _demarrer(
+      tester,
+      app: ProviderScope(
         overrides: [nativeApiProvider.overrideWithValue(mock)],
         child: const NovaDeskApp(),
       ),
     );
-    await tester.pumpAndSettle();
 
-    // Ouvre l'écran depuis la colonne « Ce poste » de l'accueil.
-    await tester.ensureVisible(find.text('Accès non surveillé'));
+    // Ouvre l'écran depuis le lien « Accès non surveillé » de l'accueil.
     await tester.tap(find.text('Accès non surveillé'));
     await tester.pumpAndSettle();
 
-    // Active l'hôte : start_unattended_host renvoie un id, abonnement au flux.
-    await tester.tap(find.text("Activer l'accès non surveillé"));
-    await tester.pump(); // lance _activerHote
-    await tester.pump(const Duration(milliseconds: 50)); // l'appel résout
-    expect(find.text('Actif'), findsOneWidget);
+    // Active l'hôte via l'interrupteur (start_unattended_host + abonnement).
+    await tester.tap(find.byType(NovaSwitch).first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
 
-    // La demande entrante factice arrive ~2 s après l'abonnement : le dialogue
-    // d'acceptation s'ouvre. (Pas de pumpAndSettle : le polling des stats
-    // reprogramme un frame toutes les 2 s tant que l'hôte est actif.)
+    // La demande entrante factice arrive ~2 s après l'abonnement.
     await tester.pump(const Duration(milliseconds: 2200));
-    await tester.pump(); // livraison de l'événement + showDialog
-    await tester.pump(const Duration(milliseconds: 300)); // animation d'ouverture
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
     expect(find.text('Accepter'), findsOneWidget);
     expect(find.text('Refuser'), findsOneWidget);
 
     // Accepter → approve_incoming(accepter: true) sur le bon pair.
     await tester.tap(find.text('Accepter'));
-    await tester.pump(); // pop + microtâche approveIncoming
-    await tester.pump(const Duration(milliseconds: 300)); // fermeture du dialogue
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
     expect(mock.approbations, isNotEmpty);
     expect(mock.approbations.last.accepter, isTrue);
     expect(mock.approbations.last.peerId, 555240173);
 
     // Désactive proprement l'hôte (annule le flux mock → aucun timer pendant).
-    await tester.tap(find.text('Désactiver'));
+    await tester.tap(find.byType(NovaSwitch).first);
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
+    // Vide les minuteurs de toast (3 s).
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(milliseconds: 300));
   });
 }

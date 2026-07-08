@@ -16,12 +16,15 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
     show ExternalLibrary;
 
+import 'app_routes.dart';
 import 'bridge/frb_api.dart';
 import 'bridge/generated/frb_generated.dart';
 import 'bridge/mock_api.dart';
 import 'bridge/native_api.dart';
 import 'platform/window_shim.dart';
+import 'screens/address_book_screen.dart';
 import 'screens/home_screen.dart';
+import 'screens/recordings_screen.dart';
 import 'screens/session_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/unattended_screen.dart';
@@ -109,16 +112,24 @@ class NovaDeskApp extends ConsumerWidget {
         GlobalCupertinoLocalizations.delegate,
       ],
 
-      initialRoute: HomeScreen.route,
+      initialRoute: NovaRoutes.accueil,
       onGenerateRoute: _genererRoute,
     );
   }
 
   Route<dynamic>? _genererRoute(RouteSettings parametres) {
     switch (parametres.name) {
-      case HomeScreen.route:
+      case NovaRoutes.accueil:
         return MaterialPageRoute(builder: (_) => const HomeScreen());
-      case SessionScreen.route:
+      case NovaRoutes.carnet:
+        return MaterialPageRoute(builder: (_) => const AddressBookScreen());
+      case NovaRoutes.enregistrements:
+        return MaterialPageRoute(builder: (_) => const RecordingsScreen());
+      case NovaRoutes.nonSurveille:
+        return MaterialPageRoute(builder: (_) => const UnattendedScreen());
+      case NovaRoutes.reglages:
+        return MaterialPageRoute(builder: (_) => const SettingsScreen());
+      case NovaRoutes.session:
         final arguments = parametres.arguments;
         if (arguments is! SessionScreenArgs) {
           // Une session ne s'ouvre jamais sans configuration validée.
@@ -127,10 +138,6 @@ class NovaDeskApp extends ConsumerWidget {
         return MaterialPageRoute(
           builder: (_) => SessionScreen(args: arguments),
         );
-      case SettingsScreen.route:
-        return MaterialPageRoute(builder: (_) => const SettingsScreen());
-      case UnattendedScreen.route:
-        return MaterialPageRoute(builder: (_) => const UnattendedScreen());
     }
     return null;
   }
