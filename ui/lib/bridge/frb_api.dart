@@ -298,8 +298,220 @@ class FrbNativeApi implements NativeApi {
       frb.stopUnattendedHost(hostId: BigInt.from(hostId));
 
   // ---------------------------------------------------------------------------
+  // État persistant — délégation aux fonctions générées (u64 ⇄ BigInt,
+  // i64 ⇄ PlatformInt64)
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<LocalIdentityDto> localIdentity() async {
+    final i = await frb.localIdentity();
+    return LocalIdentityDto(
+      id: i.id.toInt(),
+      idFormate: i.idFormate,
+      empreinte: i.empreinte,
+    );
+  }
+
+  @override
+  Future<String> generateEphemeralPassword() =>
+      frb.generateEphemeralPassword();
+
+  @override
+  Future<List<AddressBookEntryDto>> listContacts() async {
+    final contacts = await frb.listContacts();
+    return contacts.map(_contactDepuis).toList();
+  }
+
+  @override
+  Future<AddressBookEntryDto> addContact({
+    required String alias,
+    required int id,
+    required String groupe,
+    required List<String> etiquettes,
+  }) async {
+    try {
+      final entree = await frb.addContact(
+        alias: alias,
+        id: BigInt.from(id),
+        groupe: groupe,
+        etiquettes: etiquettes,
+      );
+      return _contactDepuis(entree);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> updateContact({
+    required int id,
+    required String alias,
+    required String groupe,
+    required List<String> etiquettes,
+  }) async {
+    try {
+      await frb.updateContact(
+        id: BigInt.from(id),
+        alias: alias,
+        groupe: groupe,
+        etiquettes: etiquettes,
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> removeContact({required int id}) async {
+    try {
+      await frb.removeContact(id: BigInt.from(id));
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> setFavorite({required int id, required bool favori}) async {
+    try {
+      await frb.setFavorite(id: BigInt.from(id), favori: favori);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<List<String>> listGroups() => frb.listGroups();
+
+  @override
+  Future<void> addGroup({required String nom}) async {
+    try {
+      await frb.addGroup(nom: nom);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<List<SettingDto>> getSettings() async {
+    final settings = await frb.getSettings();
+    return [for (final s in settings) SettingDto(cle: s.cle, valeur: s.valeur)];
+  }
+
+  @override
+  Future<String?> getSetting({required String cle}) =>
+      frb.getSetting(cle: cle);
+
+  @override
+  Future<void> setSetting({required String cle, required String valeur}) async {
+    try {
+      await frb.setSetting(cle: cle, valeur: valeur);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> recordSession({required int id, required String alias}) =>
+      frb.recordSession(id: BigInt.from(id), alias: alias);
+
+  @override
+  Future<List<RecentSessionDto>> recentSessions() async {
+    final sessions = await frb.recentSessions();
+    return [
+      for (final s in sessions)
+        RecentSessionDto(
+          id: s.id.toInt(),
+          alias: s.alias,
+          timestamp: s.timestamp.toInt(),
+        ),
+    ];
+  }
+
+  @override
+  Future<List<RecordingDto>> listRecordings({String? dir}) async {
+    final recordings = await frb.listRecordings(dir: dir);
+    return [
+      for (final r in recordings)
+        RecordingDto(
+          chemin: r.chemin,
+          nom: r.nom,
+          date: r.date.toInt(),
+          dureeS: r.dureeS,
+          tailleOctets: r.tailleOctets.toInt(),
+        ),
+    ];
+  }
+
+  @override
+  Future<UnattendedConfigDto> unattendedConfig() async {
+    final c = await frb.unattendedConfig();
+    return UnattendedConfigDto(
+      aMotDePasse: c.aMotDePasse,
+      appareilsDeConfiance: [
+        for (final id in c.appareilsDeConfiance) id.toInt(),
+      ],
+    );
+  }
+
+  @override
+  Future<void> setUnattendedPassword({required String pwd}) async {
+    try {
+      await frb.setUnattendedPassword(pwd: pwd);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<bool> verifyUnattendedPassword({required String pwd}) =>
+      frb.verifyUnattendedPassword(pwd: pwd);
+
+  @override
+  Future<void> addTrustedDevice({required int id}) =>
+      frb.addTrustedDevice(id: BigInt.from(id));
+
+  @override
+  Future<void> removeTrustedDevice({required int id}) async {
+    try {
+      await frb.removeTrustedDevice(id: BigInt.from(id));
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> recordAccess({required int peerId, required bool accepte}) =>
+      frb.recordAccess(peerId: BigInt.from(peerId), accepte: accepte);
+
+  @override
+  Future<List<AccessLogEntryDto>> accessLog() async {
+    final journal = await frb.accessLog();
+    return [
+      for (final e in journal)
+        AccessLogEntryDto(
+          peerId: e.peerId.toInt(),
+          peerIdFormate: e.peerIdFormate,
+          timestamp: e.timestamp.toInt(),
+          accepte: e.accepte,
+        ),
+    ];
+  }
+
+  // ---------------------------------------------------------------------------
   // Conversions internes
   // ---------------------------------------------------------------------------
+
+  /// Aplatit une entrée de carnet générée (id `u64` ⇄ `BigInt`, dernière
+  /// connexion `i64` ⇄ `PlatformInt64`).
+  static AddressBookEntryDto _contactDepuis(frb.AddressBookEntryDto c) =>
+      AddressBookEntryDto(
+        id: c.id.toInt(),
+        alias: c.alias,
+        groupe: c.groupe,
+        etiquettes: c.etiquettes,
+        favori: c.favori,
+        derniereConnexion: c.derniereConnexion?.toInt(),
+      );
 
   /// FRB lève la `String` d'erreur telle quelle pour un `Result<_, String>`.
   static String _message(Object e) {

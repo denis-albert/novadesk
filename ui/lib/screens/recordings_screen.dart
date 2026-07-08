@@ -3,9 +3,10 @@
 /// (`.reclist`) et scène de lecture à droite (`.stage`) — canevas d'aperçu
 /// sombre (`.canvas`) surmontant la barre de contrôles (`.pctrl`).
 ///
-/// La sélection d'un enregistrement met à jour le titre et le détail du canevas
-/// ainsi que la durée totale. La lecture est purement présentationnelle
-/// (remplissage figé à 38 %, pas de lecture réelle) — fidèle à la maquette.
+/// La liste est désormais alimentée par l'état persistant (`list_recordings`) :
+/// nom, date, durée et taille **réels** des fichiers présents. État vide si
+/// aucun enregistrement. La lecture reste présentationnelle (remplissage figé à
+/// 38 %, pas de lecture réelle) — fidèle à la maquette.
 ///
 /// Les surfaces d'aperçu (vignettes `.th`, canevas dégradé) sont volontairement
 /// sombres : comme l'écran de session, elles représentent une surface vidéo et
@@ -14,53 +15,14 @@
 library;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app_routes.dart';
+import '../bridge/native_api.dart';
+import '../state/providers.dart';
 import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_kit.dart';
-
-// ===========================================================================
-// Données (maquette : tableau `REC`)
-// ===========================================================================
-
-/// Un enregistrement de session (une entrée du tableau `REC` de la maquette).
-class _Enregistrement {
-  const _Enregistrement({
-    required this.nom,
-    required this.date,
-    required this.heure,
-    required this.duree,
-  });
-
-  /// Alias du poste enregistré (ex. « poste-bureau »).
-  final String nom;
-
-  /// Date de l'enregistrement (ex. « 8 juil. »).
-  final String date;
-
-  /// Heure de début (ex. « 14:07 »).
-  final String heure;
-
-  /// Durée totale (ex. « 12:34 »).
-  final String duree;
-
-  /// Ligne méta de la liste (maquette `.mt`) : « 8 juil. 14:07 · 12:34 ».
-  String get meta => '$date $heure · $duree';
-
-  /// Détail affiché sous le titre du canevas : « 8 juil. 2026 · 12:34 · H.264 ».
-  String get detailCanevas => '$date 2026 · $duree · H.264';
-}
-
-/// Enregistrements de démonstration — reprise exacte du tableau `REC`.
-const List<_Enregistrement> _enregistrements = [
-  _Enregistrement(
-      nom: 'poste-bureau', date: '8 juil.', heure: '14:07', duree: '12:34'),
-  _Enregistrement(
-      nom: 'serveur-nas', date: '7 juil.', heure: '18:40', duree: '04:02'),
-  _Enregistrement(
-      nom: 'pc-marie', date: '5 juil.', heure: '14:07', duree: '21:15'),
-];
 
 // --- Surfaces d'aperçu sombres (valeurs fixes de la maquette) --------------
 
@@ -81,32 +43,113 @@ const Color _canevasTexte = Color(0xFF8A94B4);
 const Color _canevasTitre = Color(0xFFCDD6F2);
 
 // ===========================================================================
+// Formatage des métadonnées d'enregistrement
+// ===========================================================================
+
+const List<String> _moisCourts = [
+  'janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', //
+  'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'
+];
+
+/// Date courte française d'un horodatage Unix (secondes) : « 8 juil. ».
+String _formaterDateCourte(int unixSecondes) {
+  final d = DateTime.fromMillisecondsSinceEpoch(unixSecondes * 1000);
+  return '${d.day} ${_moisCourts[d.month - 1]}';
+}
+
+/// Heure d'un horodatage Unix (secondes) : « 14:07 ».
+String _formaterHeure(int unixSecondes) {
+  final d = DateTime.fromMillisecondsSinceEpoch(unixSecondes * 1000);
+  return '${d.hour.toString().padLeft(2, '0')}:'
+      '${d.minute.toString().padLeft(2, '0')}';
+}
+
+/// Durée « mm:ss » (ou « h:mm:ss ») depuis un nombre de secondes.
+String _formaterDuree(double secondes) {
+  final total = secondes.round();
+  final h = total ~/ 3600;
+  final m = (total % 3600) ~/ 60;
+  final s = total % 60;
+  final mm = m.toString().padLeft(2, '0');
+  final ss = s.toString().padLeft(2, '0');
+  return h > 0 ? '$h:$mm:$ss' : '$mm:$ss';
+}
+
+/// Taille de fichier lisible (Ko / Mo / Go).
+String _formaterTaille(int octets) {
+  if (octets < 1024) return '$octets o';
+  if (octets < 1024 * 1024) return '${(octets / 1024).toStringAsFixed(0)} Ko';
+  if (octets < 1024 * 1024 * 1024) {
+    return '${(octets / (1024 * 1024)).toStringAsFixed(0)} Mo';
+  }
+  return '${(octets / (1024 * 1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',')} Go';
+}
+
+/// Ligne méta d'une entrée : « 8 juil. 14:07 · 12:34 · 486 Mo ».
+String _meta(RecordingDto r) =>
+    '${_formaterDateCourte(r.date)} ${_formaterHeure(r.date)} · '
+    '${_formaterDuree(r.dureeS)} · ${_formaterTaille(r.tailleOctets)}';
+
+/// Détail sous le titre du canevas : « poste-bureau_1407.mp4 · 12:34 ».
+String _detailCanevas(RecordingDto r) =>
+    '${_formaterDateCourte(r.date)} · ${_formaterDuree(r.dureeS)} · '
+    '${_extension(r.nom)}';
+
+/// Extension en capitales (ex. « MP4 »), ou « ENR » à défaut.
+String _extension(String nom) {
+  final point = nom.lastIndexOf('.');
+  if (point < 0 || point == nom.length - 1) return 'ENR';
+  return nom.substring(point + 1).toUpperCase();
+}
+
+// ===========================================================================
 // Écran
 // ===========================================================================
 
 /// Écran « Lecteur d'enregistrements » (vue `enregistrements` du rail).
-class RecordingsScreen extends StatefulWidget {
+class RecordingsScreen extends ConsumerStatefulWidget {
   const RecordingsScreen({super.key});
 
   /// Route nommée de l'écran.
   static const String route = NovaRoutes.enregistrements;
 
   @override
-  State<RecordingsScreen> createState() => _RecordingsScreenState();
+  ConsumerState<RecordingsScreen> createState() => _RecordingsScreenState();
 }
 
-class _RecordingsScreenState extends State<RecordingsScreen> {
+class _RecordingsScreenState extends ConsumerState<RecordingsScreen> {
   /// Index de l'enregistrement sélectionné (premier par défaut).
   int _indexSelectionne = 0;
 
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
+    final asyncRec = ref.watch(recordingsProvider);
+    final enregistrements = asyncRec.valueOrNull ?? const <RecordingDto>[];
+
+    if (asyncRec.isLoading && enregistrements.isEmpty) {
+      return const Center(
+        child: SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+    if (enregistrements.isEmpty) {
+      return const NovaEmptyState(
+        icone: NovaIcones.enregistrements,
+        titre: 'Aucun enregistrement',
+        sousTitre: 'Les sessions enregistrées apparaîtront ici.',
+      );
+    }
+
+    final index = _indexSelectionne.clamp(0, enregistrements.length - 1);
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _construireListe(t),
-        Expanded(child: _construireScene(t)),
+        _construireListe(t, enregistrements, index),
+        Expanded(child: _construireScene(t, enregistrements[index])),
       ],
     );
   }
@@ -115,7 +158,8 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
   // Liste latérale (maquette `.reclist`)
   // -------------------------------------------------------------------------
 
-  Widget _construireListe(NovaTokens t) {
+  Widget _construireListe(
+      NovaTokens t, List<RecordingDto> enregistrements, int index) {
     return Container(
       width: 228,
       decoration: BoxDecoration(
@@ -123,10 +167,10 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
       ),
       child: ListView.builder(
         padding: const EdgeInsets.all(8),
-        itemCount: _enregistrements.length,
+        itemCount: enregistrements.length,
         itemBuilder: (context, i) => _LigneEnregistrement(
-          enregistrement: _enregistrements[i],
-          selectionne: i == _indexSelectionne,
+          enregistrement: enregistrements[i],
+          selectionne: i == index,
           onTap: () => setState(() => _indexSelectionne = i),
         ),
       ),
@@ -137,8 +181,7 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
   // Scène de lecture (maquette `.stage`)
   // -------------------------------------------------------------------------
 
-  Widget _construireScene(NovaTokens t) {
-    final enr = _enregistrements[_indexSelectionne];
+  Widget _construireScene(NovaTokens t, RecordingDto enr) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -149,7 +192,7 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
   }
 
   /// Canevas d'aperçu sombre (maquette `.canvas`).
-  Widget _construireCanevas(_Enregistrement enr) {
+  Widget _construireCanevas(RecordingDto enr) {
     return Container(
       alignment: Alignment.center,
       decoration: const BoxDecoration(
@@ -181,7 +224,7 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
           ),
           const SizedBox(height: 4),
           Text(
-            enr.detailCanevas,
+            _detailCanevas(enr),
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 11,
@@ -194,7 +237,7 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
   }
 
   /// Barre de contrôles de lecture (maquette `.pctrl`).
-  Widget _construireControles(NovaTokens t, _Enregistrement enr) {
+  Widget _construireControles(NovaTokens t, RecordingDto enr) {
     return Container(
       height: 50,
       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -205,11 +248,11 @@ class _RecordingsScreenState extends State<RecordingsScreen> {
         children: [
           const _BoutonLecture(),
           const SizedBox(width: 12),
-          Text('04:41', style: _styleTemps(t.texte2)),
+          Text(_formaterDuree(enr.dureeS * 0.38), style: _styleTemps(t.texte2)),
           const SizedBox(width: 12),
           Expanded(child: _construireTimeline(t)),
           const SizedBox(width: 12),
-          Text(enr.duree, style: _styleTemps(t.texte3)),
+          Text(_formaterDuree(enr.dureeS), style: _styleTemps(t.texte3)),
           const SizedBox(width: 12),
           NovaBoutonAction(
             icone: NovaIcones.agrandirCadre,
@@ -295,7 +338,7 @@ class _LigneEnregistrement extends StatefulWidget {
     required this.onTap,
   });
 
-  final _Enregistrement enregistrement;
+  final RecordingDto enregistrement;
   final bool selectionne;
   final VoidCallback onTap;
 
@@ -348,6 +391,8 @@ class _LigneEnregistrementState extends State<_LigneEnregistrement> {
                   children: [
                     Text(
                       widget.enregistrement.nom,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 12.5,
                         fontWeight: FontWeight.w500,
@@ -356,7 +401,9 @@ class _LigneEnregistrementState extends State<_LigneEnregistrement> {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      widget.enregistrement.meta,
+                      _meta(widget.enregistrement),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 11,
                         color: t.texte3,

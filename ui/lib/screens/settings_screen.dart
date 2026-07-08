@@ -11,6 +11,8 @@
 /// la persistance appartiendra au cœur Rust via la façade `nd-ffi`.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -35,14 +37,20 @@ class _Onglet {
 }
 
 /// Une ligne de réglage (`.set`) : titre, sous-titre optionnel, type de contrôle
-/// (`on`/`off`/`seg`/`sel`/`field`/`fp`/`btn`/`txt`) et valeur pré-remplie.
+/// (`on`/`off`/`seg`/`sel`/`field`/`fp`/`btn`/`txt`), valeur pré-remplie et,
+/// pour les lignes **câblées à l'état persistant**, la clé de réglage
+/// [cleReglage] lue/écrite via `get_setting`/`set_setting`.
 class _Ligne {
-  const _Ligne(this.titre, this.sousTitre, this.type, {this.preset = ''});
+  const _Ligne(this.titre, this.sousTitre, this.type,
+      {this.preset = '', this.cleReglage});
 
   final String titre;
   final String? sousTitre;
   final String type;
   final String preset;
+
+  /// Clé de réglage persistée (`null` = ligne de présentation locale).
+  final String? cleReglage;
 }
 
 // ===========================================================================
@@ -63,8 +71,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   static const List<_Onglet> _onglets = [
     _Onglet('Interface', NovaIcones.accueil, 'Apparence et comportement.', [
       _Ligne('Thème', null, 'seg'),
-      _Ligne('Langue', null, 'sel'),
-      _Ligne('Démarrer avec le système', null, 'on'),
+      _Ligne('Langue', null, 'sel', cleReglage: 'langue'),
+      _Ligne('Démarrer avec le système', null, 'on',
+          cleReglage: 'demarrer_avec_systeme'),
       _Ligne('Réduire dans la zone de notification', null, 'on'),
       _Ligne('Densité compacte', null, 'off'),
     ]),
@@ -77,13 +86,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       _Ligne('Empreinte de ce poste', null, 'fp'),
     ]),
     _Onglet('Connexion', NovaIcones.reseau, 'Serveurs de mise en relation.', [
-      _Ligne('Serveur de rendez-vous', null, 'field'),
-      _Ligne('Serveur de relais', null, 'field'),
-      _Ligne('Serveurs STUN', null, 'field'),
+      _Ligne('Serveur de rendez-vous', null, 'field',
+          cleReglage: 'serveur_rendezvous'),
+      _Ligne('Serveur de relais', null, 'field', cleReglage: 'serveur_relais'),
+      _Ligne('Serveurs STUN', null, 'field', cleReglage: 'serveurs_stun'),
       _Ligne('Proxy', null, 'sel'),
     ]),
     _Onglet('Affichage', NovaIcones.affichage, 'Qualité par défaut.', [
-      _Ligne('Mode par défaut', null, 'sel'),
+      _Ligne('Mode par défaut', null, 'sel', cleReglage: 'prereglage_qualite'),
       _Ligne('Images/s cible', null, 'sel'),
       _Ligne('Débit maximum', null, 'field'),
       _Ligne('Accélération NVENC', null, 'on'),
@@ -111,7 +121,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     _Onglet('Enregistrement', NovaIcones.enregistrements,
         'Enregistrement des sessions.', [
       _Ligne('Enregistrer automatiquement', null, 'off'),
-      _Ligne('Dossier', null, 'field'),
+      _Ligne('Dossier', null, 'field', cleReglage: 'dossier_enregistrement'),
       _Ligne('Format', null, 'sel'),
     ]),
     _Onglet('Wake-on-LAN', NovaIcones.alimentation, 'Réveil des appareils.', [
@@ -136,6 +146,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     ]),
   ];
 
+  /// Options des sélecteurs câblés à un réglage : (valeur persistée, libellé).
+  static const Map<String, List<(String, String)>> _optionsSel = {
+    'langue': [('fr', 'Français'), ('en', 'English')],
+    'prereglage_qualite': [
+      ('qualite', 'Meilleure qualité'),
+      ('equilibre', 'Équilibré'),
+      ('performance', 'Meilleures performances'),
+    ],
+  };
+
   /// Onglet sélectionné (défaut : Interface).
   int _ongletActif = 0;
 
@@ -143,6 +163,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final Map<String, bool> _interrupteurs = {};
   final Map<String, String> _selections = {};
   final Map<String, TextEditingController> _champs = {};
+
+  /// Réglages persistés chargés depuis `get_settings` (source des contrôles
+  /// câblés). Rempli une fois au démarrage de l'écran.
+  final Map<String, String> _reglages = {};
 
   @override
   void initState() {
@@ -162,6 +186,47 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         }
       }
     }
+    unawaited(_chargerReglages());
+  }
+
+  /// Charge les réglages persistés et hydrate les contrôles câblés.
+  Future<void> _chargerReglages() async {
+    try {
+      final settings = await ref.read(nativeApiProvider).getSettings();
+      final map = {for (final s in settings) s.cle: s.valeur};
+      if (!mounted) return;
+      setState(() {
+        _reglages
+          ..clear()
+          ..addAll(map);
+        for (final onglet in _onglets) {
+          for (final ligne in onglet.lignes) {
+            final cleReglage = ligne.cleReglage;
+            if (cleReglage == null) continue;
+            final valeur = map[cleReglage];
+            if (valeur == null) continue;
+            final cleLocale = _cle(onglet, ligne);
+            switch (ligne.type) {
+              case 'field':
+                _champs[cleLocale]?.text = valeur;
+              case 'on':
+              case 'off':
+                _interrupteurs[cleLocale] = valeur == 'true';
+            }
+          }
+        }
+      });
+    } catch (_) {
+      // Réglages indisponibles : on conserve les valeurs par défaut locales.
+    }
+  }
+
+  /// Persiste un réglage (`set_setting`) et invalide la vue des réglages afin
+  /// que les providers dérivés (rendez-vous, STUN, relais) se rafraîchissent.
+  void _definirReglage(String cle, String valeur) {
+    setState(() => _reglages[cle] = valeur);
+    unawaited(ref.read(nativeApiProvider).setSetting(cle: cle, valeur: valeur));
+    ref.invalidate(settingsProvider);
   }
 
   @override
@@ -299,19 +364,25 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
   Widget _construireControle(NovaTokens t, _Onglet onglet, _Ligne ligne) {
     final cle = _cle(onglet, ligne);
+    final cleReglage = ligne.cleReglage;
     switch (ligne.type) {
-      // Interrupteurs (`.sw`) — état local.
+      // Interrupteurs (`.sw`) — persistés si câblés (ex. démarrer-avec-système).
       case 'on':
       case 'off':
         final actif = _interrupteurs[cle] ?? (ligne.type == 'on');
         return NovaSwitch(
           actif: actif,
           label: ligne.titre,
-          onChanged: (v) => setState(() => _interrupteurs[cle] = v),
+          onChanged: (v) {
+            setState(() => _interrupteurs[cle] = v);
+            if (cleReglage != null) {
+              _definirReglage(cleReglage, v ? 'true' : 'false');
+            }
+          },
         );
 
-      // Segmenté (`.segb`) — seul l'onglet Interface l'utilise (le Thème),
-      // câblé au thème réel de l'application via Riverpod.
+      // Segmenté (`.segb`) — le Thème : relié à [themeModeProvider] (effet
+      // immédiat) ET persisté via `set_setting("theme", …)`.
       case 'seg':
         final mode = ref.watch(themeModeProvider);
         return NovaSegmented<ThemeMode>(
@@ -321,12 +392,33 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             (ThemeMode.system, 'Système'),
           ],
           selection: mode,
-          onChanged: (v) =>
-              ref.read(themeModeProvider.notifier).state = v,
+          onChanged: (v) {
+            ref.read(themeModeProvider.notifier).state = v;
+            _definirReglage('theme', reglageDepuisTheme(v));
+          },
         );
 
-      // Sélecteur compact (`.selc`) — état local.
+      // Sélecteur compact (`.selc`) — persisté si câblé (langue, qualité).
       case 'sel':
+        if (cleReglage != null && _optionsSel.containsKey(cleReglage)) {
+          final options = _optionsSel[cleReglage]!;
+          final valeurBrute = _reglages[cleReglage] ?? options.first.$1;
+          final labelCourant = options
+              .firstWhere((o) => o.$1 == valeurBrute,
+                  orElse: () => options.first)
+              .$2;
+          return _Selecteur(
+            valeur: labelCourant,
+            options: [for (final o in options) o.$2],
+            onChanged: (label) {
+              final brute = options
+                  .firstWhere((o) => o.$2 == label,
+                      orElse: () => options.first)
+                  .$1;
+              _definirReglage(cleReglage, brute);
+            },
+          );
+        }
         final valeur = _selections[cle] ?? 'Automatique';
         return _Selecteur(
           valeur: valeur,
@@ -334,11 +426,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           onChanged: (v) => setState(() => _selections[cle] = v),
         );
 
-      // Champ de saisie (`.field`) — contrôleur dédié amorcé en initState.
+      // Champ de saisie (`.field`) — persisté si câblé (serveurs, dossiers).
       case 'field':
-        return _champ(t, _champs[cle]!);
+        return _champ(
+          t,
+          _champs[cle]!,
+          onChanged:
+              cleReglage == null ? null : (v) => _definirReglage(cleReglage, v),
+        );
 
-      // Empreinte monospace (`.fp`).
+      // Empreinte monospace (`.fp`) — issue de local_identity.
       case 'fp':
         return _empreinte(t);
 
@@ -368,13 +465,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
   }
 
-  /// Champ de saisie 210×32 (`.field`) — habillage hérité du thème.
-  Widget _champ(NovaTokens t, TextEditingController controleur) {
+  /// Champ de saisie 210×32 (`.field`) — habillage hérité du thème. Pour les
+  /// champs câblés, [onChanged] persiste la valeur via `set_setting`.
+  Widget _champ(NovaTokens t, TextEditingController controleur,
+      {ValueChanged<String>? onChanged}) {
     return SizedBox(
       width: 210,
       height: 32,
       child: TextField(
         controller: controleur,
+        onChanged: onChanged,
         textAlignVertical: TextAlignVertical.center,
         cursorColor: kNovaRouge,
         style: TextStyle(fontSize: 12.5, color: t.texte),
@@ -386,18 +486,33 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  /// Empreinte monospace (`.fp`) — police Cascadia Code / Consolas.
+  /// Empreinte monospace (`.fp`) — police Cascadia Code / Consolas, issue de
+  /// `local_identity` (8 premières paires hexadécimales).
   Widget _empreinte(NovaTokens t) {
-    return Text(
-      '3F·A9·7C·22·E1·08',
-      style: TextStyle(
-        fontFamily: 'Cascadia Code',
-        fontFamilyFallback: const ['Consolas', 'monospace'],
-        fontSize: 12,
-        letterSpacing: 1,
-        color: t.texte2,
-      ),
+    final identite = ref.watch(localIdentityProvider);
+    final style = TextStyle(
+      fontFamily: 'Cascadia Code',
+      fontFamilyFallback: const ['Consolas', 'monospace'],
+      fontSize: 12,
+      letterSpacing: 1,
+      color: t.texte2,
     );
+    return identite.when(
+      data: (i) => Text(_empreinteFormatee(i.empreinte), style: style),
+      loading: () => const NovaSkeleton(largeur: 150, hauteur: 12),
+      error: (e, _) => Text('—', style: style),
+    );
+  }
+
+  /// Formate une empreinte hexadécimale en paires « AB·CD·… » (8 paires max).
+  static String _empreinteFormatee(String empreinte) {
+    final hex = empreinte.toUpperCase();
+    final n = hex.length < 16 ? hex.length : 16;
+    final paires = <String>[];
+    for (var i = 0; i + 2 <= n; i += 2) {
+      paires.add(hex.substring(i, i + 2));
+    }
+    return paires.join('·');
   }
 }
 

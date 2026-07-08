@@ -603,6 +603,365 @@ class MockNativeApi implements NativeApi {
     _hotesActifs.remove(hostId);
   }
 
+  // -------------------------------------------------------------------------
+  // État persistant — persistance EN MÉMOIRE (lot « état persistant »).
+  //
+  // Reproduit fidèlement le comportement observable de `nd-ffi` : le carnet est
+  // modifiable, les réglages get/set, l'historique s'enrichit à chaque
+  // `recordSession`, l'accès non surveillé mémorise mot de passe / appareils /
+  // journal. Tout persiste tant que l'instance vit : le parcours reste
+  // entièrement démontrable sans le cœur natif.
+  // -------------------------------------------------------------------------
+
+  /// Empreinte locale stable (64 caractères hexadécimaux, façon BLAKE2s).
+  static const String _empreinteLocale =
+      '3fa97c22e108b4d95f6a1c07e2438d5b9a0f47c1e6d820b53a9f7c14e0d6b28f';
+
+  /// Identité locale persistante : créée une fois, rechargée à l'identique.
+  final LocalIdentityDto _identite = LocalIdentityDto(
+    id: 936271048,
+    idFormate: _formater(936271048),
+    empreinte: _empreinteLocale,
+  );
+
+  /// Horodatage Unix (secondes) il y a [jours]/[heures]/[minutes].
+  static int _ilYa({int jours = 0, int heures = 0, int minutes = 0}) =>
+      DateTime.now()
+          .subtract(Duration(days: jours, hours: heures, minutes: minutes))
+          .millisecondsSinceEpoch ~/
+      1000;
+
+  /// Carnet d'adresses en mémoire (calqué sur la maquette `novadesk-app.html`).
+  late final List<AddressBookEntryDto> _contacts = [
+    AddressBookEntryDto(
+      id: 421887330,
+      alias: 'poste-bureau',
+      groupe: 'Travail',
+      etiquettes: const ['bureau', 'windows'],
+      favori: true,
+      derniereConnexion: _ilYa(heures: 2),
+    ),
+    AddressBookEntryDto(
+      id: 730118902,
+      alias: 'serveur-nas',
+      groupe: 'Serveurs',
+      etiquettes: const ['nas', 'linux'],
+      favori: false,
+      derniereConnexion: _ilYa(jours: 1),
+    ),
+    AddressBookEntryDto(
+      id: 555240173,
+      alias: 'pc-marie',
+      groupe: 'Travail',
+      etiquettes: const ['support'],
+      favori: false,
+      derniereConnexion: _ilYa(jours: 3),
+    ),
+    AddressBookEntryDto(
+      id: 190774025,
+      alias: 'mobile-atelier',
+      groupe: 'Perso',
+      etiquettes: const ['android'],
+      favori: false,
+      derniereConnexion: _ilYa(jours: 5),
+    ),
+    AddressBookEntryDto(
+      id: 308552641,
+      alias: 'vm-build-01',
+      groupe: 'Serveurs',
+      etiquettes: const ['ci'],
+      favori: false,
+      derniereConnexion: _ilYa(jours: 10),
+    ),
+  ];
+
+  /// Groupes déclarés (ordre d'apparition).
+  final List<String> _groupes = ['Travail', 'Serveurs', 'Perso'];
+
+  /// Réglages effectifs (défauts raisonnables ; surchargés par [setSetting]).
+  final Map<String, String> _reglages = {
+    'theme': 'systeme',
+    'langue': 'fr',
+    'serveur_rendezvous': '127.0.0.1:9000',
+    'serveur_relais': '',
+    'serveurs_stun': '',
+    'prereglage_qualite': 'equilibre',
+    'dossier_enregistrement': r'C:\Users\Public\Videos\NovaDesk',
+    'demarrer_avec_systeme': 'false',
+  };
+
+  /// Historique des sessions récentes (le plus récent en tête, borné).
+  late final List<RecentSessionDto> _sessionsRecentes = [
+    RecentSessionDto(
+        id: 421887330, alias: 'poste-bureau', timestamp: _ilYa(heures: 2)),
+    RecentSessionDto(
+        id: 730118902, alias: 'serveur-nas', timestamp: _ilYa(jours: 1)),
+    RecentSessionDto(
+        id: 555240173, alias: 'pc-marie', timestamp: _ilYa(jours: 3)),
+    RecentSessionDto(
+        id: 190774025, alias: 'mobile-atelier', timestamp: _ilYa(jours: 5)),
+  ];
+
+  /// Enregistrements de démonstration (métadonnées seules).
+  late final List<RecordingDto> _enregistrements = [
+    RecordingDto(
+      chemin: r'C:\Users\Public\Videos\NovaDesk\poste-bureau_1407.mp4',
+      nom: 'poste-bureau_1407.mp4',
+      date: _ilYa(heures: 2),
+      dureeS: 754,
+      tailleOctets: 486 * 1024 * 1024,
+    ),
+    RecordingDto(
+      chemin: r'C:\Users\Public\Videos\NovaDesk\serveur-nas_1840.mp4',
+      nom: 'serveur-nas_1840.mp4',
+      date: _ilYa(jours: 1),
+      dureeS: 242,
+      tailleOctets: 158 * 1024 * 1024,
+    ),
+    RecordingDto(
+      chemin: r'C:\Users\Public\Videos\NovaDesk\pc-marie_1407.ndr',
+      nom: 'pc-marie_1407.ndr',
+      date: _ilYa(jours: 3),
+      dureeS: 1275,
+      tailleOctets: 921 * 1024 * 1024,
+    ),
+  ];
+
+  /// Mot de passe permanent d'accès non surveillé (mock : conservé en clair
+  /// pour la vérification ; le cœur réel ne stocke qu'un hachage salé).
+  String? _motDePasseNonSurveille;
+
+  /// Appareils de confiance (`NovaId`).
+  final Set<int> _appareilsConfiance = {421887330, 555240173};
+
+  /// Journal des accès non surveillés (le plus récent en tête).
+  late final List<AccessLogEntryDto> _journalAcces = [
+    AccessLogEntryDto(
+        peerId: 421887330,
+        peerIdFormate: _formater(421887330),
+        timestamp: _ilYa(heures: 2),
+        accepte: true),
+    AccessLogEntryDto(
+        peerId: 555240173,
+        peerIdFormate: _formater(555240173),
+        timestamp: _ilYa(jours: 1, heures: 5),
+        accepte: false),
+    AccessLogEntryDto(
+        peerId: 421887330,
+        peerIdFormate: _formater(421887330),
+        timestamp: _ilYa(jours: 4),
+        accepte: true),
+  ];
+
+  @override
+  Future<LocalIdentityDto> localIdentity() async => _identite;
+
+  @override
+  Future<String> generateEphemeralPassword() async {
+    // 10 caractères lisibles (alphabet sans symboles ambigus), non persisté.
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+    return List.generate(
+        10, (_) => alphabet[_alea.nextInt(alphabet.length)]).join();
+  }
+
+  @override
+  Future<List<AddressBookEntryDto>> listContacts() async =>
+      List.unmodifiable(_contacts);
+
+  @override
+  Future<AddressBookEntryDto> addContact({
+    required String alias,
+    required int id,
+    required String groupe,
+    required List<String> etiquettes,
+  }) async {
+    if (_contacts.any((c) => c.id == id)) {
+      throw NovaApiException(
+          'un contact possède déjà l\'ID ${_formater(id)}');
+    }
+    final entree = AddressBookEntryDto(
+      id: id,
+      alias: alias,
+      groupe: groupe,
+      etiquettes: List.of(etiquettes),
+      favori: false,
+    );
+    _contacts.add(entree);
+    if (groupe.isNotEmpty && !_groupes.contains(groupe)) {
+      _groupes.add(groupe);
+    }
+    return entree;
+  }
+
+  @override
+  Future<void> updateContact({
+    required int id,
+    required String alias,
+    required String groupe,
+    required List<String> etiquettes,
+  }) async {
+    final i = _contacts.indexWhere((c) => c.id == id);
+    if (i < 0) {
+      throw NovaApiException('contact inconnu : ${_formater(id)}');
+    }
+    final ancien = _contacts[i];
+    _contacts[i] = AddressBookEntryDto(
+      id: id,
+      alias: alias,
+      groupe: groupe,
+      etiquettes: List.of(etiquettes),
+      favori: ancien.favori,
+      derniereConnexion: ancien.derniereConnexion,
+    );
+    if (groupe.isNotEmpty && !_groupes.contains(groupe)) {
+      _groupes.add(groupe);
+    }
+  }
+
+  @override
+  Future<void> removeContact({required int id}) async {
+    final i = _contacts.indexWhere((c) => c.id == id);
+    if (i < 0) {
+      throw NovaApiException('contact inconnu : ${_formater(id)}');
+    }
+    _contacts.removeAt(i);
+  }
+
+  @override
+  Future<void> setFavorite({required int id, required bool favori}) async {
+    final i = _contacts.indexWhere((c) => c.id == id);
+    if (i < 0) {
+      throw NovaApiException('contact inconnu : ${_formater(id)}');
+    }
+    final ancien = _contacts[i];
+    _contacts[i] = AddressBookEntryDto(
+      id: ancien.id,
+      alias: ancien.alias,
+      groupe: ancien.groupe,
+      etiquettes: ancien.etiquettes,
+      favori: favori,
+      derniereConnexion: ancien.derniereConnexion,
+    );
+  }
+
+  @override
+  Future<List<String>> listGroups() async => List.unmodifiable(_groupes);
+
+  @override
+  Future<void> addGroup({required String nom}) async {
+    if (nom.isEmpty) {
+      throw const NovaApiException('le nom du groupe est vide');
+    }
+    if (_groupes.contains(nom)) {
+      throw NovaApiException('le groupe « $nom » existe déjà');
+    }
+    _groupes.add(nom);
+  }
+
+  @override
+  Future<List<SettingDto>> getSettings() async {
+    final cles = _reglages.keys.toList()..sort();
+    return [for (final c in cles) SettingDto(cle: c, valeur: _reglages[c]!)];
+  }
+
+  @override
+  Future<String?> getSetting({required String cle}) async => _reglages[cle];
+
+  @override
+  Future<void> setSetting({required String cle, required String valeur}) async {
+    if (cle.isEmpty) {
+      throw const NovaApiException('la clé de réglage est vide');
+    }
+    _reglages[cle] = valeur;
+  }
+
+  @override
+  Future<void> recordSession({required int id, required String alias}) async {
+    final maintenant = _ilYa();
+    // Dédupliqué par id, remis en tête, borné à 20 entrées.
+    _sessionsRecentes.removeWhere((s) => s.id == id);
+    _sessionsRecentes.insert(
+        0, RecentSessionDto(id: id, alias: alias, timestamp: maintenant));
+    if (_sessionsRecentes.length > 20) {
+      _sessionsRecentes.removeRange(20, _sessionsRecentes.length);
+    }
+    // Rafraîchit la dernière connexion du contact correspondant.
+    final i = _contacts.indexWhere((c) => c.id == id);
+    if (i >= 0) {
+      final c = _contacts[i];
+      _contacts[i] = AddressBookEntryDto(
+        id: c.id,
+        alias: c.alias,
+        groupe: c.groupe,
+        etiquettes: c.etiquettes,
+        favori: c.favori,
+        derniereConnexion: maintenant,
+      );
+    }
+  }
+
+  @override
+  Future<List<RecentSessionDto>> recentSessions() async =>
+      List.unmodifiable(_sessionsRecentes);
+
+  @override
+  Future<List<RecordingDto>> listRecordings({String? dir}) async {
+    // Le mock ignore [dir] (aucun disque) : renvoie la liste triée récent→ancien.
+    final copie = List.of(_enregistrements)
+      ..sort((a, b) => b.date.compareTo(a.date));
+    return copie;
+  }
+
+  @override
+  Future<UnattendedConfigDto> unattendedConfig() async => UnattendedConfigDto(
+        aMotDePasse:
+            _motDePasseNonSurveille != null && _motDePasseNonSurveille!.isNotEmpty,
+        appareilsDeConfiance: _appareilsConfiance.toList()..sort(),
+      );
+
+  @override
+  Future<void> setUnattendedPassword({required String pwd}) async {
+    // Un mot de passe vide efface la configuration.
+    _motDePasseNonSurveille = pwd.isEmpty ? null : pwd;
+  }
+
+  @override
+  Future<bool> verifyUnattendedPassword({required String pwd}) async {
+    final ref = _motDePasseNonSurveille;
+    return ref != null && ref.isNotEmpty && ref == pwd;
+  }
+
+  @override
+  Future<void> addTrustedDevice({required int id}) async {
+    _appareilsConfiance.add(id);
+  }
+
+  @override
+  Future<void> removeTrustedDevice({required int id}) async {
+    if (!_appareilsConfiance.remove(id)) {
+      throw NovaApiException(
+          'appareil non présent dans la liste de confiance : ${_formater(id)}');
+    }
+  }
+
+  @override
+  Future<void> recordAccess(
+      {required int peerId, required bool accepte}) async {
+    _journalAcces.insert(
+      0,
+      AccessLogEntryDto(
+        peerId: peerId,
+        peerIdFormate: _formater(peerId),
+        timestamp: _ilYa(),
+        accepte: accepte,
+      ),
+    );
+  }
+
+  @override
+  Future<List<AccessLogEntryDto>> accessLog() async =>
+      List.unmodifiable(_journalAcces);
+
   // Barres facon mire télé : blanc, jaune, cyan, vert, magenta, rouge, bleu, noir.
   static const List<List<int>> _barresMire = [
     [236, 239, 244],

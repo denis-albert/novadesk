@@ -18,6 +18,8 @@ library;
 
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show listEquals;
+
 // ---------------------------------------------------------------------------
 // Erreurs
 // ---------------------------------------------------------------------------
@@ -698,6 +700,265 @@ class TransferEventDto {
 }
 
 // ---------------------------------------------------------------------------
+// État persistant : identité locale, carnet, réglages, historique,
+// enregistrements, accès non surveillé (lot « état persistant »).
+//
+// Miroirs des DTO de `nd-ffi`. Les identifiants et horodatages sont des `int`
+// Dart : l'adaptateur FRB convertit les `u64` (exposés en `BigInt`) et les
+// `i64` (exposés en `PlatformInt64`) du pont.
+// ---------------------------------------------------------------------------
+
+/// Identité locale de l'appareil, prête à afficher — écran d'accueil « votre
+/// ID » (miroir de `nd_ffi::LocalIdentityDto`).
+class LocalIdentityDto {
+  const LocalIdentityDto({
+    required this.id,
+    required this.idFormate,
+    required this.empreinte,
+  });
+
+  /// `NovaId` brut à 9 chiffres, stable et persistant.
+  final int id;
+
+  /// ID au format groupé (« 123 456 789 »), prêt à afficher.
+  final String idFormate;
+
+  /// Empreinte hexadécimale (BLAKE2s, 64 caractères) de la clé publique
+  /// statique — sert à la vérification d'identité (TOFU).
+  final String empreinte;
+
+  @override
+  bool operator ==(Object other) =>
+      other is LocalIdentityDto &&
+      other.id == id &&
+      other.idFormate == idFormate &&
+      other.empreinte == empreinte;
+
+  @override
+  int get hashCode => Object.hash(id, idFormate, empreinte);
+
+  @override
+  String toString() =>
+      'LocalIdentityDto(id: $id, idFormate: $idFormate, empreinte: $empreinte)';
+}
+
+/// Entrée du carnet d'adresses / contact enregistré (miroir de
+/// `nd_ffi::AddressBookEntryDto`).
+class AddressBookEntryDto {
+  const AddressBookEntryDto({
+    required this.id,
+    required this.alias,
+    required this.groupe,
+    required this.etiquettes,
+    required this.favori,
+    this.derniereConnexion,
+  });
+
+  /// `NovaId` du contact.
+  final int id;
+
+  /// Nom lisible donné au contact.
+  final String alias;
+
+  /// Groupe de rangement (chaîne vide = non groupé).
+  final String groupe;
+
+  /// Étiquettes libres associées au contact.
+  final List<String> etiquettes;
+
+  /// Contact marqué comme favori.
+  final bool favori;
+
+  /// Horodatage Unix (secondes) de la dernière connexion, si connue.
+  final int? derniereConnexion;
+
+  @override
+  bool operator ==(Object other) =>
+      other is AddressBookEntryDto &&
+      other.id == id &&
+      other.alias == alias &&
+      other.groupe == groupe &&
+      listEquals(other.etiquettes, etiquettes) &&
+      other.favori == favori &&
+      other.derniereConnexion == derniereConnexion;
+
+  @override
+  int get hashCode => Object.hash(id, alias, groupe,
+      Object.hashAll(etiquettes), favori, derniereConnexion);
+
+  @override
+  String toString() => 'AddressBookEntryDto(id: $id, alias: $alias, '
+      'groupe: $groupe, favori: $favori)';
+}
+
+/// Réglage clé/valeur (les deux en texte : l'UI interprète selon la clé).
+/// Miroir de `nd_ffi::SettingDto`.
+class SettingDto {
+  const SettingDto({required this.cle, required this.valeur});
+
+  /// Clé du réglage (ex. `theme`, `langue`, `dossier_enregistrement`,
+  /// `serveur_rendezvous`, `serveur_relais`, `serveurs_stun`,
+  /// `prereglage_qualite`, `demarrer_avec_systeme`).
+  final String cle;
+
+  /// Valeur textuelle courante (surcharge persistée ou défaut).
+  final String valeur;
+
+  @override
+  bool operator ==(Object other) =>
+      other is SettingDto && other.cle == cle && other.valeur == valeur;
+
+  @override
+  int get hashCode => Object.hash(cle, valeur);
+
+  @override
+  String toString() => 'SettingDto(cle: $cle, valeur: $valeur)';
+}
+
+/// Une session récente (historique borné, le plus récent en tête). Miroir de
+/// `nd_ffi::RecentSessionDto`.
+class RecentSessionDto {
+  const RecentSessionDto({
+    required this.id,
+    required this.alias,
+    required this.timestamp,
+  });
+
+  /// `NovaId` du pair joint.
+  final int id;
+
+  /// Alias affiché au moment de la session.
+  final String alias;
+
+  /// Horodatage Unix (secondes) du démarrage de la session.
+  final int timestamp;
+
+  @override
+  bool operator ==(Object other) =>
+      other is RecentSessionDto &&
+      other.id == id &&
+      other.alias == alias &&
+      other.timestamp == timestamp;
+
+  @override
+  int get hashCode => Object.hash(id, alias, timestamp);
+
+  @override
+  String toString() =>
+      'RecentSessionDto(id: $id, alias: $alias, timestamp: $timestamp)';
+}
+
+/// Description d'un fichier d'enregistrement présent sur le disque (miroir de
+/// `nd_ffi::RecordingDto`).
+class RecordingDto {
+  const RecordingDto({
+    required this.chemin,
+    required this.nom,
+    required this.date,
+    required this.dureeS,
+    required this.tailleOctets,
+  });
+
+  /// Chemin absolu du fichier.
+  final String chemin;
+
+  /// Nom de fichier seul.
+  final String nom;
+
+  /// Date de modification (horodatage Unix, secondes).
+  final int date;
+
+  /// Durée en secondes (`0.0` si inconnue).
+  final double dureeS;
+
+  /// Taille du fichier en octets.
+  final int tailleOctets;
+
+  @override
+  bool operator ==(Object other) =>
+      other is RecordingDto &&
+      other.chemin == chemin &&
+      other.nom == nom &&
+      other.date == date &&
+      other.dureeS == dureeS &&
+      other.tailleOctets == tailleOctets;
+
+  @override
+  int get hashCode => Object.hash(chemin, nom, date, dureeS, tailleOctets);
+
+  @override
+  String toString() =>
+      'RecordingDto(nom: $nom, dureeS: $dureeS, tailleOctets: $tailleOctets)';
+}
+
+/// Configuration d'accès non surveillé, sans jamais exposer le secret (miroir
+/// de `nd_ffi::UnattendedConfigDto`).
+class UnattendedConfigDto {
+  const UnattendedConfigDto({
+    required this.aMotDePasse,
+    required this.appareilsDeConfiance,
+  });
+
+  /// Un mot de passe permanent est configuré (seul un hachage salé est stocké).
+  final bool aMotDePasse;
+
+  /// `NovaId` des appareils de confiance.
+  final List<int> appareilsDeConfiance;
+
+  @override
+  bool operator ==(Object other) =>
+      other is UnattendedConfigDto &&
+      other.aMotDePasse == aMotDePasse &&
+      listEquals(other.appareilsDeConfiance, appareilsDeConfiance);
+
+  @override
+  int get hashCode =>
+      Object.hash(aMotDePasse, Object.hashAll(appareilsDeConfiance));
+
+  @override
+  String toString() => 'UnattendedConfigDto(aMotDePasse: $aMotDePasse, '
+      'appareilsDeConfiance: $appareilsDeConfiance)';
+}
+
+/// Une entrée du journal des accès non surveillés (miroir de
+/// `nd_ffi::AccessLogEntryDto`).
+class AccessLogEntryDto {
+  const AccessLogEntryDto({
+    required this.peerId,
+    required this.peerIdFormate,
+    required this.timestamp,
+    required this.accepte,
+  });
+
+  /// `NovaId` brut de l'appelant.
+  final int peerId;
+
+  /// ID de l'appelant au format groupé, prêt à afficher.
+  final String peerIdFormate;
+
+  /// Horodatage Unix (secondes) de l'accès.
+  final int timestamp;
+
+  /// Vrai si l'accès a été accepté, faux s'il a été refusé.
+  final bool accepte;
+
+  @override
+  bool operator ==(Object other) =>
+      other is AccessLogEntryDto &&
+      other.peerId == peerId &&
+      other.peerIdFormate == peerIdFormate &&
+      other.timestamp == timestamp &&
+      other.accepte == accepte;
+
+  @override
+  int get hashCode => Object.hash(peerId, peerIdFormate, timestamp, accepte);
+
+  @override
+  String toString() => 'AccessLogEntryDto(peerId: $peerId, '
+      'timestamp: $timestamp, accepte: $accepte)';
+}
+
+// ---------------------------------------------------------------------------
 // Interface de la façade
 // ---------------------------------------------------------------------------
 
@@ -894,4 +1155,113 @@ abstract interface class NativeApi {
   /// Arrête l'hôte [hostId] et invalide son identifiant : réveille toute
   /// approbation en attente (refus). Miroir de `nd_ffi::stop_unattended_host`.
   Future<void> stopUnattendedHost(int hostId);
+
+  // -------------------------------------------------------------------------
+  // État persistant (lot « état persistant »)
+  // -------------------------------------------------------------------------
+
+  /// Identité locale, créée et persistée au premier appel puis rechargée à
+  /// l'identique ensuite. Miroir de `nd_ffi::local_identity`.
+  Future<LocalIdentityDto> localIdentity();
+
+  /// Génère un mot de passe éphémère **lisible** (session ponctuelle),
+  /// non persisté. Miroir de `nd_ffi::generate_ephemeral_password`.
+  Future<String> generateEphemeralPassword();
+
+  /// Liste tous les contacts du carnet. Miroir de `nd_ffi::list_contacts`.
+  Future<List<AddressBookEntryDto>> listContacts();
+
+  /// Ajoute un contact et renvoie l'entrée créée ; lève [NovaApiException] si
+  /// l'`id` existe déjà. Un `groupe` non vide est ajouté à la liste des
+  /// groupes. Miroir de `nd_ffi::add_contact`.
+  Future<AddressBookEntryDto> addContact({
+    required String alias,
+    required int id,
+    required String groupe,
+    required List<String> etiquettes,
+  });
+
+  /// Met à jour l'alias, le groupe et les étiquettes d'un contact ; lève
+  /// [NovaApiException] si l'`id` est inconnu. Le favori et la dernière
+  /// connexion ne sont pas touchés. Miroir de `nd_ffi::update_contact`.
+  Future<void> updateContact({
+    required int id,
+    required String alias,
+    required String groupe,
+    required List<String> etiquettes,
+  });
+
+  /// Retire un contact du carnet ; lève [NovaApiException] si l'`id` est
+  /// inconnu. Miroir de `nd_ffi::remove_contact`.
+  Future<void> removeContact({required int id});
+
+  /// Marque (ou démarque) un contact comme favori ; lève [NovaApiException] si
+  /// l'`id` est inconnu. Miroir de `nd_ffi::set_favorite`.
+  Future<void> setFavorite({required int id, required bool favori});
+
+  /// Liste les groupes déclarés du carnet. Miroir de `nd_ffi::list_groups`.
+  Future<List<String>> listGroups();
+
+  /// Ajoute un groupe (éventuellement vide de contacts) ; lève
+  /// [NovaApiException] si le nom est vide ou déjà présent. Miroir de
+  /// `nd_ffi::add_group`.
+  Future<void> addGroup({required String nom});
+
+  /// Renvoie tous les réglages effectifs (défauts fusionnés avec les surcharges
+  /// persistées), triés par clé. Miroir de `nd_ffi::get_settings`.
+  Future<List<SettingDto>> getSettings();
+
+  /// Valeur effective d'un réglage (`null` si la clé est inconnue). Miroir de
+  /// `nd_ffi::get_setting`.
+  Future<String?> getSetting({required String cle});
+
+  /// Définit (persiste) la valeur d'un réglage ; lève [NovaApiException] si la
+  /// clé est vide. Miroir de `nd_ffi::set_setting`.
+  Future<void> setSetting({required String cle, required String valeur});
+
+  /// Journalise le démarrage d'une session (à appeler au moment de se
+  /// connecter) : entrée en tête de l'historique (dédupliquée par `id`, bornée)
+  /// et dernière connexion du contact rafraîchie. Miroir de
+  /// `nd_ffi::record_session`.
+  Future<void> recordSession({required int id, required String alias});
+
+  /// Sessions récentes, de la plus récente à la plus ancienne. Miroir de
+  /// `nd_ffi::recent_sessions`.
+  Future<List<RecentSessionDto>> recentSessions();
+
+  /// Liste les enregistrements (`.mp4`/`.ndr`) d'un dossier — [dir] s'il est
+  /// fourni, sinon le réglage `dossier_enregistrement`, sinon le dossier par
+  /// défaut. Un dossier absent renvoie une liste vide, triée du plus récent au
+  /// plus ancien. Miroir de `nd_ffi::list_recordings`.
+  Future<List<RecordingDto>> listRecordings({String? dir});
+
+  /// Configuration d'accès non surveillé. Miroir de `nd_ffi::unattended_config`.
+  Future<UnattendedConfigDto> unattendedConfig();
+
+  /// Définit le mot de passe permanent d'accès non surveillé (stocké **haché et
+  /// salé**). Un mot de passe vide efface la configuration. Miroir de
+  /// `nd_ffi::set_unattended_password`.
+  Future<void> setUnattendedPassword({required String pwd});
+
+  /// Vérifie un mot de passe candidat contre le hachage stocké (`false` si
+  /// aucun mot de passe n'est configuré). Miroir de
+  /// `nd_ffi::verify_unattended_password`.
+  Future<bool> verifyUnattendedPassword({required String pwd});
+
+  /// Ajoute un appareil à la liste de confiance (sans effet s'il y figure
+  /// déjà). Miroir de `nd_ffi::add_trusted_device`.
+  Future<void> addTrustedDevice({required int id});
+
+  /// Retire un appareil de la liste de confiance ; lève [NovaApiException] s'il
+  /// n'y figure pas. Miroir de `nd_ffi::remove_trusted_device`.
+  Future<void> removeTrustedDevice({required int id});
+
+  /// Ajoute une entrée au journal des accès (append) : à appeler quand une
+  /// demande d'accès non surveillé est tranchée. Miroir de
+  /// `nd_ffi::record_access`.
+  Future<void> recordAccess({required int peerId, required bool accepte});
+
+  /// Renvoie le journal des accès, du plus récent au plus ancien. Miroir de
+  /// `nd_ffi::access_log`.
+  Future<List<AccessLogEntryDto>> accessLog();
 }

@@ -18,9 +18,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app_routes.dart';
+import '../bridge/native_api.dart';
 import '../state/providers.dart';
+import '../theme/motion.dart';
 import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
+import '../widgets/nova_id_field.dart';
 import '../widgets/nova_kit.dart';
 
 /// Clés de groupe réservées (les autres clés sont des noms de groupe libres).
@@ -102,10 +105,16 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
 
   /// Construit la liste des groupes : « Tous », « Favoris », puis un groupe par
   /// valeur distincte de `groupe` (comptes calculés dynamiquement).
-  List<_Groupe> _calculerGroupes(List<EntreeCarnet> entrees, NovaTokens t) {
+  List<_Groupe> _calculerGroupes(
+      List<EntreeCarnet> entrees, List<String> groupesDeclares, NovaTokens t) {
     final favoris = entrees.where((e) => e.favori).length;
     final noms = <String>[];
     final comptes = <String, int>{};
+    // Groupes déclarés (via `list_groups`) d'abord, même vides de contacts.
+    for (final nom in groupesDeclares) {
+      if (!noms.contains(nom)) noms.add(nom);
+      comptes.putIfAbsent(nom, () => 0);
+    }
     for (final e in entrees) {
       comptes[e.groupe] = (comptes[e.groupe] ?? 0) + 1;
       if (!noms.contains(e.groupe)) noms.add(e.groupe);
@@ -155,8 +164,44 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
     NovaToast.montrer(context, 'Transfert de fichiers — ${e.alias}', info: true);
   }
 
-  void _renommer(EntreeCarnet e) {
-    NovaToast.montrer(context, 'Renommer « ${e.alias} » — à venir.', info: true);
+  Future<void> _renommer(EntreeCarnet e) async {
+    final controller = TextEditingController(text: e.alias);
+    final nouveau = await montrerDialogueNova<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Renommer'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Alias'),
+          onSubmitted: (v) => Navigator.of(context).pop(v),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(controller.text),
+              child: const Text('Renommer')),
+        ],
+      ),
+    );
+    controller.dispose();
+    final alias = nouveau?.trim();
+    if (alias == null || alias.isEmpty) return;
+    try {
+      await ref.read(carnetProvider.notifier).modifier(
+            id: e.id,
+            alias: alias,
+            groupe: e.groupe,
+            etiquettes: e.etiquettes,
+          );
+      if (mounted) {
+        NovaToast.montrer(context, '${e.alias} renommé en « $alias »');
+      }
+    } on NovaApiException catch (ex) {
+      if (mounted) NovaToast.montrer(context, ex.message, info: true);
+    }
   }
 
   void _wakeOnLan(EntreeCarnet e) {
@@ -164,28 +209,152 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
         info: true);
   }
 
-  void _basculerFavori(EntreeCarnet e) {
-    final carnet = ref.read(carnetProvider.notifier);
+  Future<void> _basculerFavori(EntreeCarnet e) async {
     final devientFavori = !e.favori;
-    carnet.state = [
-      for (final x in carnet.state)
-        x.id == e.id ? x.copyWith(favori: devientFavori) : x,
-    ];
-    NovaToast.montrer(
-      context,
-      devientFavori
-          ? '${e.alias} ajouté aux favoris'
-          : '${e.alias} retiré des favoris',
-    );
+    try {
+      await ref.read(carnetProvider.notifier).basculerFavori(e.id, devientFavori);
+      if (mounted) {
+        NovaToast.montrer(
+          context,
+          devientFavori
+              ? '${e.alias} ajouté aux favoris'
+              : '${e.alias} retiré des favoris',
+        );
+      }
+    } on NovaApiException catch (ex) {
+      if (mounted) NovaToast.montrer(context, ex.message, info: true);
+    }
   }
 
-  void _supprimer(EntreeCarnet e) {
-    final carnet = ref.read(carnetProvider.notifier);
-    carnet.state = carnet.state.where((x) => x.id != e.id).toList();
-    if (_idSelectionne == e.id) {
-      setState(() => _idSelectionne = null);
+  Future<void> _supprimer(EntreeCarnet e) async {
+    try {
+      await ref.read(carnetProvider.notifier).supprimer(e.id);
+      if (!mounted) return;
+      if (_idSelectionne == e.id) {
+        setState(() => _idSelectionne = null);
+      }
+      NovaToast.montrer(context, '${e.alias} supprimé du carnet');
+    } on NovaApiException catch (ex) {
+      if (mounted) NovaToast.montrer(context, ex.message, info: true);
     }
-    NovaToast.montrer(context, '${e.alias} supprimé du carnet');
+  }
+
+  /// Ajoute un appareil au carnet (`add_contact`) via un dialogue de saisie.
+  Future<void> _ajouterContact() async {
+    final aliasController = TextEditingController();
+    final idController = TextEditingController();
+    final groupeInitial =
+        (_groupeSelectionne != _cleTous && _groupeSelectionne != _cleFavoris)
+            ? _groupeSelectionne
+            : '';
+    final groupeController = TextEditingController(text: groupeInitial);
+    final etiquettesController = TextEditingController();
+
+    final valide = await montrerDialogueNova<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ajouter un appareil'),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: aliasController,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Alias'),
+              ),
+              const SizedBox(height: 10),
+              NovaIdField(controller: idController, libelle: 'ID NovaDesk'),
+              const SizedBox(height: 10),
+              TextField(
+                controller: groupeController,
+                decoration:
+                    const InputDecoration(labelText: 'Groupe (facultatif)'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: etiquettesController,
+                decoration: const InputDecoration(
+                    labelText: 'Étiquettes (séparées par des virgules)'),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Ajouter')),
+        ],
+      ),
+    );
+
+    if (valide == true) {
+      try {
+        final api = ref.read(nativeApiProvider);
+        final id = await api.parseNovaId(texte: idController.text);
+        final alias = aliasController.text.trim().isEmpty
+            ? _formaterIdLocal(id)
+            : aliasController.text.trim();
+        final etiquettes = etiquettesController.text
+            .split(',')
+            .map((s) => s.trim())
+            .where((s) => s.isNotEmpty)
+            .toList();
+        await ref.read(carnetProvider.notifier).ajouter(
+              alias: alias,
+              id: id,
+              groupe: groupeController.text.trim(),
+              etiquettes: etiquettes,
+            );
+        if (mounted) NovaToast.montrer(context, '$alias ajouté au carnet');
+      } on NovaApiException catch (e) {
+        if (mounted) NovaToast.montrer(context, e.message, info: true);
+      }
+    }
+    aliasController.dispose();
+    idController.dispose();
+    groupeController.dispose();
+    etiquettesController.dispose();
+  }
+
+  /// Crée un nouveau groupe (`add_group`) via un dialogue de saisie.
+  Future<void> _nouveauGroupe() async {
+    final controller = TextEditingController();
+    final nom = await montrerDialogueNova<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Nouveau groupe'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Nom du groupe'),
+          onSubmitted: (v) => Navigator.of(context).pop(v),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(controller.text),
+              child: const Text('Créer')),
+        ],
+      ),
+    );
+    controller.dispose();
+    final nomGroupe = nom?.trim();
+    if (nomGroupe == null || nomGroupe.isEmpty) return;
+    try {
+      await ref.read(carnetProvider.notifier).ajouterGroupe(nomGroupe);
+      if (!mounted) return;
+      setState(() => _groupeSelectionne = nomGroupe);
+      NovaToast.montrer(context, 'Groupe « $nomGroupe » créé');
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
   }
 
   /// Ouvre le menu contextuel d'une entrée à la position écran [position]
@@ -215,16 +384,16 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
         _transfertFichiers(e);
         break;
       case 'fav':
-        _basculerFavori(e);
+        unawaited(_basculerFavori(e));
         break;
       case 'ren':
-        _renommer(e);
+        unawaited(_renommer(e));
         break;
       case 'wol':
         _wakeOnLan(e);
         break;
       case 'del':
-        _supprimer(e);
+        unawaited(_supprimer(e));
         break;
     }
   }
@@ -236,18 +405,24 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final entrees = ref.watch(carnetProvider);
-    final groupes = _calculerGroupes(entrees, t);
+    final asyncCarnet = ref.watch(carnetProvider);
+    final entrees = asyncCarnet.valueOrNull ?? const <EntreeCarnet>[];
+    final groupesDeclares =
+        ref.watch(groupesProvider).valueOrNull ?? const <String>[];
+    final groupes = _calculerGroupes(entrees, groupesDeclares, t);
     final filtrees = _filtrer(entrees);
     // Pré-résolution des adresses ici : `ref.watch` doit rester dans `build`
     // (jamais dans un `itemBuilder` paresseux de ListView).
     final lignes = [for (final e in filtrees) (e, _adresse(e))];
+    final chargement =
+        _chargement || (asyncCarnet.isLoading && !asyncCarnet.hasValue);
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _railGroupes(t, groupes),
-        Expanded(child: _panneauPrincipal(t, lignes, filtrees.isEmpty)),
+        Expanded(
+            child: _panneauPrincipal(t, lignes, filtrees.isEmpty, chargement)),
       ],
     );
   }
@@ -286,11 +461,7 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
                     icone: NovaIcones.plus,
                     libelle: 'Nouveau groupe',
                     couleurTexte: t.bleu,
-                    onTap: () => NovaToast.montrer(
-                      context,
-                      'Nouveau groupe — à venir.',
-                      info: true,
-                    ),
+                    onTap: () => unawaited(_nouveauGroupe()),
                   ),
                 ],
               ),
@@ -336,8 +507,8 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
 
   // ---- Panneau principal (droite, maquette `.bookmain`) ---------------------
 
-  Widget _panneauPrincipal(
-      NovaTokens t, List<(EntreeCarnet, String)> lignes, bool vide) {
+  Widget _panneauPrincipal(NovaTokens t, List<(EntreeCarnet, String)> lignes,
+      bool vide, bool chargement) {
     return Column(
       children: [
         // Barre : recherche + bouton primaire « Ajouter » (maquette `.bookbar`).
@@ -353,11 +524,7 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
               NovaBoutonPrimaire(
                 libelle: 'Ajouter',
                 icone: NovaIcones.plus,
-                onPressed: () => NovaToast.montrer(
-                  context,
-                  "Ajout d'un appareil au carnet — à venir.",
-                  info: true,
-                ),
+                onPressed: () => unawaited(_ajouterContact()),
               ),
             ],
           ),
@@ -367,7 +534,7 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
           child: Column(
             children: [
               _entete(t),
-              Expanded(child: _corps(t, lignes, vide)),
+              Expanded(child: _corps(t, lignes, vide, chargement)),
             ],
           ),
         ),
@@ -444,8 +611,9 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
   }
 
   /// Corps du tableau : squelettes (chargement), état vide, ou lignes réelles.
-  Widget _corps(NovaTokens t, List<(EntreeCarnet, String)> lignes, bool vide) {
-    if (_chargement) {
+  Widget _corps(NovaTokens t, List<(EntreeCarnet, String)> lignes, bool vide,
+      bool chargement) {
+    if (chargement) {
       return ListView.builder(
         padding: EdgeInsets.zero,
         itemCount: 6,

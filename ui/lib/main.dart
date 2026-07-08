@@ -72,9 +72,31 @@ Future<void> main() async {
     }
   }
 
+  // Thème persistant : relu depuis les réglages (`theme`) pour appliquer le bon
+  // mode dès le premier frame, sans clignotement.
+  ThemeMode themeInitial = ThemeMode.system;
+  try {
+    themeInitial = themeDepuisReglage(await api.getSetting(cle: 'theme'));
+  } catch (_) {
+    // Réglage indisponible : reste sur « système ».
+  }
+
+  // Identité locale persistante : résolue une fois pour renseigner l'ID local
+  // synchrone (les écrans lisent aussi [localIdentityProvider] de façon réactive).
+  final overrides = <Override>[
+    nativeApiProvider.overrideWithValue(api),
+    themeModeProvider.overrideWith((ref) => themeInitial),
+  ];
+  try {
+    final identite = await api.localIdentity();
+    overrides.add(idLocalProvider.overrideWithValue(identite.id));
+  } catch (_) {
+    // Identité indisponible : le provider dérive de localIdentityProvider.
+  }
+
   runApp(
     ProviderScope(
-      overrides: [nativeApiProvider.overrideWithValue(api)],
+      overrides: overrides,
       child: const NovaDeskApp(),
     ),
   );

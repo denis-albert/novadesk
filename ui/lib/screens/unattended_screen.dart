@@ -24,19 +24,6 @@ import '../widgets/nova_id_field.dart';
 import '../widgets/nova_kit.dart';
 import 'incoming_request_dialog.dart';
 
-/// Appareil autorisé à se connecter sans présence.
-class _AppareilConfiance {
-  _AppareilConfiance({
-    required this.idFormate,
-    required this.alias,
-    required this.mode,
-  });
-
-  final String idFormate;
-  final String alias;
-  String mode;
-}
-
 class UnattendedScreen extends ConsumerStatefulWidget {
   const UnattendedScreen({super.key});
 
@@ -47,10 +34,7 @@ class UnattendedScreen extends ConsumerStatefulWidget {
 }
 
 class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
-  static const List<String> _modes = ['Contrôle', 'Observation'];
-
-  final TextEditingController _motDePasseController =
-      TextEditingController(text: 'permanent-secret');
+  final TextEditingController _motDePasseController = TextEditingController();
   bool _actif = false;
   bool _profilControle = true;
   bool _profilObservation = false;
@@ -67,13 +51,6 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   bool _dialogueEnCours = false;
 
   NativeApi get _api => ref.read(nativeApiProvider);
-
-  final List<_AppareilConfiance> _appareils = [
-    _AppareilConfiance(
-        idFormate: '421 887 330', alias: 'poste-bureau', mode: 'Contrôle'),
-    _AppareilConfiance(
-        idFormate: '555 240 173', alias: 'pc-marie', mode: 'Observation'),
-  ];
 
   @override
   void dispose() {
@@ -163,9 +140,11 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   Future<void> _surDemandeEntrante(IncomingRequestDto demande) async {
     if (!mounted || _hostId == null || _dialogueEnCours) return;
     _dialogueEnCours = true;
-    final alias = _appareils
-        .where((a) => a.idFormate == demande.peerIdFormate)
-        .map((a) => a.alias)
+    final carnet =
+        ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    final alias = carnet
+        .where((e) => e.id == demande.peerId)
+        .map((e) => e.alias)
         .firstOrNull;
     final reponse = await IncomingRequestDialog.montrer(
       context,
@@ -185,6 +164,13 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
       } catch (_) {
         // Demande déjà tranchée/expirée : rien à faire.
       }
+    }
+    // Journalise l'accès (accepté / refusé) dans l'état persistant.
+    try {
+      await _api.recordAccess(peerId: demande.peerId, accepte: accepter);
+      ref.invalidate(accessLogProvider);
+    } catch (_) {
+      // Journalisation best-effort.
     }
     if (mounted) {
       setState(() {
@@ -221,22 +207,69 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   String _message(Object e) =>
       e is NovaApiException ? e.message : e.toString();
 
-  /// Sous-titre du journal : compteurs honnêtes de la session + résumé des
-  /// statistiques cumulées de l'hôte (`unattended_stats`) quand elles existent.
+  /// Sous-titre du journal : compteurs réels de l'`access_log` persistant, plus,
+  /// en session, le résumé des statistiques cumulées de l'hôte
+  /// (`unattended_stats`) quand elles existent.
   String _sousTitreJournal() {
-    if (!_actif) {
-      return '17 connexions ce mois — dernière : poste-bureau, '
-          'aujourd’hui 14:07.';
-    }
-    final base = '${_servies + _refusees} demande(s) cette session — '
-        '$_servies servie(s), $_refusees refusée(s)';
+    final journal =
+        ref.watch(accessLogProvider).valueOrNull ?? const <AccessLogEntryDto>[];
+    final acceptes = journal.where((e) => e.accepte).length;
+    final refuses = journal.length - acceptes;
+    final base = '${journal.length} accès journalisé(s) — '
+        '$acceptes acceptée(s), $refuses refusée(s)';
+    if (!_actif) return '$base.';
     final s = _stats;
-    if (s == null) return '$base.';
-    final mo = (s.bytesOut / (1024 * 1024))
-        .toStringAsFixed(1)
-        .replaceAll('.', ',');
+    if (s == null) {
+      return '$base · session : $_servies servie(s), $_refusees refusée(s).';
+    }
+    final mo =
+        (s.bytesOut / (1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',');
     final ms = (s.rttUs / 1000).toStringAsFixed(0);
     return '$base · ↑ $mo Mo servis · RTT $ms ms.';
+  }
+
+  /// Alias d'un pair depuis le carnet, sinon son ID formaté.
+  String _aliasOuId(int peerId, String peerIdFormate) {
+    final carnet =
+        ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    return carnet
+            .where((e) => e.id == peerId)
+            .map((e) => e.alias)
+            .firstOrNull ??
+        peerIdFormate;
+  }
+
+  /// Alias d'un appareil de confiance depuis le carnet (« sans-alias » sinon).
+  String _aliasPour(int id) {
+    final carnet =
+        ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    return carnet.where((e) => e.id == id).map((e) => e.alias).firstOrNull ??
+        'sans-alias';
+  }
+
+  /// Formatage local d'un ID (9 chiffres, groupés par 3).
+  static String _formaterId(int id) {
+    var chiffres = id.toString();
+    if (chiffres.length < 9) chiffres = chiffres.padLeft(9, '0');
+    final groupes = <String>[];
+    for (var fin = chiffres.length; fin > 0; fin -= 3) {
+      final debut = fin - 3 < 0 ? 0 : fin - 3;
+      groupes.insert(0, chiffres.substring(debut, fin));
+    }
+    return groupes.join(' ');
+  }
+
+  /// Sous-titre de la ligne « Appareils de confiance » (depuis
+  /// `unattended_config`).
+  String _sousTitreAppareils() {
+    final ids = ref.watch(unattendedConfigProvider).valueOrNull
+            ?.appareilsDeConfiance ??
+        const <int>[];
+    if (ids.isEmpty) {
+      return 'Aucun appareil de confiance — ajoutez-en pour la connexion '
+          'sans mot de passe.';
+    }
+    return '${ids.map(_aliasPour).join(' · ')} — connexion sans mot de passe.';
   }
 
   String _empreinte(int peerId) {
@@ -268,31 +301,55 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   // Appareils de confiance
   // ---------------------------------------------------------------------------
 
-  Future<_AppareilConfiance?> _saisirAppareil() async {
-    final idController = TextEditingController();
-    final aliasController = TextEditingController();
-    final api = ref.read(nativeApiProvider);
+  // ---------------------------------------------------------------------------
+  // Mot de passe permanent (set_unattended_password / verify_unattended_password)
+  // ---------------------------------------------------------------------------
 
+  /// Définit (ou efface, si vide) le mot de passe permanent.
+  Future<void> _definirMotDePasse() async {
+    final pwd = _motDePasseController.text;
+    try {
+      await _api.setUnattendedPassword(pwd: pwd);
+      ref.invalidate(unattendedConfigProvider);
+      if (mounted) {
+        NovaToast.montrer(
+            context,
+            pwd.isEmpty
+                ? 'Mot de passe permanent effacé'
+                : 'Mot de passe permanent défini');
+      }
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
+  }
+
+  /// Vérifie le mot de passe saisi contre le hachage stocké.
+  Future<void> _verifierMotDePasse() async {
+    final ok =
+        await _api.verifyUnattendedPassword(pwd: _motDePasseController.text);
+    if (!mounted) return;
+    NovaToast.montrer(
+      context,
+      ok ? 'Mot de passe correct' : 'Mot de passe incorrect',
+      info: !ok,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Appareils de confiance (add_trusted_device / remove_trusted_device)
+  // ---------------------------------------------------------------------------
+
+  /// Saisit un ID NovaDesk d'appareil ; renvoie l'ID analysé ou `null`.
+  Future<int?> _saisirAppareilId() async {
+    final idController = TextEditingController();
     final valide = await montrerDialogueNova<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Ajouter un appareil de confiance'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            NovaIdField(
-                controller: idController,
-                libelle: "ID de l'appareil",
-                autofocus: true),
-            const SizedBox(height: 12),
-            TextField(
-              controller: aliasController,
-              decoration: const InputDecoration(
-                  labelText: 'Alias (facultatif)',
-                  border: OutlineInputBorder()),
-            ),
-          ],
-        ),
+        content: NovaIdField(
+            controller: idController,
+            libelle: "ID de l'appareil",
+            autofocus: true),
         actions: [
           TextButton(
               onPressed: () => Navigator.of(context).pop(false),
@@ -303,26 +360,40 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
         ],
       ),
     );
-
-    _AppareilConfiance? resultat;
+    int? resultat;
     if (valide == true) {
       try {
-        final id = await api.parseNovaId(texte: idController.text);
-        final idFormate = await api.formatNovaId(id: id);
-        resultat = _AppareilConfiance(
-          idFormate: idFormate,
-          alias: aliasController.text.trim().isEmpty
-              ? 'sans-alias'
-              : aliasController.text.trim(),
-          mode: 'Contrôle',
-        );
+        resultat = await _api.parseNovaId(texte: idController.text);
       } on NovaApiException catch (e) {
         if (mounted) NovaToast.montrer(context, e.message, info: true);
       }
     }
     idController.dispose();
-    aliasController.dispose();
     return resultat;
+  }
+
+  Future<void> _ajouterAppareil() async {
+    final id = await _saisirAppareilId();
+    if (id == null) return;
+    try {
+      await _api.addTrustedDevice(id: id);
+      ref.invalidate(unattendedConfigProvider);
+      if (mounted) {
+        NovaToast.montrer(context, 'Appareil ajouté à la liste de confiance');
+      }
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
+  }
+
+  Future<void> _retirerAppareil(int id) async {
+    try {
+      await _api.removeTrustedDevice(id: id);
+      ref.invalidate(unattendedConfigProvider);
+      if (mounted) NovaToast.montrer(context, 'Appareil retiré');
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
   }
 
   Future<void> _gererAppareils() async {
@@ -330,71 +401,63 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
       context: context,
       builder: (context) {
         final t = NovaTokens.of(context);
-        return StatefulBuilder(
-          builder: (context, setInner) => AlertDialog(
-            title: const Text('Appareils de confiance'),
-            content: SizedBox(
-              width: 380,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  for (final appareil in _appareils)
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const NovaIcone(NovaIcones.moniteur),
-                      title: Text(appareil.idFormate),
-                      subtitle: Text(appareil.alias),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          DropdownButton<String>(
-                            value: appareil.mode,
-                            underline: const SizedBox.shrink(),
-                            items: [
-                              for (final mode in _modes)
-                                DropdownMenuItem(
-                                    value: mode, child: Text(mode)),
-                            ],
-                            onChanged: (v) => setInner(
-                                () => appareil.mode = v ?? appareil.mode),
-                          ),
-                          IconButton(
-                            tooltip: 'Retirer',
-                            icon: const NovaIcone(NovaIcones.corbeille,
-                                taille: 16),
-                            onPressed: () {
-                              setInner(() => _appareils.remove(appareil));
-                              setState(() {});
-                            },
-                          ),
-                        ],
+        return AlertDialog(
+          title: const Text('Appareils de confiance'),
+          backgroundColor: t.fenetre,
+          content: SizedBox(
+            width: 380,
+            child: Consumer(
+              builder: (context, ref, _) {
+                final ids = ref
+                        .watch(unattendedConfigProvider)
+                        .valueOrNull
+                        ?.appareilsDeConfiance ??
+                    const <int>[];
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (ids.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text('Aucun appareil de confiance.',
+                              style:
+                                  TextStyle(fontSize: 12.5, color: t.texte3)),
+                        ),
+                      ),
+                    for (final id in ids)
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const NovaIcone(NovaIcones.moniteur),
+                        title: Text(_formaterId(id)),
+                        subtitle: Text(_aliasPour(id)),
+                        trailing: IconButton(
+                          tooltip: 'Retirer',
+                          icon: const NovaIcone(NovaIcones.corbeille,
+                              taille: 16),
+                          onPressed: () => unawaited(_retirerAppareil(id)),
+                        ),
+                      ),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => unawaited(_ajouterAppareil()),
+                        icon: const NovaIcone(NovaIcones.plus, taille: 14),
+                        label: const Text('Ajouter'),
                       ),
                     ),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: TextButton.icon(
-                      onPressed: () async {
-                        final ajout = await _saisirAppareil();
-                        if (ajout != null) {
-                          setInner(() => _appareils.add(ajout));
-                          setState(() {});
-                        }
-                      },
-                      icon: const NovaIcone(NovaIcones.plus, taille: 14),
-                      label: const Text('Ajouter'),
-                    ),
-                  ),
-                ],
-              ),
+                  ],
+                );
+              },
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Fermer'),
-              ),
-            ],
-            backgroundColor: t.fenetre,
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Fermer'),
+            ),
+          ],
         );
       },
     );
@@ -409,30 +472,47 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           title: const Text('Journal des accès'),
           content: SizedBox(
             width: 380,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _actif
-                      ? 'Session en cours : $_servies servie(s), '
-                          '$_refusees refusée(s).'
-                      : 'Hôte inactif. Activez l’accès pour journaliser les '
-                          'connexions entrantes.',
-                  style: TextStyle(fontSize: 12.5, color: t.texte2),
-                ),
-                const SizedBox(height: 12),
-                for (final ligne in const [
-                  'poste-bureau · aujourd’hui 14:07 · acceptée',
-                  'pc-marie · hier 09:22 · refusée',
-                  'poste-bureau · 3 juil. 18:40 · acceptée',
-                ])
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Text(ligne,
-                        style: TextStyle(fontSize: 12, color: t.texte3)),
-                  ),
-              ],
+            child: Consumer(
+              builder: (context, ref, _) {
+                final journal = ref.watch(accessLogProvider).valueOrNull ??
+                    const <AccessLogEntryDto>[];
+                if (journal.isEmpty) {
+                  return Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text('Aucun accès journalisé pour l’instant.',
+                        style: TextStyle(fontSize: 12.5, color: t.texte3)),
+                  );
+                }
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final e in journal.take(30))
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          children: [
+                            NovaIcone(
+                              e.accepte ? NovaIcones.coche : NovaIcones.bloquer,
+                              taille: 14,
+                              couleur: e.accepte ? t.vert : kNovaRouge,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                '${_aliasOuId(e.peerId, e.peerIdFormate)} · '
+                                '${formaterHorodatageRelatif(e.timestamp)} · '
+                                '${e.accepte ? 'acceptée' : 'refusée'}',
+                                style:
+                                    TextStyle(fontSize: 12, color: t.texte3),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                );
+              },
             ),
           ),
           actions: [
@@ -453,6 +533,12 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
+    // Dépendances réactives : la config d'accès, le carnet et le journal
+    // alimentent les sous-titres (appareils, journal) — l'écran se reconstruit
+    // à chaque changement persistant.
+    ref.watch(unattendedConfigProvider);
+    ref.watch(carnetProvider);
+    ref.watch(accessLogProvider);
     return ListView(
       padding: const EdgeInsets.fromLTRB(26, 22, 26, 22),
       children: [
@@ -480,9 +566,7 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
         _ligne(
           t,
           titre: 'Appareils de confiance',
-          sousTitre:
-              '${_appareils.map((a) => a.alias).join(' · ')} — connexion '
-              'sans mot de passe.',
+          sousTitre: _sousTitreAppareils(),
           controle: NovaBoutonSecondaire(
               libelle: 'Gérer', onPressed: () => unawaited(_gererAppareils())),
         ),
@@ -550,14 +634,21 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
 
   Widget _lignePassword(NovaTokens t) {
     final force = _force(_motDePasseController.text);
+    final aMotDePasse =
+        ref.watch(unattendedConfigProvider).valueOrNull?.aMotDePasse ?? false;
     return _ligne(
       t,
+      alignement: CrossAxisAlignment.start,
       titre: 'Mot de passe permanent',
       sousTitreWidget: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Authentification sans confirmation à l’écran.',
-              style: TextStyle(fontSize: 11.5, color: t.texte3)),
+          Text(
+            aMotDePasse
+                ? 'Un mot de passe permanent est configuré (haché et salé).'
+                : 'Aucun mot de passe permanent — accès refusé par défaut.',
+            style: TextStyle(fontSize: 11.5, color: t.texte3),
+          ),
           const SizedBox(height: 8),
           SizedBox(
             width: 220,
@@ -573,27 +664,47 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           ),
         ],
       ),
-      controle: Row(
+      controle: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
         mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
-            width: 180,
-            height: 32,
-            child: TextField(
-              controller: _motDePasseController,
-              enabled: _actif,
-              obscureText: true,
-              onChanged: (_) => setState(() {}),
-              style: const TextStyle(fontSize: 12.5),
-            ),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 180,
+                height: 32,
+                child: TextField(
+                  controller: _motDePasseController,
+                  obscureText: true,
+                  onChanged: (_) => setState(() {}),
+                  decoration:
+                      const InputDecoration(hintText: 'Nouveau mot de passe'),
+                  style: const TextStyle(fontSize: 12.5),
+                ),
+              ),
+              const SizedBox(width: 8),
+              NovaBoutonSecondaire(
+                libelle: 'Générer',
+                onPressed: () => setState(
+                    () => _motDePasseController.text = genererMotDePasse(20)),
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          NovaBoutonSecondaire(
-            libelle: 'Générer',
-            onPressed: _actif
-                ? () => setState(() =>
-                    _motDePasseController.text = genererMotDePasse(20))
-                : null,
+          const SizedBox(height: 8),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              NovaBoutonSecondaire(
+                libelle: 'Vérifier',
+                onPressed: () => unawaited(_verifierMotDePasse()),
+              ),
+              const SizedBox(width: 8),
+              NovaBoutonPrimaire(
+                libelle: 'Définir',
+                onPressed: () => unawaited(_definirMotDePasse()),
+              ),
+            ],
           ),
         ],
       ),

@@ -250,4 +250,133 @@ void main() {
     await sub.cancel();
     await api.stopSession(id);
   });
+
+  // -------------------------------------------------------------------------
+  // État persistant du mock (lot « état persistant ») — persistance mémoire
+  // -------------------------------------------------------------------------
+
+  test('identité mock : localIdentity est stable et formatée', () async {
+    final api = MockNativeApi();
+    final a = await api.localIdentity();
+    final b = await api.localIdentity();
+    expect(a.id, 936271048);
+    expect(a.idFormate, '936 271 048');
+    expect(a.empreinte.length, 64);
+    // Rechargée à l'identique.
+    expect(b, a);
+  });
+
+  test('carnet mock : addContact → listContacts contient le contact', () async {
+    final api = MockNativeApi();
+    final avant = await api.listContacts();
+    final entree = await api.addContact(
+        alias: 'nouveau-poste',
+        id: 123456789,
+        groupe: 'Test',
+        etiquettes: const ['demo']);
+    expect(entree.id, 123456789);
+    expect(entree.alias, 'nouveau-poste');
+
+    final apres = await api.listContacts();
+    expect(apres.length, avant.length + 1);
+    expect(apres.any((c) => c.id == 123456789 && c.alias == 'nouveau-poste'),
+        isTrue);
+    // Le groupe non vide est déclaré.
+    expect(await api.listGroups(), contains('Test'));
+
+    // Favori puis mise à jour persistent, ID en double refusé.
+    await api.setFavorite(id: 123456789, favori: true);
+    expect(
+        (await api.listContacts()).firstWhere((c) => c.id == 123456789).favori,
+        isTrue);
+    await api.updateContact(
+        id: 123456789,
+        alias: 'poste-renomme',
+        groupe: 'Test',
+        etiquettes: const ['demo']);
+    expect(
+        (await api.listContacts()).firstWhere((c) => c.id == 123456789).alias,
+        'poste-renomme');
+    await expectLater(
+      api.addContact(
+          alias: 'x', id: 123456789, groupe: '', etiquettes: const []),
+      throwsA(isA<NovaApiException>()),
+    );
+
+    // Retrait effectif.
+    await api.removeContact(id: 123456789);
+    expect((await api.listContacts()).any((c) => c.id == 123456789), isFalse);
+  });
+
+  test('réglages mock : setSetting → getSetting renvoie la valeur', () async {
+    final api = MockNativeApi();
+    expect(await api.getSetting(cle: 'serveur_rendezvous'), '127.0.0.1:9000');
+    await api.setSetting(cle: 'serveur_rendezvous', valeur: '203.0.113.7:9000');
+    expect(await api.getSetting(cle: 'serveur_rendezvous'), '203.0.113.7:9000');
+    // Reflété dans getSettings.
+    final tous = await api.getSettings();
+    expect(tous.firstWhere((s) => s.cle == 'serveur_rendezvous').valeur,
+        '203.0.113.7:9000');
+    // Clé vide refusée.
+    await expectLater(
+      api.setSetting(cle: '', valeur: 'x'),
+      throwsA(isA<NovaApiException>()),
+    );
+  });
+
+  test('accès non surveillé mock : setUnattendedPassword → verify', () async {
+    final api = MockNativeApi();
+    expect((await api.unattendedConfig()).aMotDePasse, isFalse);
+    expect(await api.verifyUnattendedPassword(pwd: 'secret'), isFalse);
+
+    await api.setUnattendedPassword(pwd: 'secret-permanent');
+    expect((await api.unattendedConfig()).aMotDePasse, isTrue);
+    expect(await api.verifyUnattendedPassword(pwd: 'secret-permanent'), isTrue);
+    expect(await api.verifyUnattendedPassword(pwd: 'mauvais'), isFalse);
+
+    // Mot de passe vide : efface la configuration.
+    await api.setUnattendedPassword(pwd: '');
+    expect((await api.unattendedConfig()).aMotDePasse, isFalse);
+
+    // Appareils de confiance : add / remove.
+    await api.addTrustedDevice(id: 111222333);
+    expect((await api.unattendedConfig()).appareilsDeConfiance,
+        contains(111222333));
+    await api.removeTrustedDevice(id: 111222333);
+    expect((await api.unattendedConfig()).appareilsDeConfiance,
+        isNot(contains(111222333)));
+
+    // Journal des accès : recordAccess ajoute en tête.
+    final avant = (await api.accessLog()).length;
+    await api.recordAccess(peerId: 111222333, accepte: true);
+    final apres = await api.accessLog();
+    expect(apres.length, avant + 1);
+    expect(apres.first.peerId, 111222333);
+    expect(apres.first.accepte, isTrue);
+  });
+
+  test('historique mock : recordSession place la session en tête', () async {
+    final api = MockNativeApi();
+    await api.recordSession(id: 987654321, alias: 'poste-test');
+    final recentes = await api.recentSessions();
+    expect(recentes.first.id, 987654321);
+    expect(recentes.first.alias, 'poste-test');
+    // Dédupliqué par id : un second enregistrement ne crée pas de doublon.
+    await api.recordSession(id: 987654321, alias: 'poste-test');
+    final apres = await api.recentSessions();
+    expect(apres.where((s) => s.id == 987654321).length, 1);
+  });
+
+  test('enregistrements mock : listRecordings renvoie des métadonnées triées',
+      () async {
+    final api = MockNativeApi();
+    final recs = await api.listRecordings();
+    expect(recs, isNotEmpty);
+    // Triés du plus récent au plus ancien.
+    for (var i = 1; i < recs.length; i++) {
+      expect(recs[i - 1].date >= recs[i].date, isTrue);
+    }
+    expect(recs.first.nom, isNotEmpty);
+    expect(recs.first.tailleOctets, greaterThan(0));
+  });
 }

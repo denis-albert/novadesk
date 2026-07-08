@@ -114,7 +114,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final api = ref.read(nativeApiProvider);
     final idLocal = ref.read(idLocalProvider);
     final saisie = (saisieExplicite ?? _adresseController.text).trim();
-    final carnet = ref.read(carnetProvider);
+    final carnet = ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
 
     setState(() => _connexionEnCours = true);
     try {
@@ -139,6 +139,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         relay: ref.read(relayProvider),
       );
       final options = SessionOptionsDto(permissions: _mode.permissions);
+      // Journalise la session au démarrage (historique + dernière connexion du
+      // contact) puis rafraîchit les vues concernées.
+      await api.recordSession(id: idPair, alias: alias ?? idFormate);
+      ref.invalidate(recentSessionsProvider);
+      ref.invalidate(carnetProvider);
       if (!mounted) return;
       await Navigator.of(context).pushNamed(
         SessionScreen.route,
@@ -167,18 +172,31 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // Actions du carnet (état local)
   // ---------------------------------------------------------------------------
 
-  void _basculerFavori(EntreeCarnet entree) {
-    final carnet = ref.read(carnetProvider.notifier);
-    carnet.state = [
-      for (final e in carnet.state)
-        e.id == entree.id ? e.copyWith(favori: !e.favori) : e,
-    ];
-    NovaToast.montrer(
-      context,
-      entree.favori
-          ? '${entree.alias} retiré des favoris'
-          : '${entree.alias} ajouté aux favoris',
-    );
+  Future<void> _basculerFavori(EntreeCarnet entree) async {
+    try {
+      await ref
+          .read(carnetProvider.notifier)
+          .basculerFavori(entree.id, !entree.favori);
+      if (!mounted) return;
+      NovaToast.montrer(
+        context,
+        entree.favori
+            ? '${entree.alias} retiré des favoris'
+            : '${entree.alias} ajouté aux favoris',
+      );
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
+  }
+
+  Future<void> _supprimer(EntreeCarnet entree) async {
+    try {
+      await ref.read(carnetProvider.notifier).supprimer(entree.id);
+      if (!mounted) return;
+      NovaToast.montrer(context, '${entree.alias} supprimé du carnet');
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
   }
 
   Future<void> _menuContextuel(EntreeCarnet entree, Offset position) async {
@@ -199,7 +217,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       case 'obs':
         unawaited(_connecterEntree(entree));
       case 'fav':
-        _basculerFavori(entree);
+        unawaited(_basculerFavori(entree));
       case 'ren':
         unawaited(_renommer(entree));
       case 'wol':
@@ -207,11 +225,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             context, 'Paquet Wake-on-LAN envoyé à ${entree.alias}',
             info: true);
       case 'del':
-        ref.read(carnetProvider.notifier).state = ref
-            .read(carnetProvider)
-            .where((e) => e.id != entree.id)
-            .toList();
-        NovaToast.montrer(context, '${entree.alias} supprimé du carnet');
+        unawaited(_supprimer(entree));
       case 'ft':
         NovaToast.montrer(context, 'Transfert de fichiers — ${entree.alias}',
             info: true);
@@ -245,10 +259,18 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     controller.dispose();
     final alias = nouvelAlias?.trim();
     if (alias == null || alias.isEmpty) return;
-    ref.read(carnetProvider.notifier).state = [
-      for (final e in ref.read(carnetProvider))
-        e.id == entree.id ? e.copyWith(alias: alias) : e,
-    ];
+    try {
+      await ref.read(carnetProvider.notifier).modifier(
+            id: entree.id,
+            alias: alias,
+            groupe: entree.groupe,
+            etiquettes: entree.etiquettes,
+          );
+      if (!mounted) return;
+      NovaToast.montrer(context, '${entree.alias} renommé en « $alias »');
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -407,6 +429,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _colonneCePoste(NovaTokens t) {
     final idFormate = ref.watch(idLocalFormateProvider);
+    final identite = ref.watch(localIdentityProvider);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -423,18 +446,32 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               fontFeatures: const [FontFeature.tabularFigures()],
             ),
           ),
-          loading: () => NovaSkeleton(largeur: 160, hauteur: 26),
+          loading: () => const NovaSkeleton(largeur: 160, hauteur: 26),
           error: (e, _) => const Text('—'),
         ),
-        const SizedBox(height: 3),
+        const SizedBox(height: 5),
+        // Empreinte d'identité (vérification TOFU) — issue de local_identity.
         Row(
           children: [
-            NovaIcone(NovaIcones.tag, taille: 13, couleur: t.texte2),
+            NovaIcone(NovaIcones.bouclierCoche, taille: 13, couleur: t.texte2),
             const SizedBox(width: 6),
-            Text('poste-bureau-01@ad',
-                style: TextStyle(fontSize: 12, color: t.texte2)),
+            identite.when(
+              data: (i) => Text(
+                'Empreinte : ${_empreinteCourte(i.empreinte)}',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: t.texte2,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+              loading: () => const NovaSkeleton(largeur: 150, hauteur: 11),
+              error: (e, _) => Text('Empreinte indisponible',
+                  style: TextStyle(fontSize: 12, color: t.texte3)),
+            ),
           ],
         ),
+        const SizedBox(height: 8),
+        _motDePasseEphemere(t),
         const SizedBox(height: 12),
         Wrap(
           spacing: 16,
@@ -462,6 +499,70 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
+  /// Empreinte compacte : 6 premières paires hexadécimales (« 3F·A9·7C·… »).
+  static String _empreinteCourte(String empreinte) {
+    final hex = empreinte.toUpperCase();
+    final n = hex.length < 12 ? hex.length : 12;
+    final paires = <String>[];
+    for (var i = 0; i + 2 <= n; i += 2) {
+      paires.add(hex.substring(i, i + 2));
+    }
+    return paires.join('·');
+  }
+
+  /// Mot de passe éphémère (session ponctuelle) issu de
+  /// `generate_ephemeral_password`, avec copie et régénération.
+  Widget _motDePasseEphemere(NovaTokens t) {
+    final motDePasse = ref.watch(motDePasseEphemereProvider);
+    return Row(
+      children: [
+        NovaIcone(NovaIcones.cadenas, taille: 13, couleur: t.texte2),
+        const SizedBox(width: 6),
+        Text('Mot de passe : ',
+            style: TextStyle(fontSize: 12, color: t.texte2)),
+        motDePasse.when(
+          data: (mdp) => SelectableText(
+            mdp,
+            style: TextStyle(
+              fontSize: 12.5,
+              color: t.texte,
+              letterSpacing: 0.5,
+              fontFamily: 'Cascadia Code',
+              fontFamilyFallback: const ['Consolas', 'monospace'],
+            ),
+          ),
+          loading: () => const NovaSkeleton(largeur: 84, hauteur: 12),
+          error: (e, _) => Text('—',
+              style: TextStyle(fontSize: 12, color: t.texte3)),
+        ),
+        const SizedBox(width: 6),
+        NovaBoutonAction(
+          icone: NovaIcones.copier,
+          tailleIcone: 13,
+          taille: 22,
+          infobulle: 'Copier le mot de passe',
+          onTap: motDePasse.hasValue
+              ? () async {
+                  await Clipboard.setData(
+                      ClipboardData(text: motDePasse.requireValue));
+                  if (mounted) {
+                    NovaToast.montrer(context, 'Mot de passe copié');
+                  }
+                }
+              : null,
+        ),
+        NovaBoutonAction(
+          icone: NovaIcones.recharger,
+          tailleIcone: 13,
+          taille: 22,
+          infobulle: 'Régénérer',
+          onTap: () => unawaited(
+              ref.read(motDePasseEphemereProvider.notifier).regenerer()),
+        ),
+      ],
+    );
+  }
+
   Widget _lien(NovaTokens t, IconData icone, String libelle, VoidCallback onTap) {
     return _LienBleu(icone: icone, libelle: libelle, onTap: onTap);
   }
@@ -470,7 +571,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _barreOnglets() {
     final t = NovaTokens.of(context);
-    final favoris = ref.watch(carnetProvider).where((e) => e.favori).length;
+    final favoris = (ref.watch(carnetProvider).valueOrNull ??
+            const <EntreeCarnet>[])
+        .where((e) => e.favori)
+        .length;
     return Container(
       decoration: BoxDecoration(
         border: Border(bottom: BorderSide(color: t.filet)),
@@ -536,7 +640,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // --- Liste d'appareils ----------------------------------------------------
 
   Widget _liste() {
-    final carnet = ref.watch(carnetProvider);
     if (_onglet == _OngletAccueil.decouverts) {
       return const NovaEmptyState(
         icone: NovaIcones.radar,
@@ -550,24 +653,54 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         children: [for (var i = 0; i < 4; i++) const _LigneSquelette()],
       );
     }
-    final entrees = _onglet == _OngletAccueil.favoris
-        ? carnet.where((e) => e.favori).toList()
-        : carnet;
-    if (entrees.isEmpty) {
-      return const NovaEmptyState(
-        icone: NovaIcones.etoile,
-        titre: 'Aucun favori',
-        sousTitre: 'Ajoutez des favoris via le menu contextuel d’un appareil.',
-      );
+    final carnet =
+        ref.watch(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    final List<EntreeCarnet> entrees;
+    if (_onglet == _OngletAccueil.favoris) {
+      entrees = carnet.where((e) => e.favori).toList();
+      if (entrees.isEmpty) {
+        return const NovaEmptyState(
+          icone: NovaIcones.etoile,
+          titre: 'Aucun favori',
+          sousTitre:
+              'Ajoutez des favoris via le menu contextuel d’un appareil.',
+        );
+      }
+    } else {
+      // Sessions récentes (historique persistant), enrichies depuis le carnet.
+      final recentes = ref.watch(recentSessionsProvider).valueOrNull ??
+          const <RecentSessionDto>[];
+      if (recentes.isEmpty) {
+        return const NovaEmptyState(
+          icone: NovaIcones.horloge,
+          titre: 'Aucune session récente',
+          sousTitre: 'Vos connexions récentes apparaîtront ici.',
+        );
+      }
+      entrees = [for (final s in recentes) _entreeDepuisRecente(s, carnet)];
     }
     return ListView.builder(
       itemCount: entrees.length,
       itemBuilder: (context, i) => _LigneAppareil(
         entree: entrees[i],
         onConnecter: () => unawaited(_connecterEntree(entrees[i])),
-        onFavori: () => _basculerFavori(entrees[i]),
+        onFavori: () => unawaited(_basculerFavori(entrees[i])),
         onMenu: (pos) => unawaited(_menuContextuel(entrees[i], pos)),
       ),
+    );
+  }
+
+  /// Convertit une session récente en entrée d'affichage (enrichie depuis le
+  /// carnet si le pair y figure).
+  EntreeCarnet _entreeDepuisRecente(
+      RecentSessionDto s, List<EntreeCarnet> carnet) {
+    final corr = carnet.where((e) => e.id == s.id).firstOrNull;
+    if (corr != null) return corr;
+    return EntreeCarnet(
+      id: s.id,
+      alias: s.alias,
+      derniereConnexion: formaterHorodatageRelatif(s.timestamp),
+      groupe: 'Récent',
     );
   }
 
