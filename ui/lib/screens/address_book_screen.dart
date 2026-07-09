@@ -5,14 +5,23 @@
 /// tableau dense (étoile · alias+OS · adresse · étiquettes · dernière connexion
 /// · état · actions révélées au survol).
 ///
-/// Écran de présentation : aucune session réelle n'est ouverte ici. Le carnet
-/// est un [carnetProvider] fictif ; les actions se contentent d'un toast
-/// NovaDesk, hormis « favori » (bascule) et « Supprimer » (retrait), persistés
-/// dans le provider. Chargement initial simulé par des squelettes shimmer
+/// « Se connecter », « Observer » et « Transfert de fichiers » ouvrent une
+/// **vraie session** (mêmes appels de façade que l'accueil : `new_session_config`
+/// → fenêtre de session par rendez-vous), avec les permissions du mode choisi.
+/// « Wake-on-LAN » demande l'adresse MAC (le carnet n'en stocke pas) puis émet
+/// le paquet magique **réel** via la façade (`send_wol`).
+/// « Importer » / « Exporter » échangent le carnet au format **JSON** par un
+/// simple fichier local (`dart:io`, aucun plugin ni sélecteur natif) : l'export
+/// écrit contacts + groupes vers `Documents`, l'import ajoute les contacts
+/// absents (dédoublonnés par ID) et crée les groupes manquants.
+/// Le carnet est persistant ([carnetProvider]) ; favori, renommage, retrait et
+/// groupes sont persistés. Chargement initial simulé par des squelettes shimmer
 /// (~780 ms), comme `skTrs` dans la maquette.
 library;
 
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -25,10 +34,15 @@ import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_id_field.dart';
 import '../widgets/nova_kit.dart';
+import 'session_screen.dart';
 
 /// Clés de groupe réservées (les autres clés sont des noms de groupe libres).
 const String _cleTous = 'Tous';
 const String _cleFavoris = 'Favoris';
+
+/// Nom d'affichage des contacts sans groupe (voir `EntreeCarnet.depuisContact`) ;
+/// à l'export on restitue un groupe vide pour un aller-retour fidèle.
+const String _groupeSansGroupe = 'Sans groupe';
 
 /// Durée du faux chargement initial (squelettes), calquée sur la maquette.
 const Duration _dureeChargement = Duration(milliseconds: 780);
@@ -57,6 +71,14 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
   /// Vrai pendant le faux chargement initial (squelettes).
   bool _chargement = true;
   Timer? _minuteurChargement;
+
+  /// Verrou : une seule ouverture de session à la fois.
+  bool _connexionEnCours = false;
+
+  /// Adresses MAC saisies pour le Wake-on-LAN pendant la session, par ID de
+  /// contact : le carnet ne stocke pas de MAC, on pré-remplit donc le dialogue
+  /// avec la dernière saisie (mémoire d'écran, best-effort).
+  final Map<int, String> _macWolMemorisees = <int, String>{};
 
   @override
   void initState() {
@@ -148,21 +170,66 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // Actions (toasts + mutations du provider fictif)
+  // Actions (sessions réelles + mutations persistantes du carnet)
   // ---------------------------------------------------------------------------
 
-  void _seConnecter(EntreeCarnet e) {
-    // Écran de présentation : aucune session réelle n'est ouverte ici.
-    NovaToast.montrer(context, 'Connexion à ${e.alias}…');
+  /// Ouvre une vraie session vers [e] avec les [permissions] données — même
+  /// parcours que l'accueil : `new_session_config` puis fenêtre de session en
+  /// mise en relation par rendez-vous ([SessionEndpointByRendezvous]).
+  Future<void> _ouvrirSession(EntreeCarnet e, PermissionsDto permissions) async {
+    if (_connexionEnCours) return;
+    setState(() => _connexionEnCours = true);
+    try {
+      final api = ref.read(nativeApiProvider);
+      final config = await api.newSessionConfig(
+        role: SessionRoleDto.controller,
+        localId: ref.read(idLocalProvider),
+        peerId: e.id,
+        permissions: permissions,
+      );
+      final endpoint = SessionEndpointByRendezvous(
+        server: ref.read(rendezvousProvider),
+        stunServers: ref.read(stunServersProvider),
+        relay: ref.read(relayProvider),
+      );
+      // Journalise la session (historique + dernière connexion du contact).
+      await api.recordSession(id: e.id, alias: e.alias);
+      ref.invalidate(recentSessionsProvider);
+      ref.invalidate(carnetProvider);
+      if (!mounted) return;
+      await Navigator.of(context).pushNamed(
+        SessionScreen.route,
+        arguments: SessionScreenArgs(
+          config: config,
+          libellePair: e.alias,
+          endpoint: endpoint,
+          options: SessionOptionsDto(permissions: permissions),
+        ),
+      );
+    } on NovaApiException catch (ex) {
+      if (mounted) NovaToast.montrer(context, ex.message, info: true);
+    } finally {
+      if (mounted) setState(() => _connexionEnCours = false);
+    }
   }
 
-  void _observer(EntreeCarnet e) {
-    NovaToast.montrer(context, 'Observation de ${e.alias}…');
-  }
+  void _seConnecter(EntreeCarnet e) =>
+      unawaited(_ouvrirSession(e, PermissionsDto.full()));
 
-  void _transfertFichiers(EntreeCarnet e) {
-    NovaToast.montrer(context, 'Transfert de fichiers — ${e.alias}', info: true);
-  }
+  void _observer(EntreeCarnet e) =>
+      unawaited(_ouvrirSession(e, PermissionsDto.viewOnly()));
+
+  void _transfertFichiers(EntreeCarnet e) => unawaited(_ouvrirSession(
+        e,
+        const PermissionsDto(
+          keyboard: false,
+          mouse: false,
+          clipboard: false,
+          files: true,
+          audio: false,
+          viewOnly: true,
+        ),
+      ));
 
   Future<void> _renommer(EntreeCarnet e) async {
     final controller = TextEditingController(text: e.alias);
@@ -204,9 +271,104 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
     }
   }
 
-  void _wakeOnLan(EntreeCarnet e) {
-    NovaToast.montrer(context, 'Paquet Wake-on-LAN envoyé à ${e.alias}',
-        info: true);
+  /// Réveille [e] par **Wake-on-LAN** : demande l'adresse MAC via un dialogue
+  /// (le carnet n'en stocke pas) puis émet le paquet magique via la façade
+  /// (`send_wol`). Diffusion vide → globale (`255.255.255.255:9`).
+  Future<void> _wakeOnLan(EntreeCarnet e) async {
+    final parametres = await _demanderParametresWol(e);
+    if (parametres == null || !mounted) return;
+    // Mémorise la MAC (normalisée) pour pré-remplir le prochain réveil.
+    _macWolMemorisees[e.id] = parametres.mac;
+    try {
+      await ref
+          .read(nativeApiProvider)
+          .sendWol(parametres.mac, broadcast: parametres.broadcast);
+      if (!mounted) return;
+      NovaToast.montrer(context, 'Paquet de réveil envoyé à ${e.alias}');
+    } on NovaApiException catch (ex) {
+      if (mounted) NovaToast.montrer(context, ex.message, info: true);
+    }
+  }
+
+  /// Dialogue « Réveiller {alias} » : champ **Adresse MAC** obligatoire
+  /// (formats `AA:BB:CC:DD:EE:FF`, `AA-BB-…` ou `AABB…` tolérés, pré-rempli si
+  /// déjà saisie pendant la session) et champ **Broadcast** facultatif
+  /// (« ip:port », vide → diffusion globale). Renvoie la MAC normalisée et la
+  /// diffusion (`null` si vide), ou `null` si l'utilisateur annule.
+  Future<({String mac, String? broadcast})?> _demanderParametresWol(
+      EntreeCarnet e) async {
+    final macController =
+        TextEditingController(text: _macWolMemorisees[e.id] ?? '');
+    final broadcastController = TextEditingController();
+    String? erreurMac;
+    final parametres =
+        await montrerDialogueNova<({String mac, String? broadcast})>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setEtat) {
+          // Valide la MAC ; en cas d'échec, affiche l'erreur sans fermer.
+          void valider() {
+            final mac = _normaliserMac(macController.text);
+            if (mac == null) {
+              setEtat(() => erreurMac =
+                  'Adresse MAC invalide — attendu AA:BB:CC:DD:EE:FF.');
+              return;
+            }
+            final broadcast = broadcastController.text.trim();
+            Navigator.of(context).pop(
+                (mac: mac, broadcast: broadcast.isEmpty ? null : broadcast));
+          }
+
+          return AlertDialog(
+            title: Text('Réveiller ${e.alias}'),
+            content: SizedBox(
+              width: 360,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: macController,
+                    autofocus: true,
+                    decoration: InputDecoration(
+                      labelText: 'Adresse MAC',
+                      hintText: 'AA:BB:CC:DD:EE:FF',
+                      errorText: erreurMac,
+                      errorMaxLines: 2,
+                    ),
+                    onChanged: (_) {
+                      if (erreurMac != null) setEtat(() => erreurMac = null);
+                    },
+                    onSubmitted: (_) => valider(),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: broadcastController,
+                    decoration: const InputDecoration(
+                      labelText: 'Broadcast (facultatif)',
+                      hintText: '255.255.255.255:9',
+                    ),
+                    onSubmitted: (_) => valider(),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Annuler'),
+              ),
+              FilledButton(
+                onPressed: valider,
+                child: const Text('Réveiller'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    macController.dispose();
+    broadcastController.dispose();
+    return parametres;
   }
 
   Future<void> _basculerFavori(EntreeCarnet e) async {
@@ -357,6 +519,274 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Import / Export du carnet (fichier JSON local via dart:io — aucun plugin)
+  // ---------------------------------------------------------------------------
+
+  /// Dossier proposé pour l'échange : `Documents` du profil utilisateur s'il
+  /// existe, sinon le Bureau, sinon le profil lui-même (repli : dossier
+  /// courant). Aucun sélecteur natif ici (ni admin ni plugins) : le dialogue
+  /// se contente d'un champ de chemin pré-rempli.
+  static String _dossierEchangeParDefaut() {
+    final profil = Platform.environment['USERPROFILE'] ??
+        Platform.environment['HOME'] ??
+        '';
+    if (profil.isEmpty) return Directory.current.path;
+    for (final nom in const ['Documents', 'Desktop']) {
+      final dossier = Directory('$profil${Platform.pathSeparator}$nom');
+      if (dossier.existsSync()) return dossier.path;
+    }
+    return profil;
+  }
+
+  /// Nom de fichier proposé : `carnet-novadesk-AAAA-MM-JJ.json` (date du jour).
+  static String _nomExportDuJour() {
+    final d = DateTime.now();
+    return 'carnet-novadesk-${d.year}-${d.month.toString().padLeft(2, '0')}-'
+        '${d.day.toString().padLeft(2, '0')}.json';
+  }
+
+  /// Chemin complet proposé par défaut dans les dialogues Import/Export.
+  static String _cheminEchangeParDefaut() =>
+      '${_dossierEchangeParDefaut()}${Platform.pathSeparator}'
+      '${_nomExportDuJour()}';
+
+  /// Dialogue commun Import/Export : un champ **chemin de fichier** pré-rempli
+  /// (fidèle au style des autres dialogues du carnet). Renvoie le chemin
+  /// saisi, ou `null` si l'utilisateur annule ou laisse le champ vide.
+  Future<String?> _demanderCheminFichier({
+    required String titre,
+    required String libelleAction,
+    required String aide,
+  }) async {
+    final controller = TextEditingController(text: _cheminEchangeParDefaut());
+    final chemin = await montrerDialogueNova<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(titre),
+        content: SizedBox(
+          width: 430,
+          child: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: 'Chemin du fichier JSON',
+              helperText: aide,
+              helperMaxLines: 3,
+            ),
+            onSubmitted: (v) => Navigator.of(context).pop(v),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(controller.text),
+              child: Text(libelleAction)),
+        ],
+      ),
+    );
+    controller.dispose();
+    final nettoye = chemin?.trim();
+    return (nettoye == null || nettoye.isEmpty) ? null : nettoye;
+  }
+
+  /// Exporte le carnet en **JSON** (contacts + groupes déclarés) vers un
+  /// fichier écrit via `dart:io`. Un chemin de dossier saisi tel quel reçoit
+  /// le nom du jour ; un export existant est écrasé. Toast de succès avec le
+  /// chemin, erreurs d'écriture en toast d'information.
+  Future<void> _exporterCarnet() async {
+    final entrees =
+        ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    final groupesDeclares =
+        ref.read(groupesProvider).valueOrNull ?? const <String>[];
+    if (entrees.isEmpty && groupesDeclares.isEmpty) {
+      NovaToast.montrer(context, 'Le carnet est vide — rien à exporter.',
+          info: true);
+      return;
+    }
+    final chemin = await _demanderCheminFichier(
+      titre: 'Exporter le carnet',
+      libelleAction: 'Exporter',
+      aide: '${entrees.length} contact(s) et ${groupesDeclares.length} '
+          'groupe(s) seront écrits dans ce fichier.',
+    );
+    if (chemin == null || !mounted) return;
+    var cible = chemin;
+    if (FileSystemEntity.isDirectorySync(cible)) {
+      cible = '$cible${Platform.pathSeparator}${_nomExportDuJour()}';
+    }
+    final donnees = <String, Object?>{
+      'format': 'carnet-novadesk',
+      'version': 1,
+      'exporteLe': DateTime.now().toIso8601String(),
+      'groupes': groupesDeclares,
+      'contacts': [
+        for (final e in entrees)
+          <String, Object?>{
+            'id': e.id,
+            'alias': e.alias,
+            'groupe': e.groupe == _groupeSansGroupe ? '' : e.groupe,
+            'etiquettes': e.etiquettes,
+            'favori': e.favori,
+          },
+      ],
+    };
+    try {
+      final fichier = File(cible);
+      await fichier.parent.create(recursive: true);
+      await fichier
+          .writeAsString(const JsonEncoder.withIndent('  ').convert(donnees));
+    } on FileSystemException catch (e) {
+      if (mounted) {
+        NovaToast.montrer(context, 'Export impossible vers $cible — ${e.message}',
+            info: true);
+      }
+      return;
+    }
+    if (mounted) {
+      NovaToast.montrer(
+          context, 'Carnet exporté (${entrees.length} contact(s)) → $cible');
+    }
+  }
+
+  /// Importe un carnet **JSON** (export NovaDesk `{groupes, contacts}` ; une
+  /// liste nue de contacts est aussi acceptée). Les contacts sont ajoutés via
+  /// la façade ([CarnetNotifier.ajouter]) en dédoublonnant par ID, les favoris
+  /// restaurés et les groupes manquants créés. Fichier introuvable ou JSON
+  /// invalide → toast d'information, rien n'est modifié.
+  Future<void> _importerCarnet() async {
+    final chemin = await _demanderCheminFichier(
+      titre: 'Importer un carnet',
+      libelleAction: 'Importer',
+      aide: 'Fichier JSON produit par « Exporter » — contacts ajoutés sans '
+          'doublon, groupes créés au besoin.',
+    );
+    if (chemin == null || !mounted) return;
+    String texte;
+    try {
+      texte = await File(chemin).readAsString();
+    } on FileSystemException {
+      if (mounted) {
+        NovaToast.montrer(context, 'Fichier introuvable ou illisible : $chemin',
+            info: true);
+      }
+      return;
+    }
+    Object? racine;
+    try {
+      racine = jsonDecode(texte);
+    } on FormatException {
+      if (mounted) {
+        NovaToast.montrer(
+            context, 'JSON invalide — fichier d\'export NovaDesk attendu.',
+            info: true);
+      }
+      return;
+    }
+    if (!mounted) return;
+    final List<dynamic>? contactsBruts = racine is Map
+        ? (racine['contacts'] is List
+            ? racine['contacts'] as List
+            : const <dynamic>[])
+        : (racine is List ? racine : null);
+    final List<dynamic> groupesBruts =
+        racine is Map && racine['groupes'] is List
+            ? racine['groupes'] as List
+            : const <dynamic>[];
+    if (contactsBruts == null) {
+      NovaToast.montrer(context,
+          'Format inattendu — objet {"contacts": […]} ou liste attendus.',
+          info: true);
+      return;
+    }
+
+    final notifier = ref.read(carnetProvider.notifier);
+    final existants =
+        ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    final idsConnus = {for (final e in existants) e.id};
+    final groupesConnus = <String>{
+      ...ref.read(groupesProvider).valueOrNull ?? const <String>[],
+      for (final e in existants) e.groupe,
+    };
+
+    // Groupes déclarés d'abord (même vides de contacts), sans doublon —
+    // `add_group` lèverait sur un nom déjà présent côté cœur.
+    for (final brut in groupesBruts) {
+      final nom = brut is String ? brut.trim() : '';
+      if (nom.isEmpty ||
+          nom == _groupeSansGroupe ||
+          groupesConnus.contains(nom)) {
+        continue;
+      }
+      try {
+        await notifier.ajouterGroupe(nom);
+      } on NovaApiException {
+        // Déjà présent côté cœur : rien à faire.
+      }
+      groupesConnus.add(nom);
+    }
+
+    var importes = 0;
+    var ignores = 0; // doublons d'ID (fichier ou carnet) et entrées invalides
+    for (final brut in contactsBruts) {
+      if (brut is! Map) {
+        ignores++;
+        continue;
+      }
+      final idBrut = brut['id'];
+      final id = idBrut is int ? idBrut : int.tryParse('$idBrut');
+      if (id == null || id <= 0 || idsConnus.contains(id)) {
+        ignores++;
+        continue;
+      }
+      final aliasBrut = brut['alias'];
+      final alias = aliasBrut is String && aliasBrut.trim().isNotEmpty
+          ? aliasBrut.trim()
+          : _formaterIdLocal(id);
+      final groupeBrut = brut['groupe'];
+      final groupe =
+          groupeBrut is String && groupeBrut.trim() != _groupeSansGroupe
+              ? groupeBrut.trim()
+              : '';
+      final etiquettesBrutes = brut['etiquettes'];
+      final etiquettes = [
+        if (etiquettesBrutes is List)
+          for (final e in etiquettesBrutes)
+            if (e is String && e.trim().isNotEmpty) e.trim(),
+      ];
+      try {
+        await notifier.ajouter(
+            alias: alias, id: id, groupe: groupe, etiquettes: etiquettes);
+        if (brut['favori'] == true) {
+          await notifier.basculerFavori(id, true);
+        }
+        idsConnus.add(id);
+        if (groupe.isNotEmpty) groupesConnus.add(groupe);
+        importes++;
+      } on NovaApiException {
+        ignores++; // ID déjà présent côté cœur (état plus frais que l'écran).
+      }
+    }
+    if (!mounted) return;
+    if (importes == 0) {
+      NovaToast.montrer(
+        context,
+        ignores > 0
+            ? 'Aucun contact importé — $ignores déjà présent(s) ou invalide(s).'
+            : 'Aucun contact à importer dans ce fichier.',
+        info: true,
+      );
+      return;
+    }
+    NovaToast.montrer(
+      context,
+      '$importes contact(s) importé(s)'
+      '${ignores > 0 ? ' · $ignores ignoré(s) (doublons/invalides)' : ''}',
+    );
+  }
+
   /// Ouvre le menu contextuel d'une entrée à la position écran [position]
   /// (clic droit sur la ligne ou bouton « ⋯ »), puis traite le choix.
   Future<void> _ouvrirMenu(EntreeCarnet e, Offset position) async {
@@ -390,7 +820,7 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
         unawaited(_renommer(e));
         break;
       case 'wol':
-        _wakeOnLan(e);
+        unawaited(_wakeOnLan(e));
         break;
       case 'del':
         unawaited(_supprimer(e));
@@ -477,11 +907,7 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
                     libelle: 'Importer',
                     icone: NovaIcones.importer,
                     hauteur: 28,
-                    onPressed: () => NovaToast.montrer(
-                      context,
-                      'Importation du carnet — à venir.',
-                      info: true,
-                    ),
+                    onPressed: () => unawaited(_importerCarnet()),
                   ),
                 ),
                 const SizedBox(width: 6),
@@ -490,11 +916,7 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
                     libelle: 'Exporter',
                     icone: NovaIcones.exporter,
                     hauteur: 28,
-                    onPressed: () => NovaToast.montrer(
-                      context,
-                      'Exportation du carnet — à venir.',
-                      info: true,
-                    ),
+                    onPressed: () => unawaited(_exporterCarnet()),
                   ),
                 ),
               ],
@@ -641,12 +1063,28 @@ class _AddressBookScreenState extends ConsumerState<AddressBookScreen> {
           selectionne: _idSelectionne == entree.id,
           onTap: () => setState(() => _idSelectionne = entree.id),
           onConnecter: () => _seConnecter(entree),
-          onWakeOnLan: () => _wakeOnLan(entree),
+          onWakeOnLan: () => unawaited(_wakeOnLan(entree)),
           onMenu: (pos) => _ouvrirMenu(entree, pos),
         );
       },
     );
   }
+}
+
+// ===========================================================================
+// Wake-on-LAN — validation / normalisation de l'adresse MAC saisie
+// ===========================================================================
+
+/// Normalise une adresse MAC saisie librement — séparateurs `:` ou `-` ou
+/// aucun, casse indifférente — vers la forme canonique « AA:BB:CC:DD:EE:FF ».
+/// Renvoie `null` si la saisie ne compte pas exactement 12 chiffres
+/// hexadécimaux.
+String? _normaliserMac(String saisie) {
+  final hex = saisie.trim().replaceAll(RegExp(r'[:-]'), '').toUpperCase();
+  if (!RegExp(r'^[0-9A-F]{12}$').hasMatch(hex)) return null;
+  return [
+    for (var i = 0; i < hex.length; i += 2) hex.substring(i, i + 2),
+  ].join(':');
 }
 
 // ===========================================================================
@@ -700,7 +1138,7 @@ class _Groupe {
 // Ligne de groupe (rail gauche) — survol / sélection (maquette `.grp`)
 // ===========================================================================
 
-class _LigneGroupe extends StatefulWidget {
+class _LigneGroupe extends StatelessWidget {
   const _LigneGroupe({
     required this.icone,
     required this.libelle,
@@ -720,29 +1158,19 @@ class _LigneGroupe extends StatefulWidget {
   final Color? couleurTexte;
 
   @override
-  State<_LigneGroupe> createState() => _LigneGroupeState();
-}
-
-class _LigneGroupeState extends State<_LigneGroupe> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final couleurTexte =
-        widget.couleurTexte ?? (widget.selectionne ? t.texte : t.texte2);
-    final couleurIcone = widget.couleurIcone ?? couleurTexte;
-    final fond = widget.selectionne
-        ? t.selection
-        : (_survole ? t.survol : Colors.transparent);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: Container(
+    final couleurLibelle =
+        couleurTexte ?? (selectionne ? t.texte : t.texte2);
+    final couleurGlyphe = couleurIcone ?? couleurLibelle;
+    return NovaActivable(
+      onTap: onTap,
+      label: libelle,
+      builder: (context, survole, focus) {
+        final fond = selectionne
+            ? t.selection
+            : (survole ? t.survol : Colors.transparent);
+        return Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
           decoration: BoxDecoration(
             color: fond,
@@ -750,32 +1178,32 @@ class _LigneGroupeState extends State<_LigneGroupe> {
           ),
           child: Row(
             children: [
-              NovaIcone(widget.icone, taille: 15, couleur: couleurIcone),
+              NovaIcone(icone, taille: 15, couleur: couleurGlyphe),
               const SizedBox(width: 9),
               Expanded(
                 child: Text(
-                  widget.libelle,
+                  libelle,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 12.5,
                     fontWeight:
-                        widget.selectionne ? FontWeight.w500 : FontWeight.w400,
-                    color: couleurTexte,
+                        selectionne ? FontWeight.w500 : FontWeight.w400,
+                    color: couleurLibelle,
                   ),
                 ),
               ),
-              if (widget.compte != null) ...[
+              if (compte != null) ...[
                 const SizedBox(width: 8),
                 Text(
-                  '${widget.compte}',
+                  '$compte',
                   style: TextStyle(fontSize: 11, color: t.texte3),
                 ),
               ],
             ],
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }

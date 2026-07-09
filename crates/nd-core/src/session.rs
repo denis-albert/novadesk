@@ -41,24 +41,25 @@
 //! (une paire de clés par session) ; l'identité persistante (`IdentityStore`) et
 //! l'épinglage TOFU arrivent au lot 06.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nd_audio::AudioSession;
-use nd_capture::create_capturer;
+use nd_capture::{create_capturer, enumerate_monitors, Rect};
 use nd_codec::{
     create_decoder, create_encoder, create_hardware_encoder, CodecKind, ContentProfile,
     DecodedFrame, EncodedChunk, VideoDecoder, VideoEncoder,
 };
 use nd_crypto::{generate_static_keypair, HandshakeRole};
 use nd_features::{
-    Capability, PermissionBroker, PermissionSet, ReconnectController, ReconnectPolicy,
+    AnnotationLayer, Capability, HostAction, Hotkey, HotkeyMap, KeyEvent, KeyState,
+    PermissionBroker, PermissionSet, ReconnectController, ReconnectPolicy,
 };
 use nd_files::{ClipboardSync, TransferEvent, TransferSession};
 use nd_input::{create_injector, InputInjector};
@@ -70,12 +71,16 @@ use nd_transport::{
 };
 
 use crate::media::{
-    decoder_audio, decoder_controle, encoder_audio, encoder_controle, Categorie, ChatMessage,
-    CommandeMedia, SousTypeControle, MONITEURS_MAX,
+    decoder_audio, decoder_controle, decoder_infos_pair, decoder_moniteurs, decoder_permissions,
+    decoder_qualite, decoder_region, encoder_audio, encoder_controle, encoder_infos_pair,
+    encoder_moniteurs, encoder_permissions, encoder_qualite, encoder_region, Categorie,
+    ChatMessage, CommandeMedia, SousTypeControle, MONITEURS_MAX,
 };
 use crate::p2p::{self, AttenteRendezvous};
+use crate::tunnel::{EtatTunnels, TunnelHandle};
 use crate::{
-    apply_input, establish, HostPipeline, HostStreamOptions, HostStreamTick, SessionConfig,
+    apply_input, establish, EnregistrementPartage, EtatEnregistrement, EtatQualite, HostPipeline,
+    HostStreamOptions, HostStreamTick, PeerInfo, RegionPartagee, RemoteMonitor, SessionConfig,
     SessionRole, SessionState, ViewerPipeline,
 };
 
@@ -189,12 +194,21 @@ pub struct SessionOptions {
     /// par la boucle d'époques (re-punch + re-négociation via le rendez-vous),
     /// mécanisme plus riche et déjà actif — ce drapeau ne s'y applique pas.
     pub transport_reconnect: bool,
+    /// **Raccourcis clavier hôte** (côté contrôlé) : chaque événement clavier
+    /// autorisé par les permissions passe par [`HotkeyMap::action_for`] **avant**
+    /// injection — un appui correspondant déclenche l'action ([`HostAction`],
+    /// ex. [`HostAction::ReleaseMouse`]) au lieu d'être injecté comme frappe, et
+    /// il est compté dans [`SessionStats::hotkeys_applied`]. `None` = table par
+    /// défaut ([`raccourcis_hote_defaut`]) ; `Some(HotkeyMap::new())` (table
+    /// vide) coupe la fonction.
+    pub hotkeys: Option<HotkeyMap<HostAction>>,
 }
 
 impl Default for SessionOptions {
     /// Permissions dérivées de la configuration, pas d'enregistrement, ABR en
     /// profil bureautique, delta **actif**, reconnexion par défaut, canaux
-    /// annexes **coupés** (session vidéo + entrées historique).
+    /// annexes **coupés** (session vidéo + entrées historique), raccourcis
+    /// clavier hôte par défaut ([`raccourcis_hote_defaut`]).
     fn default() -> Self {
         SessionOptions {
             permissions: None,
@@ -205,6 +219,7 @@ impl Default for SessionOptions {
             extended_features: false,
             transfer_dir: None,
             transport_reconnect: false,
+            hotkeys: None,
         }
     }
 }
@@ -263,7 +278,7 @@ fn chemin_enregistrement(base: &Path, epoque: u32) -> PathBuf {
 fn options_flux_hote(
     options: &SessionOptions,
     epoque: u32,
-    moniteur: Arc<AtomicU32>,
+    media: &Arc<EtatMedia>,
 ) -> HostStreamOptions {
     let etendu = options.extended_features;
     HostStreamOptions {
@@ -279,7 +294,344 @@ fn options_flux_hote(
         } else {
             Reliability::UnreliableFec
         },
-        monitor_switch: etendu.then_some(moniteur),
+        // Bascule moniteur, confidentialité (cadre noir), cadre d'écran, préréglage
+        // de qualité et enregistrement à chaud ne sont pilotables que dans la boucle
+        // **étendue** (le plan de contrôle fiable hôte → contrôleur y est branché).
+        monitor_switch: etendu.then(|| Arc::clone(&media.moniteur)),
+        privacy: etendu.then(|| Arc::clone(&media.privacy)),
+        region_switch: etendu.then(|| Arc::clone(&media.region)),
+        quality: etendu.then(|| Arc::clone(&media.qualite)),
+        recording_switch: etendu.then(|| Arc::clone(&media.enregistrement)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Raccourcis clavier hôte : résolution AVANT injection (plan 13)
+// ---------------------------------------------------------------------------
+
+// Scancodes (jeu 1, préfixe `0xE0` pour les touches étendues) suivis par le
+// filtre de raccourcis — la convention du protocole d'entrées
+// (`nd_proto::InputEvent::Key`), celle que l'injection Windows rejoue telle
+// quelle (`SendInput` + `KEYEVENTF_SCANCODE`).
+/// Ctrl gauche.
+const SCAN_CTRL_GAUCHE: u32 = 0x1D;
+/// Ctrl droit (étendu).
+const SCAN_CTRL_DROIT: u32 = 0xE01D;
+/// Maj gauche.
+const SCAN_MAJ_GAUCHE: u32 = 0x2A;
+/// Maj droite.
+const SCAN_MAJ_DROITE: u32 = 0x36;
+/// Alt gauche.
+const SCAN_ALT_GAUCHE: u32 = 0x38;
+/// Alt droit / AltGr (étendu).
+const SCAN_ALT_DROIT: u32 = 0xE038;
+/// Win gauche (étendu).
+const SCAN_WIN_GAUCHE: u32 = 0xE05B;
+/// Win droit (étendu).
+const SCAN_WIN_DROIT: u32 = 0xE05C;
+/// Touche `M` — `Ctrl+Alt+M` libère la souris ([`HostAction::ReleaseMouse`]).
+const SCAN_M: u32 = 0x32;
+/// Touche `Fin` (étendue) — `Ctrl+Alt+Fin` envoie Ctrl+Alt+Suppr, comme le
+/// client Bureau à distance de Windows.
+const SCAN_FIN: u32 = 0xE04F;
+
+/// Bit de modificateur ([`Hotkey`]) porté par un scancode, si c'en est un.
+fn bit_modificateur(scancode: u32) -> Option<u8> {
+    match scancode {
+        SCAN_CTRL_GAUCHE | SCAN_CTRL_DROIT => Some(Hotkey::CTRL),
+        SCAN_MAJ_GAUCHE | SCAN_MAJ_DROITE => Some(Hotkey::SHIFT),
+        SCAN_ALT_GAUCHE | SCAN_ALT_DROIT => Some(Hotkey::ALT),
+        SCAN_WIN_GAUCHE | SCAN_WIN_DROIT => Some(Hotkey::WIN),
+        _ => None,
+    }
+}
+
+/// Table de raccourcis clavier **hôte** par défaut, appliquée quand
+/// [`SessionOptions::hotkeys`] vaut `None` (et par [`crate::UnattendedHost`]) :
+///
+/// * `Ctrl+Alt+M` → [`HostAction::ReleaseMouse`] : geste hôte « tout
+///   relâcher » (touches et boutons injectés), l'anti « souris capturée » ;
+/// * `Ctrl+Alt+Fin` → [`HostAction::SendCtrlAltDel`] : la convention du client
+///   Bureau à distance de Windows (voie SAS côté hôte, best-effort).
+///
+/// Volontairement minimale : chaque lien par défaut masque la combinaison
+/// correspondante pour les applications du poste distant. Les autres actions
+/// ([`HostAction::ToggleViewOnly`], [`HostAction::Disconnect`], …) se câblent
+/// via une table personnalisée ([`SessionOptions::hotkeys`]).
+#[must_use]
+pub fn raccourcis_hote_defaut() -> HotkeyMap<HostAction> {
+    let mut carte = HotkeyMap::new();
+    carte.bind(
+        Hotkey::new(Hotkey::CTRL | Hotkey::ALT, SCAN_M),
+        HostAction::ReleaseMouse,
+    );
+    carte.bind(
+        Hotkey::new(Hotkey::CTRL | Hotkey::ALT, SCAN_FIN),
+        HostAction::SendCtrlAltDel,
+    );
+    carte
+}
+
+/// Table de raccourcis hôte effective : celle des options si fournie, sinon la
+/// table par défaut ([`raccourcis_hote_defaut`]).
+fn resoudre_raccourcis(options: &SessionOptions) -> HotkeyMap<HostAction> {
+    options
+        .hotkeys
+        .clone()
+        .unwrap_or_else(raccourcis_hote_defaut)
+}
+
+/// Issue du filtre de raccourcis pour un événement d'entrée **autorisé**.
+enum FiltrageEntree {
+    /// L'événement suit le chemin normal d'injection vers l'OS.
+    Injecter,
+    /// Événement avalé sans action : répétition ou relâchement d'une touche
+    /// dont l'appui a déclenché un raccourci (jamais de frappe orpheline).
+    Avale,
+    /// Un raccourci a déclenché cette action hôte : l'appliquer, ne pas injecter.
+    Action(HostAction),
+}
+
+/// Filtre de raccourcis hôte : suit les **modificateurs** au fil du flux
+/// d'entrées (le protocole ne porte que des scancodes), résout chaque appui via
+/// [`HotkeyMap::action_for`] **avant** injection, et avale la frappe d'un
+/// raccourci déclenché (appui, répétitions, relâchement).
+struct FiltreRaccourcis {
+    carte: HotkeyMap<HostAction>,
+    /// Scancodes de modificateurs actuellement enfoncés — gauche et droite
+    /// suivis séparément : relâcher l'un ne masque pas l'autre.
+    modificateurs_tenus: HashSet<u32>,
+    /// Touches dont l'appui a déclenché une action : leurs répétitions et leur
+    /// relâchement sont avalés (l'hôte ne voit jamais la frappe du raccourci).
+    avalees: HashSet<u32>,
+}
+
+impl FiltreRaccourcis {
+    fn new(carte: HotkeyMap<HostAction>) -> Self {
+        FiltreRaccourcis {
+            carte,
+            modificateurs_tenus: HashSet::new(),
+            avalees: HashSet::new(),
+        }
+    }
+
+    /// Bits de modificateurs actuellement actifs (convention [`Hotkey`]).
+    fn modificateurs(&self) -> u8 {
+        self.modificateurs_tenus
+            .iter()
+            .filter_map(|&scan| bit_modificateur(scan))
+            .fold(0, |bits, bit| bits | bit)
+    }
+
+    /// Note l'appui/relâchement d'un éventuel modificateur.
+    fn noter_modificateur(&mut self, scancode: u32, down: bool) {
+        if bit_modificateur(scancode).is_some() {
+            if down {
+                self.modificateurs_tenus.insert(scancode);
+            } else {
+                self.modificateurs_tenus.remove(&scancode);
+            }
+        }
+    }
+
+    /// Filtre un événement d'entrée : résout les raccourcis **avant** injection.
+    ///
+    /// Les modificateurs sont ceux tenus *avant* l'événement : `Ctrl+Alt+M` se
+    /// déclenche à l'appui de `M` avec Ctrl et Alt déjà enfoncés (leurs appuis
+    /// ont suivi le chemin normal — leurs relâchements aussi, rien ne reste
+    /// coincé). Seuls les événements clavier sont concernés : souris, molette et
+    /// Unicode (aucun scancode) suivent toujours l'injection normale.
+    fn filtrer(&mut self, evenement: &InputEvent) -> FiltrageEntree {
+        let InputEvent::Key { scancode, down } = *evenement else {
+            return FiltrageEntree::Injecter;
+        };
+        // Répétition (appui maintenu) ou relâchement d'une touche consommée :
+        // avalé sans re-déclencher (un raccourci ne tire qu'une fois par appui).
+        if self.avalees.contains(&scancode) {
+            if !down {
+                self.avalees.remove(&scancode);
+            }
+            self.noter_modificateur(scancode, down);
+            return FiltrageEntree::Avale;
+        }
+        let etat = if down {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
+        let action = self.carte.action_for(KeyEvent {
+            modifiers: self.modificateurs(),
+            key: scancode,
+            state: etat,
+        });
+        self.noter_modificateur(scancode, down);
+        match action {
+            // `action_for` ne se déclenche que sur l'appui : la touche est
+            // marquée consommée jusqu'à son relâchement.
+            Some(action) => {
+                self.avalees.insert(scancode);
+                FiltrageEntree::Action(action)
+            }
+            None => FiltrageEntree::Injecter,
+        }
+    }
+}
+
+/// Guichet du chemin chaud d'injection côté **contrôlé** : permissions →
+/// raccourcis → (lecture seule) → injection. Partagé par la boucle historique
+/// ([`executer_hote`]) et le démux étendu ([`recepteur_hote`]) — et donc par le
+/// service [`crate::UnattendedHost`].
+struct GuichetEntrees {
+    /// Guichet de permissions (chemin chaud sans verrou, journal au premier refus).
+    broker: PermissionBroker,
+    /// Capacités dont un refus a déjà été journalisé.
+    refus_journalises: PermissionSet,
+    /// Filtre de raccourcis hôte (résolution avant injection).
+    filtre: FiltreRaccourcis,
+    /// Mode **lecture seule** basculé par [`HostAction::ToggleViewOnly`] : les
+    /// entrées (hors raccourcis) sont refusées — comptées `inputs_denied` —
+    /// tant qu'il est actif. Les raccourcis restent résolus, sinon la bascule
+    /// serait sans retour.
+    lecture_seule: bool,
+    /// ID du pair contrôleur (acteur du journal d'audit).
+    acteur: String,
+    /// Arrêt de l'époque courante, toujours levé par [`HostAction::Disconnect`].
+    arret_epoque: Arc<AtomicBool>,
+    /// Arrêt **global** de la session, levé en plus par
+    /// [`HostAction::Disconnect`] quand le propriétaire veut qu'un raccourci
+    /// clôture toute la session (moteur de session) ; `None` pour l'hôte non
+    /// surveillé, qui survit à ses sessions et retourne à l'attente.
+    stop_session: Option<Arc<AtomicBool>>,
+    /// Permissions **vivantes** partagées (renégociation à chaud) : lues sans
+    /// verrou avant chaque entrée pour réaligner le guichet. `None` = permissions
+    /// figées à l'ensemble initial (mode non étendu, ou hôte non surveillé).
+    permissions_live: Option<Arc<AtomicU16>>,
+}
+
+impl GuichetEntrees {
+    /// Construit le guichet d'une époque hôte. `arret_epoque` est le drapeau
+    /// d'arrêt de l'époque (celui des boucles média). Les permissions sont figées
+    /// à l'ensemble initial ; le mode étendu y branche ensuite l'ensemble vivant
+    /// via [`GuichetEntrees::brancher_permissions_vivantes`].
+    fn new(params: &ParamsEpoqueHote<'_>, arret_epoque: Arc<AtomicBool>) -> Self {
+        GuichetEntrees {
+            broker: PermissionBroker::with_permissions(params.permissions),
+            refus_journalises: PermissionSet::none(),
+            filtre: FiltreRaccourcis::new(params.raccourcis.clone()),
+            lecture_seule: false,
+            acteur: params.pair.to_string(),
+            arret_epoque,
+            stop_session: params.deconnexion_globale.then(|| Arc::clone(params.stop)),
+            permissions_live: None,
+        }
+    }
+
+    /// Branche l'ensemble de permissions **vivant** partagé (renégociation à
+    /// chaud) : à chaque entrée, le guichet s'y réaligne. Réservé au mode étendu,
+    /// où le canal `Control` porte [`SousTypeControle::MajPermissions`].
+    fn brancher_permissions_vivantes(&mut self, permissions: Arc<AtomicU16>) {
+        self.permissions_live = Some(permissions);
+    }
+
+    /// Traite une trame du canal `Input` : décodage, **filtre de permissions**,
+    /// **raccourcis hôte** (avant injection), verrou lecture seule, injection.
+    /// Alimente les compteurs (`inputs_applied`, `inputs_denied`,
+    /// `hotkeys_applied`).
+    fn traiter(
+        &mut self,
+        injecteur: &dyn InputInjector,
+        compteurs: &CompteursSession,
+        data: &[u8],
+    ) {
+        // Renégociation à chaud : réaligne le guichet sur les permissions
+        // vivantes (lecture atomique lock-free ; le broker n'est réécrit qu'en
+        // cas de changement, pour ne pas gonfler le journal d'audit). Un nouvel
+        // ensemble ré-arme la journalisation des refus (traçe le prochain blocage).
+        if let Some(live) = &self.permissions_live {
+            let vivantes = PermissionSet::from_bits(live.load(Ordering::Relaxed));
+            if vivantes != self.broker.permissions() {
+                self.broker.set_permissions(vivantes);
+                self.refus_journalises = PermissionSet::none();
+            }
+        }
+        let Some(evenement) = InputEvent::from_bytes(data) else {
+            return;
+        };
+        // Permissions d'abord : une entrée refusée ne peut pas non plus
+        // déclencher d'action hôte (jetée, comptée, journalisée au premier refus).
+        let capacite = Capability::required_for_input(&evenement);
+        if !self.broker.is_allowed(capacite) {
+            compteurs.inputs_denied.fetch_add(1, Ordering::Relaxed);
+            if self.refus_journalises.grant(capacite) {
+                let _ = self.broker.authorize_input(&self.acteur, &evenement);
+            }
+            return;
+        }
+        match self.filtre.filtrer(&evenement) {
+            FiltrageEntree::Action(action) => {
+                self.appliquer_action(action, injecteur);
+                compteurs
+                    .raccourcis_appliques
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            FiltrageEntree::Avale => {}
+            FiltrageEntree::Injecter => {
+                if self.lecture_seule {
+                    // Lecture seule : refus **doux** (réversible par raccourci),
+                    // compté avec les refus de permissions.
+                    compteurs.inputs_denied.fetch_add(1, Ordering::Relaxed);
+                } else if apply_input(injecteur, &evenement).is_ok() {
+                    compteurs.inputs_applied.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Applique l'**effet moteur** d'une action de raccourci côté hôte. La
+    /// frappe correspondante n'est jamais injectée (consommée par le filtre).
+    fn appliquer_action(&mut self, action: HostAction, injecteur: &dyn InputInjector) {
+        match action {
+            // Geste hôte « libérer la souris » : tout relâcher (boutons et
+            // touches injectés) — le curseur n'est plus tenu par la session et
+            // les modificateurs du raccourci ne restent pas coincés.
+            HostAction::ReleaseMouse => injecteur.release_all(),
+            // Bascule lecture seule : voir [`GuichetEntrees::lecture_seule`].
+            // En entrant en lecture seule, tout est relâché (aucune touche ne
+            // reste tenue pendant le gel des entrées).
+            HostAction::ToggleViewOnly => {
+                self.lecture_seule = !self.lecture_seule;
+                if self.lecture_seule {
+                    injecteur.release_all();
+                }
+            }
+            // Fin de session : l'époque s'arrête toujours ; la session entière
+            // se clôt quand le propriétaire l'a demandé (moteur de session).
+            // L'hôte non surveillé, lui, survit et retourne à l'attente.
+            HostAction::Disconnect => {
+                if let Some(stop) = &self.stop_session {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                self.arret_epoque.store(true, Ordering::Relaxed);
+            }
+            // Ctrl+Alt+Suppr : voie SAS de Windows (`SendSAS`), best-effort —
+            // sans service SYSTEM ni stratégie `SoftwareSASGeneration`, l'OS
+            // ignore l'appel (voir `nd_input::send_secure_attention_sequence`).
+            // Ailleurs : compté mais sans voie d'injection (le SAS est un
+            // mécanisme Windows).
+            HostAction::SendCtrlAltDel => {
+                #[cfg(windows)]
+                let _ = nd_input::send_secure_attention_sequence();
+            }
+            // Actions d'IHM du contrôleur (plein écran, capture d'écran,
+            // enregistrement — l'UI tient déjà les frames décodées et la
+            // commande d'enregistrement) ou exigeant des crochets OS non
+            // disponibles sans droits (blocage des entrées locales) : la frappe
+            // est consommée et comptée, l'effet visuel appartient à l'UI (plan 10).
+            HostAction::ToggleFullscreen
+            | HostAction::TakeScreenshot
+            | HostAction::ToggleRecording
+            | HostAction::ToggleInputBlock => {}
+        }
     }
 }
 
@@ -303,9 +655,14 @@ pub struct SessionStats {
     pub frames_decoded: u64,
     /// Entrées reçues et appliquées à l'OS (contrôlé).
     pub inputs_applied: u64,
-    /// Entrées reçues mais **refusées par les permissions** (contrôlé) : jetées
-    /// silencieusement avant injection, voir plan 13.
+    /// Entrées reçues mais **refusées** avant injection (contrôlé) : permissions
+    /// insuffisantes, ou mode lecture seule basculé par le raccourci
+    /// [`HostAction::ToggleViewOnly`] — jetées silencieusement, voir plan 13.
     pub inputs_denied: u64,
+    /// Raccourcis clavier hôte **déclenchés et appliqués** (contrôlé) : la
+    /// frappe correspondante est consommée — jamais injectée — et l'action
+    /// ([`HostAction`]) exécutée. Voir [`SessionOptions::hotkeys`].
+    pub hotkeys_applied: u64,
     /// Débit cible actuellement appliqué à l'encodeur par l'ABR (hôte), kbit/s.
     /// `0` tant que l'encodeur n'est pas configuré.
     pub target_bitrate_kbps: u32,
@@ -327,6 +684,7 @@ pub(crate) struct CompteursSession {
     frames_decoded: AtomicU64,
     inputs_applied: AtomicU64,
     inputs_denied: AtomicU64,
+    raccourcis_appliques: AtomicU64,
     debit_cible_kbps: AtomicU64,
     palier_abr: AtomicU64,
     frames_enregistrees: AtomicU64,
@@ -381,6 +739,7 @@ impl CompteursSession {
             frames_decoded: self.frames_decoded.load(Ordering::Relaxed),
             inputs_applied: self.inputs_applied.load(Ordering::Relaxed),
             inputs_denied: self.inputs_denied.load(Ordering::Relaxed),
+            hotkeys_applied: self.raccourcis_appliques.load(Ordering::Relaxed),
             target_bitrate_kbps: u32::try_from(self.debit_cible_kbps.load(Ordering::Relaxed))
                 .unwrap_or(u32::MAX),
             abr_level: u32::try_from(self.palier_abr.load(Ordering::Relaxed)).unwrap_or(u32::MAX),
@@ -516,10 +875,40 @@ pub struct SessionHandle {
     /// Flux de **progression des transferts de fichiers** (canal `Files`) :
     /// démarrage, progression, fin par fichier, et fin de file.
     pub transfer_rx: Receiver<TransferEvent>,
+    /// Couches d'**annotation / tableau blanc** *à émettre* vers le pair (canal
+    /// `Control`). Raccourci : [`SessionHandle::send_annotation`]. Sans effet
+    /// hors mode étendu ([`SessionOptions::extended_features`]).
+    pub annotation_tx: Sender<AnnotationLayer>,
+    /// Couches d'**annotation / tableau blanc** *reçues* du pair (canal
+    /// `Control`), à superposer à l'image (voir [`AnnotationLayer::render`]).
+    pub annotation_rx: Receiver<AnnotationLayer>,
     /// Commandes vers les threads média (envoi de fichiers, bascule moniteur,
-    /// activation audio) — voir [`SessionHandle::send_files`],
-    /// [`SessionHandle::switch_monitor`], [`SessionHandle::set_audio_enabled`].
+    /// activation audio, confidentialité, région) — voir
+    /// [`SessionHandle::send_files`], [`SessionHandle::switch_monitor`],
+    /// [`SessionHandle::set_audio_enabled`], [`SessionHandle::set_privacy`],
+    /// [`SessionHandle::set_region`].
     commandes_tx: Sender<CommandeMedia>,
+    /// État du mode confidentialité **connu localement** : côté hôte, le rideau
+    /// qu'il applique ; côté contrôleur, le dernier drapeau annoncé par l'hôte
+    /// (l'indicateur à afficher). Lu par [`SessionHandle::privacy_active`].
+    privacy: Arc<AtomicBool>,
+    /// Cadre d'écran demandé (partagé avec la boucle de diffusion hôte). Lu par
+    /// [`SessionHandle::requested_region`].
+    region: RegionPartagee,
+    /// État des tunnels TCP de session (voir [`SessionHandle::open_tunnel`]).
+    tunnels: Arc<EtatTunnels>,
+    /// Permissions **vivantes** de la session (bits partagés) : côté hôte,
+    /// l'ensemble appliqué par le filtre d'injection (renégocié à chaud) ; côté
+    /// contrôleur, l'ensemble initial. Lu par [`SessionHandle::current_permissions`].
+    permissions: Arc<AtomicU16>,
+    /// Préréglage de qualité appliqué (partagé avec la boucle de diffusion hôte).
+    /// Lu par [`SessionHandle::quality`], piloté par [`SessionHandle::set_quality`].
+    qualite: Arc<EtatQualite>,
+    /// Liste des moniteurs publiée par l'hôte (contrôleur). Lu par
+    /// [`SessionHandle::monitors`].
+    moniteurs_recus: Arc<Mutex<Option<Vec<RemoteMonitor>>>>,
+    /// Infos système du pair (contrôleur). Lu par [`SessionHandle::peer_info`].
+    infos_pair_recues: Arc<Mutex<Option<PeerInfo>>>,
     compteurs: Arc<CompteursSession>,
     stop: Arc<AtomicBool>,
     pilote: Option<JoinHandle<()>>,
@@ -584,6 +973,148 @@ impl SessionHandle {
     /// Sans effet hors mode étendu ou si [`Capability::Audio`] n'est pas accordé.
     pub fn set_audio_enabled(&self, actif: bool) {
         let _ = self.commandes_tx.send(CommandeMedia::AudioActif(actif));
+    }
+
+    /// Envoie une couche d'**annotation / tableau blanc** au pair (canal
+    /// `Control`). Raccourci autour de [`SessionHandle::annotation_tx`] ; les
+    /// couches reçues arrivent sur [`SessionHandle::annotation_rx`]. Sans effet
+    /// hors mode étendu.
+    pub fn send_annotation(&self, couche: AnnotationLayer) {
+        let _ = self.annotation_tx.send(couche);
+    }
+
+    /// Demande l'activation (ou la levée) du **mode confidentialité**. Côté
+    /// contrôleur, une demande est transmise à l'hôte, qui — s'il détient
+    /// [`Capability::PrivacyMode`] — cesse de diffuser son écran réel (cadre
+    /// noir) et renvoie son état ; côté hôte, le rideau est appliqué directement.
+    /// L'état effectif se lit via [`SessionHandle::privacy_active`]. Sans effet
+    /// hors mode étendu.
+    pub fn set_privacy(&self, actif: bool) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::Confidentialite(actif));
+    }
+
+    /// État du mode confidentialité connu localement : côté contrôleur, le
+    /// dernier drapeau annoncé par l'hôte (l'indicateur à afficher) ; côté hôte,
+    /// le rideau qu'il applique.
+    #[must_use]
+    pub fn privacy_active(&self) -> bool {
+        self.privacy.load(Ordering::Relaxed)
+    }
+
+    /// Restreint la zone d'écran partagée à `Some((x, y, largeur, hauteur))` (en
+    /// pixels du moniteur) — le « cadre d'écran » — ou rétablit le plein écran
+    /// avec `None`. Côté contrôleur, la demande est transmise à l'hôte, qui
+    /// l'applique au mieux ([`crate::HostPipeline`] → `set_region`) ; côté hôte,
+    /// elle est appliquée directement. Sans effet hors mode étendu.
+    pub fn set_region(&self, region: Option<(u32, u32, u32, u32)>) {
+        let rect = region.map(|(x, y, w, h)| Rect { x, y, w, h });
+        let _ = self.commandes_tx.send(CommandeMedia::DefinirRegion(rect));
+    }
+
+    /// Cadre d'écran actuellement demandé (`None` = plein écran). Côté hôte,
+    /// reflète la demande reçue du contrôleur ; utile pour prouver qu'une
+    /// commande de région a bien traversé la session.
+    #[must_use]
+    pub fn requested_region(&self) -> Option<(u32, u32, u32, u32)> {
+        self.region
+            .lock()
+            .expect("verrou du cadre d'écran")
+            .map(|r| (r.x, r.y, r.w, r.h))
+    }
+
+    /// Renégocie les **permissions à chaud** : côté contrôleur, une demande de
+    /// remplacement de l'ensemble accordé est transmise à l'hôte, qui l'applique
+    /// au vol — le filtre d'injection lit le nouvel ensemble à l'entrée suivante ;
+    /// côté hôte, l'ensemble vivant est remplacé directement. L'ensemble effectif
+    /// se relit via [`SessionHandle::current_permissions`]. Sans effet hors mode
+    /// étendu ([`SessionOptions::extended_features`]).
+    pub fn set_permissions(&self, permissions: PermissionSet) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::MajPermissions(permissions));
+    }
+
+    /// Permissions **vivantes** connues localement : côté hôte, l'ensemble
+    /// effectivement appliqué par le filtre d'injection (après renégociation à
+    /// chaud) ; côté contrôleur, l'ensemble de la **dernière** renégociation
+    /// émise (écho optimiste local — les bascules incrémentales se composent).
+    #[must_use]
+    pub fn current_permissions(&self) -> PermissionSet {
+        PermissionSet::from_bits(self.permissions.load(Ordering::Relaxed))
+    }
+
+    /// Applique un **préréglage de qualité** : `profil` ABR (netteté vs fluidité)
+    /// et `plafond_kbps` (plafond de débit ; `0` = aucun). Côté contrôleur, une
+    /// demande est transmise à l'hôte, qui reconfigure son encodeur et son échelle
+    /// ABR **sous** le plafond (l'ABR continue de dégrader à partir de là) ; côté
+    /// hôte, le préréglage est appliqué directement. L'état appliqué se relit via
+    /// [`SessionHandle::quality`]. Sans effet hors mode étendu.
+    pub fn set_quality(&self, profil: ContentProfile, plafond_kbps: u32) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::MajQualite(profil, plafond_kbps));
+    }
+
+    /// Préréglage de qualité **appliqué** (profil ABR, plafond kbit/s) connu
+    /// localement : côté hôte, ce que la boucle de diffusion applique ; côté
+    /// contrôleur, le dernier préréglage **demandé** (écho optimiste local).
+    #[must_use]
+    pub fn quality(&self) -> (ContentProfile, u32) {
+        (
+            self.qualite.profil(),
+            self.qualite.plafond_kbps.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Démarre (avec un chemin MP4) ou arrête (`None`) l'**enregistrement local
+    /// en cours de session** — côté **hôte** (l'hôte encode et muxe son écran).
+    /// Démarrer ouvre une nouvelle époque MP4 ; arrêter clôt proprement le
+    /// fichier (relisible). Sans effet côté contrôleur ni hors mode étendu.
+    pub fn set_recording(&self, chemin: Option<PathBuf>) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::DefinirEnregistrement(chemin));
+    }
+
+    /// Liste des **moniteurs** publiée par l'hôte, lue côté **contrôleur** :
+    /// `None` tant qu'aucune liste n'est arrivée, `Some(liste)` ensuite
+    /// (éventuellement vide sur un hôte sans écran énumérable). Chaque index est
+    /// celui qu'attend [`SessionHandle::switch_monitor`] — remplace tout écran
+    /// codé en dur côté UI.
+    #[must_use]
+    pub fn monitors(&self) -> Option<Vec<RemoteMonitor>> {
+        self.moniteurs_recus
+            .lock()
+            .expect("verrou des moniteurs")
+            .clone()
+    }
+
+    /// **Infos système du pair** (nom d'hôte + OS) publiées par l'hôte, lues côté
+    /// **contrôleur** : `None` tant qu'elles ne sont pas arrivées.
+    #[must_use]
+    pub fn peer_info(&self) -> Option<PeerInfo> {
+        self.infos_pair_recues
+            .lock()
+            .expect("verrou des infos du pair")
+            .clone()
+    }
+
+    /// Ouvre un **tunnel TCP de session** : écoute sur `127.0.0.1:port_local`
+    /// (port `0` = éphémère) et relaie chaque connexion locale vers
+    /// `cible_distante` **à travers le canal fiable de la session** (l'hôte
+    /// compose la connexion réelle vers la cible). Rend une [`TunnelHandle`]
+    /// (adresse écoutée, statistiques, arrêt).
+    ///
+    /// Best-effort (voir [`crate::tunnel`]) : exige le mode étendu et
+    /// [`Capability::TcpTunnel`] côté hôte ; les octets relayés sont comptés
+    /// dans [`TunnelHandle::stats`].
+    ///
+    /// # Errors
+    /// Échec de liaison de l'écouteur local (port déjà pris, droits…).
+    pub fn open_tunnel(&self, port_local: u16, cible_distante: SocketAddr) -> Result<TunnelHandle> {
+        crate::tunnel::open_tunnel(&self.tunnels, port_local, cible_distante)
     }
 
     /// Arrête la session : lève le signal d'arrêt puis attend la fin des threads
@@ -691,13 +1222,35 @@ impl SessionEngine {
         let (chat_in_tx, chat_in_rx) = mpsc::channel();
         let (chat_out_tx, chat_out_rx) = mpsc::channel();
         let (transfer_out_tx, transfer_out_rx) = mpsc::channel();
+        let (annotation_in_tx, annotation_in_rx) = mpsc::channel();
+        let (annotation_out_tx, annotation_out_rx) = mpsc::channel();
         let (commandes_tx, commandes_rx) = mpsc::channel();
         let compteurs = Arc::new(CompteursSession::default());
         let stop = Arc::new(AtomicBool::new(false));
+        // État partagé des fonctions avancées (confidentialité, cadre d'écran,
+        // tunnels), lisible/pilotable depuis la poignée.
+        let privacy = Arc::new(AtomicBool::new(false));
+        let region: RegionPartagee = Arc::new(Mutex::new(None));
+        let tunnels = Arc::new(EtatTunnels::new(Arc::clone(&stop)));
+        // Plan de contrôle de session : permissions vivantes (bits partagés),
+        // préréglage de qualité, enregistrement à chaud, liste des moniteurs et
+        // infos du pair — partagés entre les threads média et la poignée.
+        let permissions = Arc::new(AtomicU16::new(
+            resoudre_permissions(&config, &options).to_bits(),
+        ));
+        let qualite = Arc::new(EtatQualite::default());
+        // La qualité initiale reflète le profil ABR des options (netteté/fluidité).
+        qualite.profil_video.store(
+            matches!(options.abr_profile, ContentProfile::Video),
+            Ordering::Relaxed,
+        );
+        let enregistrement: EnregistrementPartage = Arc::new(EtatEnregistrement::default());
+        let moniteurs_recus = Arc::new(Mutex::new(None));
+        let infos_pair_recues = Arc::new(Mutex::new(None));
 
         let media = Arc::new(EtatMedia {
             role: config.role,
-            permissions: resoudre_permissions(&config, &options),
+            permissions: Arc::clone(&permissions),
             transfer_dir: options
                 .transfer_dir
                 .clone()
@@ -707,11 +1260,20 @@ impl SessionEngine {
             transfer: Mutex::new(None),
             audio_actif: AtomicBool::new(true),
             moniteur: Arc::new(AtomicU32::new(0)),
+            privacy: Arc::clone(&privacy),
+            region: Arc::clone(&region),
             dernier_presse_papiers: Mutex::new(None),
             chat_out: chat_out_tx,
             transfer_out: transfer_out_tx,
+            annotation_out: annotation_out_tx,
             commandes: Mutex::new(commandes_rx),
             chat_in: Mutex::new(chat_in_rx),
+            annotation_in: Mutex::new(annotation_in_rx),
+            tunnels: Arc::clone(&tunnels),
+            qualite: Arc::clone(&qualite),
+            enregistrement: Arc::clone(&enregistrement),
+            moniteurs_recus: Arc::clone(&moniteurs_recus),
+            infos_pair_recues: Arc::clone(&infos_pair_recues),
         });
 
         let ctx = ContextePilote {
@@ -735,7 +1297,16 @@ impl SessionEngine {
             chat_tx: chat_in_tx,
             chat_rx: chat_out_rx,
             transfer_rx: transfer_out_rx,
+            annotation_tx: annotation_in_tx,
+            annotation_rx: annotation_out_rx,
             commandes_tx,
+            privacy,
+            region,
+            tunnels,
+            permissions,
+            qualite,
+            moniteurs_recus,
+            infos_pair_recues,
             compteurs,
             stop,
             pilote: Some(pilote),
@@ -760,8 +1331,11 @@ type EntreesPartagees = Arc<Mutex<Receiver<InputEvent>>>;
 struct EtatMedia {
     /// Rôle local (sens de l'audio et de la vidéo).
     role: SessionRole,
-    /// Capacités effectives : gate de chaque fonction étendue.
-    permissions: PermissionSet,
+    /// Capacités **vivantes** (bits partagés) : gate de chaque fonction étendue,
+    /// **renégociable à chaud** (le contrôleur retire/rend un droit, l'hôte
+    /// l'applique au vol via [`SousTypeControle::MajPermissions`]). Lue sans
+    /// verrou par le filtre d'injection et les gardes média (voir [`Self::perms`]).
+    permissions: Arc<AtomicU16>,
     /// Répertoire de réception des fichiers (canal `Files`).
     transfer_dir: PathBuf,
     /// Session audio (émission hôte / lecture contrôleur), injectée ou système.
@@ -775,6 +1349,13 @@ struct EtatMedia {
     audio_actif: AtomicBool,
     /// Index du moniteur demandé (bascule multi-écran), lu par la capture hôte.
     moniteur: Arc<AtomicU32>,
+    /// État du **mode confidentialité** : hôte → rideau appliqué (lu par la
+    /// boucle de diffusion) ; contrôleur → dernier état annoncé par l'hôte.
+    /// Partagé avec la [`SessionHandle`] (indicateur).
+    privacy: Arc<AtomicBool>,
+    /// **Cadre d'écran** demandé (partagé avec la boucle de diffusion hôte et la
+    /// [`SessionHandle`]). `None` = plein écran.
+    region: RegionPartagee,
     /// Dernier presse-papiers **appliqué** (anti-boucle : ne pas ré-émettre ce
     /// que l'on vient de recevoir).
     dernier_presse_papiers: Mutex<Option<Vec<u8>>>,
@@ -782,10 +1363,36 @@ struct EtatMedia {
     chat_out: Sender<ChatMessage>,
     /// Progression des transferts → [`SessionHandle::transfer_rx`].
     transfer_out: Sender<TransferEvent>,
+    /// Annotations reçues → [`SessionHandle::annotation_rx`].
+    annotation_out: Sender<AnnotationLayer>,
     /// Commandes depuis la poignée ([`SessionHandle::send_files`], …).
     commandes: Mutex<Receiver<CommandeMedia>>,
     /// Chat à émettre depuis la poignée ([`SessionHandle::chat_tx`]).
     chat_in: Mutex<Receiver<String>>,
+    /// Annotations à émettre depuis la poignée ([`SessionHandle::annotation_tx`]).
+    annotation_in: Mutex<Receiver<AnnotationLayer>>,
+    /// État des tunnels TCP de session (partagé avec la [`SessionHandle`]).
+    tunnels: Arc<EtatTunnels>,
+    /// Préréglage de **qualité** partagé avec la boucle de diffusion hôte
+    /// (profil ABR + plafond de débit) — renégociable à chaud.
+    qualite: Arc<EtatQualite>,
+    /// Demande d'**enregistrement à chaud** partagée avec la boucle de diffusion
+    /// hôte (chemin MP4 voulu / arrêt).
+    enregistrement: EnregistrementPartage,
+    /// Liste des **moniteurs** reçue du pair (contrôleur) — `None` tant que
+    /// l'hôte ne l'a pas annoncée. Partagée avec la [`SessionHandle`].
+    moniteurs_recus: Arc<Mutex<Option<Vec<RemoteMonitor>>>>,
+    /// **Infos système du pair** reçues (contrôleur) — `None` tant qu'inconnues.
+    /// Partagées avec la [`SessionHandle`].
+    infos_pair_recues: Arc<Mutex<Option<PeerInfo>>>,
+}
+
+impl EtatMedia {
+    /// Permissions **vivantes** courantes (lecture atomique lock-free), telles
+    /// que renégociées à chaud. Gate de toutes les fonctions étendues.
+    fn perms(&self) -> PermissionSet {
+        PermissionSet::from_bits(self.permissions.load(Ordering::Relaxed))
+    }
 }
 
 /// Contexte vivant du pilote de session, partagé par toutes les époques.
@@ -1174,11 +1781,13 @@ fn vivre_epoque_avec_pair(
         SessionRole::Controlled => {
             let params = ParamsEpoqueHote {
                 permissions: resoudre_permissions(&ctx.config, &ctx.options),
-                flux: options_flux_hote(&ctx.options, epoque, Arc::clone(&ctx.media.moniteur)),
+                flux: options_flux_hote(&ctx.options, epoque, &ctx.media),
                 compteurs: &ctx.compteurs,
                 stop: &ctx.stop,
                 etats: Some(&ctx.state_tx),
                 pair,
+                raccourcis: resoudre_raccourcis(&ctx.options),
+                deconnexion_globale: true,
             };
             if ctx.options.extended_features {
                 vivre_epoque_hote_ext(transport, &params, &ctx.media)
@@ -1317,6 +1926,13 @@ pub(crate) struct ParamsEpoqueHote<'a> {
     pub etats: Option<&'a Sender<SessionState>>,
     /// ID du pair contrôleur (acteur du journal d'audit des permissions).
     pub pair: NovaId,
+    /// Raccourcis clavier hôte, résolus **avant** injection (voir
+    /// [`SessionOptions::hotkeys`] et [`raccourcis_hote_defaut`]).
+    pub raccourcis: HotkeyMap<HostAction>,
+    /// [`HostAction::Disconnect`] lève aussi le signal `stop` global quand vrai
+    /// (moteur de session : toute la session se clôt) ; faux pour l'hôte non
+    /// surveillé, qui survit à ses sessions (seule l'époque se termine).
+    pub deconnexion_globale: bool,
 }
 
 /// Époque complète de l'hôte : garde + Noise (répondeur) + média piloté.
@@ -1377,41 +1993,20 @@ fn executer_hote(
     let mut hote = HostPipeline::new(capteur, encodeur, Box::new(transport.clone()))?;
 
     // Thread de réception/application des entrées : seul récepteur de ce côté.
-    // Le guichet de permissions vit dans ce thread (chemin chaud sans verrou) :
-    // `is_allowed` par événement, journalisation au premier refus par capacité.
-    let mut broker = PermissionBroker::with_permissions(params.permissions);
-    let acteur = params.pair.to_string();
+    // Le guichet (permissions + raccourcis hôte + lecture seule) vit dans ce
+    // thread — chemin chaud sans verrou, journalisation au premier refus par
+    // capacité, résolution des raccourcis **avant** injection.
+    let mut guichet = GuichetEntrees::new(params, Arc::clone(arret));
     let mut transport_entrees = transport.clone();
     let arret_entrees = Arc::clone(arret);
     let compteurs_entrees = Arc::clone(params.compteurs);
     let entrees = thread::Builder::new()
         .name("nd-session-injection".to_owned())
         .spawn(move || {
-            let mut refus_journalises = PermissionSet::none();
             while !arret_entrees.load(Ordering::Relaxed) {
                 match transport_entrees.poll_recv() {
                     Ok(Some((_canal, donnees))) => {
-                        let Some(evenement) = InputEvent::from_bytes(&donnees) else {
-                            continue;
-                        };
-                        let capacite = Capability::required_for_input(&evenement);
-                        if broker.is_allowed(capacite) {
-                            if apply_input(injecteur.as_ref(), &evenement).is_ok() {
-                                compteurs_entrees
-                                    .inputs_applied
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        } else {
-                            // Entrée non autorisée : jetée silencieusement
-                            // (chemin chaud), comptée, et tracée dans le journal
-                            // d'audit au premier refus de chaque capacité.
-                            compteurs_entrees
-                                .inputs_denied
-                                .fetch_add(1, Ordering::Relaxed);
-                            if refus_journalises.grant(capacite) {
-                                let _ = broker.authorize_input(&acteur, &evenement);
-                            }
-                        }
+                        guichet.traiter(injecteur.as_ref(), &compteurs_entrees, &donnees);
                     }
                     Ok(None) => thread::sleep(Duration::from_millis(2)),
                     Err(_) => break,
@@ -1483,37 +2078,11 @@ fn construire_carte_reception(transport: &mut impl Transport) -> HashMap<u32, Ca
     carte
 }
 
-/// Applique une entrée reçue derrière le **filtre de permissions** (chemin chaud
-/// partagé par l'injection classique et étendue).
-fn appliquer_entree_gardee(
-    injecteur: &dyn InputInjector,
-    broker: &mut PermissionBroker,
-    refus_journalises: &mut PermissionSet,
-    compteurs: &CompteursSession,
-    acteur: &str,
-    data: &[u8],
-) {
-    let Some(evenement) = InputEvent::from_bytes(data) else {
-        return;
-    };
-    let capacite = Capability::required_for_input(&evenement);
-    if broker.is_allowed(capacite) {
-        if apply_input(injecteur, &evenement).is_ok() {
-            compteurs.inputs_applied.fetch_add(1, Ordering::Relaxed);
-        }
-    } else {
-        compteurs.inputs_denied.fetch_add(1, Ordering::Relaxed);
-        if refus_journalises.grant(capacite) {
-            let _ = broker.authorize_input(acteur, &evenement);
-        }
-    }
-}
-
 /// Construit (paresseusement) la session audio système si [`Capability::Audio`]
 /// est accordé, puis règle le sens actif selon le rôle (émission côté hôte,
 /// lecture côté contrôleur).
 fn assurer_audio(media: &EtatMedia) {
-    if !media.permissions.allows(Capability::Audio) {
+    if !media.perms().allows(Capability::Audio) {
         return;
     }
     let mut garde = media.audio.lock().expect("verrou audio");
@@ -1540,7 +2109,7 @@ fn assurer_audio(media: &EtatMedia) {
 /// Reçoit une trame du canal `Files` : crée paresseusement le récepteur si
 /// besoin, l'alimente, puis draine ses événements vers la poignée.
 fn traiter_fichiers(media: &EtatMedia, data: &[u8]) {
-    if !media.permissions.allows(Capability::FileDownload) {
+    if !media.perms().allows(Capability::FileDownload) {
         return;
     }
     let mut garde = media.transfer.lock().expect("verrou transfert");
@@ -1571,7 +2140,7 @@ fn traiter_controle(media: &EtatMedia, data: &[u8]) {
             }
         }
         SousTypeControle::PressePapiers => {
-            if !media.permissions.allows(Capability::ClipboardWrite) {
+            if !media.perms().allows(Capability::ClipboardWrite) {
                 return;
             }
             if let Some(clip) = media
@@ -1593,6 +2162,80 @@ fn traiter_controle(media: &EtatMedia, data: &[u8]) {
                 media
                     .moniteur
                     .store(u32::from_be_bytes(octets), Ordering::Relaxed);
+            }
+        }
+        SousTypeControle::Confidentialite => {
+            // Demande du contrôleur : l'hôte applique le rideau **s'il l'autorise**
+            // ([`Capability::PrivacyMode`], défense en profondeur côté contrôlé).
+            if media.role == SessionRole::Controlled
+                && media.perms().allows(Capability::PrivacyMode)
+            {
+                if let Some(&octet) = payload.first() {
+                    media.privacy.store(octet != 0, Ordering::Relaxed);
+                }
+            }
+        }
+        SousTypeControle::ConfidentialiteEtat => {
+            // État annoncé par l'hôte : le contrôleur met à jour son indicateur.
+            if media.role == SessionRole::Controller {
+                if let Some(&octet) = payload.first() {
+                    media.privacy.store(octet != 0, Ordering::Relaxed);
+                }
+            }
+        }
+        SousTypeControle::Annotation => {
+            if let Ok(couche) = AnnotationLayer::from_bytes(payload) {
+                let _ = media.annotation_out.send(couche);
+            }
+        }
+        SousTypeControle::Region => {
+            // Demande de cadre d'écran : l'hôte la mémorise (la boucle de
+            // diffusion applique `set_region` au mieux). Payload vide = plein écran.
+            if media.role == SessionRole::Controlled {
+                *media.region.lock().expect("verrou du cadre d'écran") = decoder_region(payload);
+            }
+        }
+        SousTypeControle::Tunnel => {
+            let autorise = media.perms().allows(Capability::TcpTunnel);
+            EtatTunnels::recevoir(&media.tunnels, payload, media.role, autorise);
+        }
+        SousTypeControle::MajPermissions => {
+            // Renégociation à chaud : l'hôte remplace son ensemble vivant, relu
+            // par le filtre d'injection et les gardes média à la volée.
+            if media.role == SessionRole::Controlled {
+                if let Some(nouvelles) = decoder_permissions(payload) {
+                    media
+                        .permissions
+                        .store(nouvelles.to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+        SousTypeControle::MajQualite => {
+            // Préréglage de qualité : l'hôte reconfigure encodeur + ABR sous le
+            // plafond (via la génération observée par la boucle de diffusion).
+            if media.role == SessionRole::Controlled {
+                if let Some((profil, plafond)) = decoder_qualite(payload) {
+                    appliquer_qualite(media, profil, plafond);
+                }
+            }
+        }
+        SousTypeControle::Moniteurs => {
+            // Liste des écrans publiée par l'hôte : le contrôleur la mémorise
+            // (remplace tout écran codé en dur côté UI).
+            if media.role == SessionRole::Controller {
+                *media.moniteurs_recus.lock().expect("verrou des moniteurs") =
+                    Some(decoder_moniteurs(payload));
+            }
+        }
+        SousTypeControle::InfosPair => {
+            // Infos système du pair : le contrôleur les mémorise.
+            if media.role == SessionRole::Controller {
+                if let Some(infos) = decoder_infos_pair(payload) {
+                    *media
+                        .infos_pair_recues
+                        .lock()
+                        .expect("verrou des infos du pair") = Some(infos);
+                }
             }
         }
     }
@@ -1628,7 +2271,7 @@ fn recepteur_controleur(
                     }
                 }
                 Some(Categorie::Audio) => {
-                    if media.permissions.allows(Capability::Audio)
+                    if media.perms().allows(Capability::Audio)
                         && media.audio_actif.load(Ordering::Relaxed)
                     {
                         if let Some(paquet) = decoder_audio(&data) {
@@ -1651,7 +2294,7 @@ fn recepteur_controleur(
         let maintenant = maintenant_us(debut);
         if maintenant >= prochain_tick {
             prochain_tick = maintenant + PERIODE_TICK_AUDIO_US;
-            if media.permissions.allows(Capability::Audio) {
+            if media.perms().allows(Capability::Audio) {
                 if let Some(audio) = media.audio.lock().expect("verrou audio").as_mut() {
                     let _ = audio.tick_lecture(maintenant);
                 }
@@ -1661,31 +2304,22 @@ fn recepteur_controleur(
     Ok(())
 }
 
-/// Récepteur démux **hôte** : entrées → filtre de permissions → injection ;
-/// fichiers → transfert ; contrôle → presse-papiers/chat/bascule moniteur.
+/// Récepteur démux **hôte** : entrées → guichet (permissions → raccourcis hôte
+/// → injection) ; fichiers → transfert ; contrôle → presse-papiers/chat/bascule
+/// moniteur.
 fn recepteur_hote(
     mut transport: TransportPartage,
     injecteur: Box<dyn InputInjector>,
-    permissions: PermissionSet,
-    acteur: String,
+    mut guichet: GuichetEntrees,
     media: &Arc<EtatMedia>,
     compteurs: &Arc<CompteursSession>,
     arret: &Arc<AtomicBool>,
 ) -> Result<()> {
     let carte = construire_carte_reception(&mut transport);
-    let mut broker = PermissionBroker::with_permissions(permissions);
-    let mut refus_journalises = PermissionSet::none();
     while !arret.load(Ordering::Relaxed) {
         match transport.poll_recv() {
             Ok(Some((handle, data))) => match carte.get(&handle.0).copied() {
-                Some(Categorie::Input) => appliquer_entree_gardee(
-                    injecteur.as_ref(),
-                    &mut broker,
-                    &mut refus_journalises,
-                    compteurs,
-                    &acteur,
-                    &data,
-                ),
+                Some(Categorie::Input) => guichet.traiter(injecteur.as_ref(), compteurs, &data),
                 Some(Categorie::Fichiers) => traiter_fichiers(media, &data),
                 Some(Categorie::Controle) => traiter_controle(media, &data),
                 _ => {}
@@ -1712,7 +2346,7 @@ fn traiter_commandes(
     for commande in commandes {
         match commande {
             CommandeMedia::EnvoyerFichiers(fichiers) => {
-                if media.permissions.allows(Capability::FileUpload) {
+                if media.perms().allows(Capability::FileUpload) {
                     if let Ok(session) = TransferSession::send(fichiers) {
                         *media.transfer.lock().expect("verrou transfert") = Some(session);
                     }
@@ -1736,8 +2370,95 @@ fn traiter_commandes(
                     }
                 }
             }
+            CommandeMedia::Confidentialite(actif) => match media.role {
+                // Le contrôleur demande ; l'hôte s'applique le rideau directement
+                // (la boucle de diffusion le lit et diffuse un cadre noir).
+                SessionRole::Controller => {
+                    let trame =
+                        encoder_controle(SousTypeControle::Confidentialite, &[u8::from(actif)]);
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+                SessionRole::Controlled => media.privacy.store(actif, Ordering::Relaxed),
+            },
+            CommandeMedia::DefinirRegion(region) => match media.role {
+                SessionRole::Controller => {
+                    let trame = encoder_controle(SousTypeControle::Region, &encoder_region(region));
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+                SessionRole::Controlled => {
+                    *media.region.lock().expect("verrou du cadre d'écran") = region;
+                }
+            },
+            CommandeMedia::MajPermissions(nouvelles) => {
+                // Les deux rôles mémorisent l'ensemble vivant : côté hôte c'est
+                // l'**application effective** (le filtre d'injection et les gardes
+                // média le lisent au vol) ; côté contrôleur, un **écho optimiste**
+                // pour que les renégociations incrémentales se composent (chaque
+                // bascule repart de l'état courant, pas de l'initial). Le
+                // contrôleur le transmet en plus à l'hôte.
+                media
+                    .permissions
+                    .store(nouvelles.to_bits(), Ordering::Relaxed);
+                if media.role == SessionRole::Controller {
+                    let trame = encoder_controle(
+                        SousTypeControle::MajPermissions,
+                        &encoder_permissions(nouvelles),
+                    );
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+            }
+            CommandeMedia::MajQualite(profil, plafond) => {
+                // Écho optimiste local +, côté hôte, application effective
+                // (reconfiguration encodeur/ABR via la génération) ; le contrôleur
+                // transmet aussi la demande à l'hôte.
+                appliquer_qualite(media, profil, plafond);
+                if media.role == SessionRole::Controller {
+                    let trame = encoder_controle(
+                        SousTypeControle::MajQualite,
+                        &encoder_qualite(profil, plafond),
+                    );
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+            }
+            CommandeMedia::DefinirEnregistrement(chemin) => {
+                // Enregistrement **local** de l'hôte : sans effet côté contrôleur
+                // (seul l'hôte encode et muxe son écran).
+                if media.role == SessionRole::Controlled {
+                    appliquer_enregistrement(media, chemin);
+                }
+            }
         }
     }
+}
+
+/// Applique un préréglage de qualité à l'état partagé de l'hôte (profil ABR +
+/// plafond de débit) et **signale le changement** à la boucle de diffusion en
+/// incrémentant la génération (elle reconfigure alors l'encodeur/l'ABR au vol).
+fn appliquer_qualite(media: &EtatMedia, profil: ContentProfile, plafond_kbps: u32) {
+    media
+        .qualite
+        .profil_video
+        .store(matches!(profil, ContentProfile::Video), Ordering::Relaxed);
+    media
+        .qualite
+        .plafond_kbps
+        .store(plafond_kbps, Ordering::Relaxed);
+    media.qualite.generation.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mémorise le chemin d'enregistrement voulu (ou `None` pour arrêter) et
+/// **signale le changement** à la boucle de diffusion (génération) : elle ouvre
+/// une nouvelle époque MP4 ou clôt proprement le muxeur courant.
+fn appliquer_enregistrement(media: &EtatMedia, chemin: Option<PathBuf>) {
+    *media
+        .enregistrement
+        .chemin
+        .lock()
+        .expect("verrou d'enregistrement à chaud") = chemin;
+    media
+        .enregistrement
+        .generation
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Émet les messages de chat en attente (canal `Control`) + écho local.
@@ -1764,13 +2485,52 @@ fn envoyer_chat_en_attente(
     }
 }
 
+/// Émet les couches d'annotation en attente (canal `Control`, sous-type
+/// [`SousTypeControle::Annotation`]).
+fn envoyer_annotations_en_attente(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    let couches: Vec<AnnotationLayer> = {
+        let rx = media.annotation_in.lock().expect("verrou annotations");
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    };
+    for couche in couches {
+        // Une couche non sérialisable (trop de traits pour le format) est sautée.
+        if let Ok(octets) = couche.to_bytes() {
+            let trame = encoder_controle(SousTypeControle::Annotation, &octets);
+            let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+        }
+    }
+}
+
+/// Émet les trames de tunnel en attente (canal `Control`, sous-type
+/// [`SousTypeControle::Tunnel`]) : données relayées et ouvertures/fermetures de
+/// flux, produites par les fils de pont ([`crate::tunnel`]).
+fn envoyer_tunnels_en_attente(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    for corps in media.tunnels.drainer_sortie() {
+        let trame = encoder_controle(SousTypeControle::Tunnel, &corps);
+        if transport
+            .send(canal_controle, trame, Reliability::Reliable)
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 /// Émet le presse-papiers local s'il a changé (garde [`Capability::ClipboardRead`]).
 fn synchroniser_presse_papiers(
     transport: &mut TransportPartage,
     canal_controle: ChannelHandle,
     media: &EtatMedia,
 ) {
-    if !media.permissions.allows(Capability::ClipboardRead) {
+    if !media.perms().allows(Capability::ClipboardRead) {
         return;
     }
     let octets = {
@@ -1831,9 +2591,7 @@ fn boucle_audio_hote(
 ) {
     let canal_audio = transport.open_channel(ChannelKind::Audio);
     while !arret.load(Ordering::Relaxed) {
-        if !media.permissions.allows(Capability::Audio)
-            || !media.audio_actif.load(Ordering::Relaxed)
-        {
+        if !media.perms().allows(Capability::Audio) || !media.audio_actif.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -1889,6 +2647,8 @@ fn emetteur_features_controleur(
         }
         traiter_commandes(&mut transport, canal_controle, media);
         envoyer_chat_en_attente(&mut transport, canal_controle, media);
+        envoyer_annotations_en_attente(&mut transport, canal_controle, media);
+        envoyer_tunnels_en_attente(&mut transport, canal_controle, media);
         pomper_transfert(&mut transport, canal_files, media);
         if Instant::now() >= prochaine_synchro {
             prochaine_synchro = Instant::now() + PERIODE_PRESSE_PAPIERS;
@@ -1897,8 +2657,67 @@ fn emetteur_features_controleur(
     }
 }
 
+/// Annonce l'état de confidentialité au contrôleur **quand il change** (hôte →
+/// contrôleur, sous-type [`SousTypeControle::ConfidentialiteEtat`]) : c'est le
+/// drapeau que le contrôleur affiche. `dernier` mémorise le dernier état émis.
+fn annoncer_confidentialite(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+    dernier: &mut Option<bool>,
+) {
+    let actuel = media.privacy.load(Ordering::Relaxed);
+    if *dernier != Some(actuel) {
+        *dernier = Some(actuel);
+        let trame = encoder_controle(SousTypeControle::ConfidentialiteEtat, &[u8::from(actuel)]);
+        let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+    }
+}
+
+/// Énumère les **écrans réels** de l'hôte (best-effort) et les publie sur le
+/// canal `Control` (sous-type [`SousTypeControle::Moniteurs`]). Une énumération
+/// en échec (session sans bureau, Wayland pur…) publie une **liste vide** : le
+/// contrôleur reçoit tout de même l'annonce (la liste a bien traversé).
+fn annoncer_moniteurs(transport: &mut TransportPartage, canal_controle: ChannelHandle) {
+    let moniteurs: Vec<RemoteMonitor> = enumerate_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| RemoteMonitor {
+            index: m.id.0,
+            width: m.width,
+            height: m.height,
+            primary: m.is_primary,
+        })
+        .collect();
+    let trame = encoder_controle(SousTypeControle::Moniteurs, &encoder_moniteurs(&moniteurs));
+    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+}
+
+/// Publie les infos système de l'hôte (nom d'hôte + OS) sur le canal `Control`
+/// (sous-type [`SousTypeControle::InfosPair`]).
+fn annoncer_infos_pair(transport: &mut TransportPartage, canal_controle: ChannelHandle) {
+    let trame = encoder_controle(
+        SousTypeControle::InfosPair,
+        &encoder_infos_pair(&infos_systeme_locales()),
+    );
+    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+}
+
+/// Infos système locales (nom d'hôte + OS) publiées au pair. **Sans dépendance
+/// native** : le nom d'hôte vient des variables d'environnement usuelles
+/// (`COMPUTERNAME` sous Windows, `HOSTNAME` ailleurs, repli « inconnu ») et l'OS
+/// des constantes de compilation.
+fn infos_systeme_locales() -> PeerInfo {
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "inconnu".to_owned());
+    let os = format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH);
+    PeerInfo { host, os }
+}
+
 /// Émetteur de fonctions étendues côté **hôte** : audio (canal `Audio`) + plan
-/// de contrôle (fichiers, presse-papiers, chat, commandes).
+/// de contrôle (fichiers, presse-papiers, chat, annotations, tunnels, état de
+/// confidentialité, commandes).
 fn emetteur_features_hote(
     mut transport: TransportPartage,
     media: &Arc<EtatMedia>,
@@ -1906,10 +2725,26 @@ fn emetteur_features_hote(
 ) {
     let canal_files = transport.open_channel(ChannelKind::Files);
     let canal_controle = transport.open_channel(ChannelKind::Control);
+    // Annonce initiale du plan de contrôle (à l'établissement) : liste réelle des
+    // écrans de l'hôte et infos système du pair (nom d'hôte + OS). Le contrôleur
+    // les lit via [`SessionHandle::monitors`] / [`SessionHandle::peer_info`].
+    annoncer_moniteurs(&mut transport, canal_controle);
+    annoncer_infos_pair(&mut transport, canal_controle);
     let mut prochaine_synchro = Instant::now();
+    // État de confidentialité déjà annoncé (émis à la première itération, puis
+    // à chaque bascule) — l'indicateur du contrôleur suit l'hôte.
+    let mut etat_prive_annonce: Option<bool> = None;
     while !arret.load(Ordering::Relaxed) {
         traiter_commandes(&mut transport, canal_controle, media);
         envoyer_chat_en_attente(&mut transport, canal_controle, media);
+        envoyer_annotations_en_attente(&mut transport, canal_controle, media);
+        envoyer_tunnels_en_attente(&mut transport, canal_controle, media);
+        annoncer_confidentialite(
+            &mut transport,
+            canal_controle,
+            media,
+            &mut etat_prive_annonce,
+        );
         pomper_transfert(&mut transport, canal_files, media);
         if Instant::now() >= prochaine_synchro {
             prochaine_synchro = Instant::now() + PERIODE_PRESSE_PAPIERS;
@@ -2033,16 +2868,17 @@ fn derouler_epoque_hote_ext(
     let media_recepteur = Arc::clone(media);
     let compteurs_recepteur = Arc::clone(params.compteurs);
     let arret_recepteur = Arc::clone(arret);
-    let permissions = params.permissions;
-    let acteur = params.pair.to_string();
+    // Mode étendu : le filtre d'injection lit les permissions **vivantes**
+    // partagées (renégociation à chaud via le canal `Control`).
+    let mut guichet = GuichetEntrees::new(params, Arc::clone(arret));
+    guichet.brancher_permissions_vivantes(Arc::clone(&media.permissions));
     let recepteur = thread::Builder::new()
         .name("nd-session-recv-hote".to_owned())
         .spawn(move || {
             let _ = recepteur_hote(
                 transport_recepteur,
                 injecteur,
-                permissions,
-                acteur,
+                guichet,
                 &media_recepteur,
                 &compteurs_recepteur,
                 &arret_recepteur,
@@ -2778,5 +3614,300 @@ mod tests {
 
         poignee.stop();
         let _ = hote.join().expect("thread hôte");
+    }
+}
+
+/// Preuve **unitaire** du guichet d'entrées hôte (permissions → raccourcis →
+/// injection) avec un injecteur témoin : un raccourci déclenché est appliqué
+/// (geste moteur), **compté** (`hotkeys_applied`) et sa frappe n'est **jamais**
+/// injectée ; les autres entrées suivent le chemin historique. Le câblage dans
+/// la vraie boucle de session est prouvé par `tests/session_raccourcis.rs`.
+#[cfg(test)]
+mod tests_raccourcis {
+    use super::*;
+    use nd_input::MouseButton;
+
+    /// Injecteur témoin : consigne les frappes injectées et compte les
+    /// `release_all`, sans toucher à l'OS.
+    #[derive(Default)]
+    struct InjecteurTemoin {
+        touches: Mutex<Vec<(u32, bool)>>,
+        souris: AtomicU64,
+        liberations: AtomicU64,
+    }
+
+    impl InjecteurTemoin {
+        fn touches(&self) -> Vec<(u32, bool)> {
+            self.touches.lock().expect("verrou des touches").clone()
+        }
+
+        fn liberations(&self) -> u64 {
+            self.liberations.load(Ordering::Relaxed)
+        }
+    }
+
+    impl InputInjector for InjecteurTemoin {
+        fn mouse_move_abs(&self, _x: f64, _y: f64, _monitor: MonitorId) -> Result<()> {
+            self.souris.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn mouse_move_rel(&self, _dx: f64, _dy: f64) -> Result<()> {
+            self.souris.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn mouse_button(&self, _btn: MouseButton, _down: bool) -> Result<()> {
+            self.souris.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn scroll(&self, _dx: f64, _dy: f64) -> Result<()> {
+            self.souris.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn key(&self, scancode: u32, down: bool) -> Result<()> {
+            self.touches
+                .lock()
+                .expect("verrou des touches")
+                .push((scancode, down));
+            Ok(())
+        }
+
+        fn unicode(&self, _ch: char) -> Result<()> {
+            Ok(())
+        }
+
+        fn release_all(&self) {
+            self.liberations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Guichet de test aux permissions données, avec ses signaux d'arrêt
+    /// `(guichet, arrêt d'époque, arrêt global de session)`.
+    fn guichet(
+        carte: HotkeyMap<HostAction>,
+        permissions: PermissionSet,
+        deconnexion_globale: bool,
+    ) -> (GuichetEntrees, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let arret_epoque = Arc::new(AtomicBool::new(false));
+        let stop_session = Arc::new(AtomicBool::new(false));
+        let guichet = GuichetEntrees {
+            broker: PermissionBroker::with_permissions(permissions),
+            refus_journalises: PermissionSet::none(),
+            filtre: FiltreRaccourcis::new(carte),
+            lecture_seule: false,
+            acteur: "pair-test".to_owned(),
+            arret_epoque: Arc::clone(&arret_epoque),
+            stop_session: deconnexion_globale.then(|| Arc::clone(&stop_session)),
+            permissions_live: None,
+        };
+        (guichet, arret_epoque, stop_session)
+    }
+
+    /// Écran + souris + clavier accordés.
+    fn clavier_complet() -> PermissionSet {
+        [
+            Capability::ViewScreen,
+            Capability::ControlMouse,
+            Capability::ControlKeyboard,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Pousse un événement clavier (sérialisé comme sur le fil) dans le guichet.
+    fn touche(
+        guichet: &mut GuichetEntrees,
+        temoin: &InjecteurTemoin,
+        compteurs: &CompteursSession,
+        scancode: u32,
+        down: bool,
+    ) {
+        guichet.traiter(
+            temoin,
+            compteurs,
+            &InputEvent::Key { scancode, down }.to_bytes(),
+        );
+    }
+
+    #[test]
+    fn la_carte_par_defaut_mappe_release_mouse_et_ctrl_alt_suppr() {
+        let carte = raccourcis_hote_defaut();
+        assert_eq!(
+            carte.lookup(Hotkey::new(Hotkey::CTRL | Hotkey::ALT, SCAN_M)),
+            Some(&HostAction::ReleaseMouse)
+        );
+        assert_eq!(
+            carte.lookup(Hotkey::new(Hotkey::CTRL | Hotkey::ALT, SCAN_FIN)),
+            Some(&HostAction::SendCtrlAltDel)
+        );
+    }
+
+    /// **Sonde du lot** : `Ctrl+Alt+M` (carte par défaut) déclenche
+    /// [`HostAction::ReleaseMouse`] — geste moteur appliqué (`release_all`),
+    /// compté dans `hotkeys_applied` — et la touche `M` n'est **jamais**
+    /// injectée (ni l'appui, ni la répétition, ni le relâchement), tandis que
+    /// les modificateurs suivent le chemin normal d'injection.
+    #[test]
+    fn ctrl_alt_m_libere_la_souris_compte_et_n_injecte_pas_la_frappe() {
+        let compteurs = CompteursSession::default();
+        let temoin = InjecteurTemoin::default();
+        let (mut guichet, _arret, _stop) =
+            guichet(raccourcis_hote_defaut(), clavier_complet(), true);
+
+        touche(&mut guichet, &temoin, &compteurs, SCAN_CTRL_GAUCHE, true);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_ALT_GAUCHE, true);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_M, true); // déclenche
+        touche(&mut guichet, &temoin, &compteurs, SCAN_M, true); // répétition avalée
+        touche(&mut guichet, &temoin, &compteurs, SCAN_M, false); // relâchement avalé
+        touche(&mut guichet, &temoin, &compteurs, SCAN_ALT_GAUCHE, false);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_CTRL_GAUCHE, false);
+
+        let stats = compteurs.instantane();
+        assert_eq!(stats.hotkeys_applied, 1, "une seule action par appui");
+        assert_eq!(temoin.liberations(), 1, "geste hôte appliqué (release_all)");
+        let touches = temoin.touches();
+        assert!(
+            touches.iter().all(|&(scan, _)| scan != SCAN_M),
+            "la frappe du raccourci ne doit jamais être injectée : {touches:?}"
+        );
+        // Les modificateurs, eux, ont suivi le chemin normal (appui/relâchement).
+        assert_eq!(stats.inputs_applied, 4, "Ctrl/Alt aller-retour injectés");
+        assert_eq!(stats.inputs_denied, 0);
+    }
+
+    /// Sans [`Capability::ControlKeyboard`], la combinaison est refusée par les
+    /// permissions **avant** la résolution : aucune action hôte déclenchable
+    /// par un pair en observation seule.
+    #[test]
+    fn un_raccourci_refuse_par_les_permissions_ne_declenche_rien() {
+        let compteurs = CompteursSession::default();
+        let temoin = InjecteurTemoin::default();
+        let (mut guichet, _arret, _stop) =
+            guichet(raccourcis_hote_defaut(), PermissionSet::view_only(), true);
+
+        touche(&mut guichet, &temoin, &compteurs, SCAN_CTRL_GAUCHE, true);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_ALT_GAUCHE, true);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_M, true);
+
+        let stats = compteurs.instantane();
+        assert_eq!(stats.hotkeys_applied, 0);
+        assert_eq!(stats.inputs_denied, 3);
+        assert_eq!(temoin.liberations(), 0);
+        assert!(temoin.touches().is_empty());
+    }
+
+    /// [`HostAction::ToggleViewOnly`] (carte personnalisée) gèle les entrées —
+    /// refus doux compté `inputs_denied` — puis les rétablit à la seconde
+    /// bascule : le raccourci reste résolu pendant le gel (bascule réversible).
+    #[test]
+    fn bascule_lecture_seule_gele_puis_retablit_les_entrees() {
+        const SCAN_F1: u32 = 0x3B;
+        const SCAN_A: u32 = 0x1E;
+        let mut carte = HotkeyMap::new();
+        carte.bind(Hotkey::new(0, SCAN_F1), HostAction::ToggleViewOnly);
+
+        let compteurs = CompteursSession::default();
+        let temoin = InjecteurTemoin::default();
+        let (mut guichet, _arret, _stop) = guichet(carte, clavier_complet(), true);
+
+        touche(&mut guichet, &temoin, &compteurs, SCAN_F1, true); // gel
+        touche(&mut guichet, &temoin, &compteurs, SCAN_F1, false);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_A, true); // refusée (gel)
+        touche(&mut guichet, &temoin, &compteurs, SCAN_A, false);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_F1, true); // dégel
+        touche(&mut guichet, &temoin, &compteurs, SCAN_F1, false);
+        touche(&mut guichet, &temoin, &compteurs, SCAN_A, true); // injectée
+        touche(&mut guichet, &temoin, &compteurs, SCAN_A, false);
+
+        let stats = compteurs.instantane();
+        assert_eq!(stats.hotkeys_applied, 2, "deux bascules comptées");
+        assert_eq!(stats.inputs_denied, 2, "frappe gelée comptée refusée");
+        assert_eq!(stats.inputs_applied, 2, "frappe injectée après dégel");
+        assert_eq!(temoin.touches(), vec![(SCAN_A, true), (SCAN_A, false)]);
+    }
+
+    /// [`HostAction::Disconnect`] termine toujours l'époque, et clôt toute la
+    /// session quand le propriétaire l'a demandé (`deconnexion_globale`) — pas
+    /// pour l'hôte non surveillé, qui survit à ses sessions.
+    #[test]
+    fn deconnexion_leve_les_signaux_selon_le_proprietaire() {
+        const SCAN_F2: u32 = 0x3C;
+        let mut carte = HotkeyMap::new();
+        carte.bind(Hotkey::new(0, SCAN_F2), HostAction::Disconnect);
+
+        // Moteur de session : époque **et** session entière.
+        let compteurs = CompteursSession::default();
+        let temoin = InjecteurTemoin::default();
+        let (mut guichet_moteur, arret, stop) = guichet(carte.clone(), clavier_complet(), true);
+        touche(&mut guichet_moteur, &temoin, &compteurs, SCAN_F2, true);
+        assert!(arret.load(Ordering::Relaxed), "l'époque s'arrête");
+        assert!(stop.load(Ordering::Relaxed), "la session se clôt");
+        assert_eq!(compteurs.instantane().hotkeys_applied, 1);
+
+        // Hôte non surveillé : seule l'époque se termine.
+        let compteurs = CompteursSession::default();
+        let (mut guichet_service, arret, stop) = guichet(carte, clavier_complet(), false);
+        touche(&mut guichet_service, &temoin, &compteurs, SCAN_F2, true);
+        assert!(arret.load(Ordering::Relaxed), "l'époque s'arrête");
+        assert!(!stop.load(Ordering::Relaxed), "le service continue");
+    }
+
+    /// Le suivi des modificateurs distingue gauche/droite : relâcher le Ctrl
+    /// gauche ne masque pas le droit, et les bits reflètent l'état réel.
+    #[test]
+    fn le_suivi_des_modificateurs_distingue_gauche_et_droite() {
+        let mut filtre = FiltreRaccourcis::new(raccourcis_hote_defaut());
+        let mut presser = |scan: u32, down: bool| {
+            let _ = filtre.filtrer(&InputEvent::Key {
+                scancode: scan,
+                down,
+            });
+        };
+        presser(SCAN_CTRL_GAUCHE, true);
+        presser(SCAN_CTRL_DROIT, true);
+        presser(SCAN_MAJ_GAUCHE, true);
+        presser(SCAN_CTRL_GAUCHE, false);
+        presser(SCAN_MAJ_GAUCHE, false);
+        // Le Ctrl droit tient toujours : CTRL reste actif, SHIFT est retombé.
+        assert_eq!(filtre.modificateurs(), Hotkey::CTRL);
+        let mut presser = |scan: u32, down: bool| {
+            let _ = filtre.filtrer(&InputEvent::Key {
+                scancode: scan,
+                down,
+            });
+        };
+        presser(SCAN_CTRL_DROIT, false);
+        assert_eq!(filtre.modificateurs(), 0);
+    }
+
+    /// Souris et Unicode traversent le filtre sans y être résolus : le chemin
+    /// d'injection historique reste inchangé pour tout ce qui n'est pas clavier.
+    #[test]
+    fn souris_et_unicode_ne_sont_pas_des_raccourcis() {
+        let compteurs = CompteursSession::default();
+        let temoin = InjecteurTemoin::default();
+        let (mut guichet, _arret, _stop) =
+            guichet(raccourcis_hote_defaut(), clavier_complet(), true);
+        guichet.traiter(
+            &temoin,
+            &compteurs,
+            &InputEvent::MouseMoveRel { dx: 2.0, dy: 3.0 }.to_bytes(),
+        );
+        guichet.traiter(
+            &temoin,
+            &compteurs,
+            &InputEvent::Unicode { codepoint: 0x41 }.to_bytes(),
+        );
+        let stats = compteurs.instantane();
+        assert_eq!(stats.hotkeys_applied, 0);
+        assert_eq!(stats.inputs_applied, 2);
+        assert_eq!(
+            temoin.souris.load(Ordering::Relaxed),
+            1,
+            "un seul geste souris"
+        );
     }
 }

@@ -1,10 +1,15 @@
-/// Badge d'état de session : pastille colorée + libellé français stable,
-/// directement issu du miroir de `SessionStateDto::label()` (façade `nd-ffi`).
+/// Badge d'état de session : point coloré + libellé français stable, calqué
+/// sur le motif `.status .g` de la maquette (pastille 7 px + texte discret).
+///
+/// Couleurs issues des jetons de thème — vert « accès » (active), ambre
+/// (établissement / reconnexion), rouge de marque (fermée), gris (inactive) —
+/// jamais de palette Material brute.
 library;
 
 import 'package:flutter/material.dart';
 
 import '../bridge/native_api.dart';
+import '../theme/nova_theme.dart';
 
 /// Pastille + libellé (« inactive », « connexion », « active »…),
 /// couleur selon l'état.
@@ -17,52 +22,43 @@ class SessionStateBadge extends StatelessWidget {
   /// Variante compacte (barre d'état de la fenêtre de session).
   final bool dense;
 
-  Color _couleur(ColorScheme schema) => switch (etat) {
-        SessionStateDto.idle => schema.outline,
+  Color _couleur(NovaTokens t) => switch (etat) {
+        SessionStateDto.idle => t.texte3,
         SessionStateDto.resolving ||
         SessionStateDto.connecting ||
-        SessionStateDto.handshaking =>
-          Colors.amber.shade800,
-        SessionStateDto.active => Colors.green.shade600,
-        SessionStateDto.reconnecting => Colors.orange.shade800,
-        SessionStateDto.closed => schema.error,
+        SessionStateDto.handshaking ||
+        SessionStateDto.reconnecting =>
+          kNovaAmbre,
+        SessionStateDto.active => t.vert,
+        SessionStateDto.closed => kNovaRouge,
       };
 
   @override
   Widget build(BuildContext context) {
-    final couleur = _couleur(Theme.of(context).colorScheme);
-    return Container(
-      padding: EdgeInsets.symmetric(
-        horizontal: dense ? 8 : 10,
-        vertical: dense ? 3 : 5,
-      ),
-      decoration: BoxDecoration(
-        color: couleur.withValues(alpha: 0.14),
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(color: couleur, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 6),
-          Flexible(
-            child: Text(
-              etat.label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: couleur,
-                fontWeight: FontWeight.w600,
-                fontSize: dense ? 12 : 13,
-              ),
+    final t = NovaTokens.of(context);
+    final couleur = _couleur(t);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: BoxDecoration(color: couleur, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            etat.label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: dense ? t.texte2 : t.texte,
+              fontWeight: FontWeight.w500,
+              fontSize: dense ? 11 : 12.5,
             ),
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }

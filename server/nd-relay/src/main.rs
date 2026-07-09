@@ -23,6 +23,16 @@
 //! sélection du relais le plus proche côté client ([`select_relay`], exposée
 //! ici via le mode diagnostic `--sonder`).
 //!
+//! **Cas limites fermés** : l'annonce de ticket est bornée par un délai d'E/S
+//! ([`DELAI_ANNONCE`] — une connexion muette ne retient ni thread ni place de
+//! quota indéfiniment) ; un pair resté **en attente** au-delà de l'échéance de
+//! son ticket est **purgé** (sa socket fermée, sa place IP rendue) — passé
+//! cette échéance, aucun second pair ne peut de toute façon plus être accepté,
+//! son annonce serait refusée comme expirée. La purge court à chaque annonce
+//! et en tâche de fond ([`INTERVALLE_PURGE_ATTENTES`]). Une fois la paire
+//! appariée, plus aucun délai n'est imposé au tuyau (les sessions longues et
+//! silencieuses sont légitimes ; le quota d'octets borne l'abus).
+//!
 //! Implémentation std pure (TCP bloquant, threads), dans l'esprit de
 //! `nd-signaling`.
 
@@ -31,7 +41,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -63,6 +73,15 @@ const DELAI_SONDE_RELAIS: Duration = Duration::from_millis(800);
 
 /// Intervalle de publication des métriques sur la sortie standard.
 const INTERVALLE_METRIQUES: Duration = Duration::from_secs(60);
+
+/// Délai d'E/S accordé à la phase d'annonce (lecture du ticket) : au-delà, la
+/// connexion muette est fermée et sa place de quota IP rendue. Le délai est
+/// **levé** une fois le ticket vérifié — le tuyau relayé, lui, n'expire pas.
+const DELAI_ANNONCE: Duration = Duration::from_secs(30);
+
+/// Intervalle du balayage de fond des pairs en attente dont le ticket a
+/// expiré (la purge court aussi, inline, à chaque annonce valide).
+const INTERVALLE_PURGE_ATTENTES: Duration = Duration::from_secs(30);
 
 /// Quotas du relais (plan 11 — relais géré).
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +129,9 @@ pub struct RelayMetrics {
     tickets_rejetes: AtomicU64,
     /// Connexions refusées par le quota de connexions par IP.
     connexions_rejetees: AtomicU64,
+    /// Pairs en attente purgés parce que leur ticket a expiré sans que le
+    /// second pair n'arrive (voir [`purger_attentes_expirees`]).
+    attentes_purgees: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -144,6 +166,11 @@ impl RelayMetrics {
         self.connexions_rejetees.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Comptabilise `n` pairs en attente purgés (tickets expirés sans pair).
+    fn purger_attentes(&self, n: u64) {
+        self.attentes_purgees.fetch_add(n, Ordering::SeqCst);
+    }
+
     /// Instantané lisible des compteurs, pour le journal d'exploitation et les
     /// tests.
     pub fn snapshot(&self) -> SnapshotMetriques {
@@ -153,6 +180,7 @@ impl RelayMetrics {
             paires_servies: self.paires_servies.load(Ordering::SeqCst),
             tickets_rejetes: self.tickets_rejetes.load(Ordering::SeqCst),
             connexions_rejetees: self.connexions_rejetees.load(Ordering::SeqCst),
+            attentes_purgees: self.attentes_purgees.load(Ordering::SeqCst),
         }
     }
 }
@@ -170,6 +198,8 @@ pub struct SnapshotMetriques {
     pub tickets_rejetes: u64,
     /// Connexions refusées par le quota de connexions par IP.
     pub connexions_rejetees: u64,
+    /// Pairs en attente purgés (ticket expiré sans second pair).
+    pub attentes_purgees: u64,
 }
 
 impl fmt::Display for SnapshotMetriques {
@@ -177,12 +207,13 @@ impl fmt::Display for SnapshotMetriques {
         write!(
             formateur,
             "paires actives : {}, paires servies : {}, octets relayés : {}, \
-             tickets rejetés : {}, connexions rejetées : {}",
+             tickets rejetés : {}, connexions rejetées : {}, attentes purgées : {}",
             self.paires_actives,
             self.paires_servies,
             self.octets_relayes,
             self.tickets_rejetes,
-            self.connexions_rejetees
+            self.connexions_rejetees,
+            self.attentes_purgees
         )
     }
 }
@@ -225,10 +256,14 @@ impl Drop for GardeIp {
     }
 }
 
-/// Pair en attente d'appariement : sa connexion et sa place de quota IP
-/// (tenue tant que la connexion vit dans la table).
+/// Pair en attente d'appariement : sa connexion, l'échéance de son ticket
+/// (au-delà, l'entrée est purgée — voir [`purger_attentes_expirees`]) et sa
+/// place de quota IP (tenue tant que la connexion vit dans la table).
 struct EnAttente {
     stream: TcpStream,
+    /// Échéance du ticket annoncé (secondes UNIX) : passé cet instant, aucun
+    /// second pair ne peut plus être accepté, l'attente est donc vaine.
+    expire_a: u64,
     _garde: GardeIp,
 }
 
@@ -345,9 +380,14 @@ fn journaliser_metriques(relais: &Relais) {
 
 /// Boucle d'acceptation du relais (bloquante, un thread par connexion).
 ///
+/// Démarre aussi le balayage de fond des pairs en attente expirés — la purge
+/// inline de chaque annonce ne suffit pas quand le trafic s'arrête.
+///
 /// # Errors
 /// Renvoie une erreur si l'acceptation d'une connexion échoue.
 fn servir(listener: &TcpListener, relais: &Arc<Relais>) -> io::Result<()> {
+    let pour_purge = Arc::downgrade(relais);
+    thread::spawn(move || balayer_attentes_expirees(&pour_purge));
     for stream in listener.incoming() {
         let stream = stream?;
         let relais = Arc::clone(relais);
@@ -358,6 +398,41 @@ fn servir(listener: &TcpListener, relais: &Arc<Relais>) -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Balayage périodique des attentes expirées ; s'arrête quand le relais
+/// n'existe plus (référence faible : le balayeur ne le maintient pas en vie).
+fn balayer_attentes_expirees(relais: &Weak<Relais>) {
+    loop {
+        thread::sleep(INTERVALLE_PURGE_ATTENTES);
+        let Some(relais) = relais.upgrade() else {
+            return;
+        };
+        purger_attentes_expirees(&relais, maintenant_unix());
+    }
+}
+
+/// Retire de la table les pairs en attente dont le ticket a expiré : passé
+/// l'échéance, l'annonce d'un second pair serait de toute façon refusée
+/// (ticket expiré), l'entrée ne fait donc plus que retenir une socket et une
+/// place de quota IP. Les connexions purgées sont fermées **hors verrou**
+/// (leur `drop` rend aussi la place IP) et comptées dans les métriques.
+fn purger_attentes_expirees(relais: &Relais, maintenant: u64) {
+    let purgees: Vec<EnAttente> = {
+        let mut table = relais.en_attente.lock().unwrap();
+        let cles: Vec<Vec<u8>> = table
+            .iter()
+            .filter(|(_, attente)| attente.expire_a <= maintenant)
+            .map(|(cle, _)| cle.clone())
+            .collect();
+        cles.into_iter()
+            .filter_map(|cle| table.remove(&cle))
+            .collect()
+    };
+    if !purgees.is_empty() {
+        relais.metriques.purger_attentes(purgees.len() as u64);
+    }
+    // `drop(purgees)` : fermeture des sockets et restitution des places IP.
 }
 
 /// Lit la trame d'annonce (`[u32 BE len][ticket]`), **vérifie le ticket**
@@ -380,6 +455,11 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
         return Err(io::Error::other("quota de connexions par IP atteint"));
     };
 
+    // L'annonce est bornée dans le temps : une connexion muette (ou qui
+    // égrène son ticket octet par octet) est fermée au bout du délai, sa
+    // place de quota IP rendue.
+    stream.set_read_timeout(Some(DELAI_ANNONCE))?;
+    stream.set_write_timeout(Some(DELAI_ANNONCE))?;
     let ticket = match lire_ticket(&mut stream) {
         Ok(ticket) => ticket,
         Err(erreur) => {
@@ -388,14 +468,26 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
         }
     };
     // Seuls les tickets signés par l'autorité et non expirés entrent.
-    if let Err(refus) = TicketRelais::verifier(&ticket, &relais.cle_autorite, maintenant_unix()) {
-        relais.metriques.rejeter_ticket();
-        let _ = stream.shutdown(Shutdown::Both);
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            refus.to_string(),
-        ));
-    }
+    let ticket_verifie =
+        match TicketRelais::verifier(&ticket, &relais.cle_autorite, maintenant_unix()) {
+            Ok(ticket_verifie) => ticket_verifie,
+            Err(refus) => {
+                relais.metriques.rejeter_ticket();
+                let _ = stream.shutdown(Shutdown::Both);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    refus.to_string(),
+                ));
+            }
+        };
+    // Annonce valide : le délai d'E/S est levé — le pair peut attendre son
+    // homologue, puis la paire relayer une session longue et silencieuse.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+
+    // Les attentes dont le ticket a expiré ne serviront plus jamais : purge
+    // (leur socket est fermée, leur place IP rendue).
+    purger_attentes_expirees(relais, maintenant_unix());
 
     // Section critique courte : retire le pair en attente ou dépose la
     // connexion. La réservation de quota se fait sous le même verrou, afin que
@@ -412,6 +504,7 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
                         premier,
                         EnAttente {
                             stream,
+                            expire_a: ticket_verifie.expire_le,
                             _garde: garde,
                         },
                     ))
@@ -430,6 +523,7 @@ fn apparier(mut stream: TcpStream, relais: &Relais) -> io::Result<()> {
                     ticket,
                     EnAttente {
                         stream,
+                        expire_a: ticket_verifie.expire_le,
                         _garde: garde,
                     },
                 );
@@ -903,6 +997,53 @@ mod tests {
         let instantane = relais.metriques.snapshot();
         assert_eq!(instantane.octets_relayes, 8, "octets sous quota seulement");
         assert_eq!(instantane.paires_servies, 1);
+    }
+
+    #[test]
+    fn pair_en_attente_purge_apres_expiration_du_ticket() {
+        let (adresse, relais, autorite) = demarrer_relais_configure(ConfigRelais::default());
+
+        // Un pair annonce un ticket qui expire dans une seconde ; son
+        // homologue n'arrivera jamais.
+        let ticket_court = autorite
+            .emettre_ticket_relais(21, 22, maintenant_unix() + 1)
+            .to_bytes();
+        let mut abandonne = annoncer(adresse, &ticket_court);
+        attendre_ticket_en_attente(&relais, &ticket_court);
+
+        // L'échéance passe, puis une annonce valide déclenche la purge inline.
+        thread::sleep(Duration::from_millis(1_600));
+        let ticket_frais = ticket_signe(&autorite, 23, 24);
+        let _premier_frais = annoncer(adresse, &ticket_frais);
+        attendre_ticket_en_attente(&relais, &ticket_frais);
+
+        // L'attente expirée a été retirée, comptée, et sa connexion fermée
+        // (sans jamais avoir relayé le moindre octet).
+        assert!(!relais
+            .en_attente
+            .lock()
+            .unwrap()
+            .contains_key(&ticket_court));
+        assert_eq!(relais.metriques.snapshot().attentes_purgees, 1);
+        verifier_refus(&mut abandonne);
+
+        // Rejouer le ticket expiré est refusé à l'annonce (pas de re-dépôt).
+        let mut rejoue = annoncer(adresse, &ticket_court);
+        verifier_refus(&mut rejoue);
+        assert_eq!(relais.metriques.snapshot().tickets_rejetes, 1);
+        assert!(!relais
+            .en_attente
+            .lock()
+            .unwrap()
+            .contains_key(&ticket_court));
+
+        // Le pair frais, lui, est toujours en attente et sera bien servi.
+        let mut second_frais = annoncer(adresse, &ticket_frais);
+        let mut premier_frais = _premier_frais;
+        premier_frais
+            .write_all(b"toujours apparie")
+            .expect("envoi du pair frais");
+        verifier_reception(&mut second_frais, b"toujours apparie");
     }
 
     #[test]

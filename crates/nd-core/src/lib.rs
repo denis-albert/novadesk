@@ -9,17 +9,19 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nd_capture::{enumerate_monitors, CaptureConfig, CapturedFrame, ScreenCapturer};
+use nd_capture::{
+    enumerate_monitors, CaptureConfig, CapturedFrame, FrameImage, PixelFormat, Rect, ScreenCapturer,
+};
 use nd_codec::{
     CodecKind, ContentProfile, DecodedFrame, EncodedChunk, EncoderConfig, NetworkEstimate,
     RateController, VideoDecoder, VideoEncoder,
 };
 use nd_crypto::{HandshakeRole, NoiseHandshake, NoiseSession, PeerFingerprint, SecureSession};
-use nd_features::{Mp4Muxer, Permissions, RecordingMetadata};
+use nd_features::{Mp4Muxer, Permissions, PrivacyState, RecordingMetadata};
 use nd_input::{InputInjector, MouseButton};
 use nd_proto::{
     ChannelKind, InputEvent, MonitorId, NdError, NovaId, ProtocolVersion, Reliability, Result,
@@ -33,14 +35,97 @@ mod media;
 mod p2p;
 /// Orchestrateur de session réutilisable (threads + canaux). Voir [`SessionEngine`].
 mod session;
+/// Tunnel TCP de session (redirection de port relayée). Voir [`tunnel`].
+mod tunnel;
 /// Service hôte « accès non surveillé ». Voir [`UnattendedHost`].
 mod unattended;
 
 pub use media::ChatMessage;
 pub use session::{
-    SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions, SessionStats,
+    raccourcis_hote_defaut, SessionEndpoint, SessionEngine, SessionHandle, SessionMedia,
+    SessionOptions, SessionStats,
 };
+pub use tunnel::TunnelHandle;
 pub use unattended::{UnattendedHost, UnattendedHostHandle};
+
+/// Région d'écran partagée (« cadre d'écran »), mutable en cours de session et
+/// observée par la boucle de diffusion hôte pour appliquer
+/// [`ScreenCapturer::set_region`]. `None` = plein écran.
+pub type RegionPartagee = Arc<Mutex<Option<Rect>>>;
+
+/// Un écran de l'hôte, tel que **publié au contrôleur** sur le plan de contrôle
+/// (plan de contrôle de session, capacité « liste des moniteurs »). Miroir plat
+/// et transportable de [`nd_capture::MonitorInfo`] réduit aux champs utiles à
+/// l'UI (l'index est celui qu'attend [`SessionHandle::switch_monitor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteMonitor {
+    /// Index du moniteur (= `MonitorId`, argument de la bascule multi-écran).
+    pub index: u32,
+    /// Largeur en pixels.
+    pub width: u32,
+    /// Hauteur en pixels.
+    pub height: u32,
+    /// Vrai pour le moniteur principal.
+    pub primary: bool,
+}
+
+/// Informations système du **pair**, publiées par l'hôte sur le plan de
+/// contrôle (capacité « infos système du pair »).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    /// Nom d'hôte de la machine distante.
+    pub host: String,
+    /// Système d'exploitation (chaîne libre, ex. « windows (x86_64) »).
+    pub os: String,
+}
+
+/// Préréglage de qualité **partagé** avec la boucle de diffusion hôte : le
+/// contrôleur (ou l'hôte) le renégocie en cours de session (capacité
+/// « préréglage de qualité »). La boucle observe la `generation` — incrémentée à
+/// chaque changement — pour reconfigurer l'encodeur et l'échelle ABR au vol,
+/// **sous** le plafond de débit (l'ABR continue de dégrader à partir du plafond,
+/// jamais au-dessus).
+#[derive(Debug, Default)]
+pub struct EtatQualite {
+    /// Profil ABR : `true` = [`ContentProfile::Video`] (fluidité — dégrade la
+    /// résolution d'abord), `false` = [`ContentProfile::Text`] (netteté —
+    /// dégrade la cadence d'abord).
+    pub profil_video: AtomicBool,
+    /// Plafond de débit en kbit/s appliqué à l'encodeur ; `0` = aucun plafond
+    /// (débit de base par défaut du pipeline).
+    pub plafond_kbps: AtomicU32,
+    /// Génération, incrémentée à chaque renégociation : la boucle de diffusion
+    /// détecte le changement en la comparant à sa dernière valeur observée.
+    pub generation: AtomicU64,
+}
+
+impl EtatQualite {
+    /// Profil de contenu ABR effectif d'après le drapeau [`Self::profil_video`].
+    #[must_use]
+    pub fn profil(&self) -> ContentProfile {
+        if self.profil_video.load(Ordering::Relaxed) {
+            ContentProfile::Video
+        } else {
+            ContentProfile::Text
+        }
+    }
+}
+
+/// Demande d'**enregistrement à chaud** partagée avec la boucle de diffusion
+/// hôte : `generation` passe à ≥ 1 dès le premier ordre (`set_recording`), et
+/// `chemin` porte alors le fichier MP4 voulu (`None` = arrêter proprement).
+/// Tant que `generation` vaut `0`, la boucle garde le comportement historique
+/// (enregistrement statique de [`HostStreamOptions::recording`]).
+pub type EnregistrementPartage = Arc<EtatEnregistrement>;
+
+/// Contenu partagé d'un [`EnregistrementPartage`] (voir sa documentation).
+#[derive(Debug, Default)]
+pub struct EtatEnregistrement {
+    /// Génération, incrémentée à chaque `set_recording` (`0` = jamais commandé).
+    pub generation: AtomicU64,
+    /// Chemin MP4 voulu au dernier ordre (`None` = arrêter l'enregistrement).
+    pub chemin: Mutex<Option<PathBuf>>,
+}
 
 /// Rôle du poste local dans la session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,11 +439,24 @@ impl HostPipeline {
         let mut prochain_abr = Instant::now();
         let mut debit_cible_kbps = 0u32;
         let mut envoyees = 0u64;
+        // Configuration d'encodage retenue (dimensions/débit de base) : mémorisée
+        // pour (r)ouvrir un enregistrement à chaud après coup.
+        let mut config_base: Option<EncoderConfig> = None;
+        // Enregistrement à chaud : chemin du muxeur actuellement ouvert (`None` =
+        // aucun), images des muxeurs déjà clos (cumul pour l'observabilité), et
+        // dernière génération de préréglage de qualité observée.
+        let mut enr_chemin_ouvert: Option<PathBuf> = None;
+        let mut frames_enr_cumul = 0u64;
+        let mut generation_qualite = 0u64;
         // Bascule multi-écran : moniteur diffusé et resynchronisation (image-clé)
         // forcée après un changement de moniteur (résolution potentiellement
         // différente → décodeur à recaler).
         let mut moniteur_courant = 0u32;
         let mut resync_moniteur = false;
+        // Cadre d'écran courant (dernière région appliquée à la capture) et état
+        // de confidentialité précédent (détection de bascule pour l'image-clé).
+        let mut region_courante: Option<Rect> = None;
+        let mut confidentiel_precedent = false;
 
         while !stop.load(Ordering::Relaxed) {
             // Bascule moniteur demandée par le contrôleur : re-cible la capture
@@ -376,6 +474,36 @@ impl HostPipeline {
                 }
             }
 
+            // Cadre d'écran demandé par le contrôleur : restreint la zone
+            // partagée au vol (best-effort). Un backend qui ne sait pas
+            // restreindre **rejette** la demande (retour au cadre courant) —
+            // jamais de fuite silencieuse de la zone hors-cadre.
+            if let Some(demande) = &options.region_switch {
+                let voulue = *demande.lock().expect("verrou du cadre d'écran");
+                if voulue != region_courante {
+                    if self.capturer.set_region(voulue).is_ok() {
+                        region_courante = voulue;
+                        self.configured = false; // dimensions changées → reconfigurer
+                        resync_moniteur = true; // image-clé de resynchronisation
+                    } else {
+                        *demande.lock().expect("verrou du cadre d'écran") = region_courante;
+                    }
+                }
+            }
+
+            // Préréglage de qualité renégocié (profil ABR + plafond de débit) :
+            // reconfigure l'encodeur et reconstruit l'échelle ABR **sous** le
+            // nouveau plafond (voir la reconfiguration ci-dessous), avec une
+            // image-clé de resynchronisation pour une transition nette.
+            if let Some(qualite) = &options.quality {
+                let generation = qualite.generation.load(Ordering::Relaxed);
+                if generation != generation_qualite {
+                    generation_qualite = generation;
+                    self.configured = false;
+                    resync_moniteur = true;
+                }
+            }
+
             let capturee = self.capturer.next_frame()?;
             let image_fraiche = capturee.image.is_some();
             if image_fraiche && !self.configured {
@@ -383,26 +511,41 @@ impl HostPipeline {
                     kind: CodecKind::H264,
                     width: capturee.width,
                     height: capturee.height,
-                    target_bitrate_kbps: 8_000,
+                    // Débit de base du palier 0 de l'ABR, **plafonné** par le
+                    // préréglage de qualité s'il en fixe un : l'échelle dégrade
+                    // ensuite à partir de ce plafond, jamais au-dessus.
+                    target_bitrate_kbps: debit_base_kbps(&options),
                     max_fps: 60,
                 };
                 self.encoder.configure(base)?;
+                config_base = Some(base);
                 debit_cible_kbps = base.target_bitrate_kbps;
-                regulateur = options
-                    .abr_profile
-                    .map(|profil| RateController::new(base, profil));
-                // L'enregistreur n'est ouvert qu'une fois : une bascule moniteur
-                // (qui remet `configured` à faux) ne doit pas ré-ouvrir le MP4.
-                if enregistreur.is_none() {
-                    if let Some(chemin) = &options.recording {
-                        enregistreur = Some(EnregistreurMp4::ouvrir(chemin, base)?);
-                    }
-                }
+                // Le préréglage de qualité prime sur le profil ABR statique.
+                regulateur =
+                    profil_abr_effectif(&options).map(|profil| RateController::new(base, profil));
                 self.configured = true;
             }
             if !self.configured {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
+            }
+
+            // Enregistrement (statique au démarrage puis piloté à chaud) : ouvre
+            // ou **clôt proprement** (fichier relisible) le muxeur MP4 selon le
+            // chemin voulu. Un muxeur clos ne se rouvre pas — un nouveau chemin
+            // ouvre donc un nouveau fichier ; l'ouverture attend la configuration
+            // (dimensions connues). Une bascule moniteur/qualité (qui remet
+            // `configured` à faux) laisse le chemin inchangé : le muxeur perdure.
+            let enr_voulu = enregistrement_voulu(&options);
+            if enr_voulu != enr_chemin_ouvert {
+                if let Some(enregistreur) = enregistreur.take() {
+                    let (frames, _chemin) = enregistreur.clore()?;
+                    frames_enr_cumul += frames;
+                }
+                if let (Some(chemin), Some(base)) = (enr_voulu.as_ref(), config_base.as_ref()) {
+                    enregistreur = Some(EnregistreurMp4::ouvrir(chemin, *base)?);
+                }
+                enr_chemin_ouvert = enr_voulu;
             }
 
             // Régulation ABR : échantillonnage périodique du chemin réseau.
@@ -425,12 +568,30 @@ impl HostPipeline {
                 }
             }
 
+            // Mode confidentialité : quand le rideau est levé, l'écran réel
+            // n'est **jamais** encodé — un cadre noir opaque part à la place. La
+            // bascule (dans un sens comme dans l'autre) force une image-clé pour
+            // une transition nette côté contrôleur.
+            let confidentiel = options
+                .privacy
+                .as_ref()
+                .is_some_and(|drapeau| drapeau.load(Ordering::Relaxed));
+            let bascule_confidentialite = confidentiel != confidentiel_precedent;
+            confidentiel_precedent = confidentiel;
+
             // Encodage : en mode delta, la frame capturée passe telle quelle
             // (`dirty` fidèle exigé ; image absente = trame de répétition) ; en
             // mode plein cadre, la dernière image disponible est ré-encodée.
-            let force_keyframe = self.sent == 0 || resync_moniteur;
+            let force_keyframe = self.sent == 0 || resync_moniteur || bascule_confidentialite;
             resync_moniteur = false;
-            let chunk = if options.delta_mode {
+            let chunk = if confidentiel {
+                // Rideau : cadre noir aux dimensions courantes (jamais l'écran réel).
+                let (largeur, hauteur) = self.dimensions_diffusion(&capturee);
+                let noire = frame_noire(largeur, hauteur, capturee.timestamp_us);
+                let chunk = self.encoder.encode(&noire, force_keyframe)?;
+                self.last_frame = Some(noire);
+                chunk
+            } else if options.delta_mode {
                 let chunk = self.encoder.encode(&capturee, force_keyframe)?;
                 if image_fraiche {
                     self.last_frame = Some(capturee);
@@ -470,20 +631,69 @@ impl HostPipeline {
                 abr_level: regulateur
                     .as_ref()
                     .map_or(0, |r| u32::try_from(r.palier()).unwrap_or(u32::MAX)),
-                frames_recorded: enregistreur.as_ref().map_or(0, |e| e.frames),
+                // Cumul des muxeurs déjà clos (enregistrement à chaud) + muxeur courant.
+                frames_recorded: frames_enr_cumul + enregistreur.as_ref().map_or(0, |e| e.frames),
             });
             std::thread::sleep(Duration::from_millis(12));
         }
 
-        let (frames_enregistrees, chemin_clos) = match enregistreur {
+        let (frames_dernier, chemin_clos) = match enregistreur {
             Some(enregistreur) => enregistreur.clore()?,
             None => (0, None),
         };
         Ok(HostStreamReport {
             frames_sent: envoyees,
-            frames_recorded: frames_enregistrees,
+            frames_recorded: frames_enr_cumul + frames_dernier,
             recording_path: chemin_clos,
         })
+    }
+
+    /// Dimensions du cadre à diffuser : celles de la frame fraîchement capturée
+    /// si elle porte une image, sinon celles de la dernière image connue (le
+    /// cadre noir de confidentialité reprend la taille de l'écran partagé).
+    fn dimensions_diffusion(&self, capturee: &CapturedFrame) -> (u32, u32) {
+        if capturee.image.is_some() {
+            (capturee.width, capturee.height)
+        } else if let Some(precedente) = &self.last_frame {
+            (precedente.width, precedente.height)
+        } else {
+            (capturee.width, capturee.height)
+        }
+    }
+}
+
+/// Construit un **cadre noir opaque** aux dimensions données, à diffuser à la
+/// place de l'écran réel pendant le mode confidentialité. Les pixels
+/// proviennent de [`PrivacyState::render_screen_cache`] (volet du rideau
+/// réalisable sans droits administrateur) ; le tampon étant uniformément noir,
+/// l'ordre des canaux est indifférent (on l'étiquette [`PixelFormat::Bgra8`],
+/// comme la capture Windows).
+fn frame_noire(largeur: u32, hauteur: u32, timestamp_us: u64) -> CapturedFrame {
+    let rideau = PrivacyState {
+        black_screen: true,
+        block_local_input: false,
+        disable_wallpaper: false,
+    };
+    let pixels = rideau
+        .render_screen_cache(largeur, hauteur)
+        .map_or_else(Vec::new, |cache| cache.pixels().to_vec());
+    CapturedFrame {
+        width: largeur,
+        height: hauteur,
+        monitor: MonitorId(0),
+        format: PixelFormat::Bgra8,
+        dirty: vec![Rect {
+            x: 0,
+            y: 0,
+            w: largeur,
+            h: hauteur,
+        }],
+        cursor: None,
+        timestamp_us,
+        image: Some(FrameImage::Cpu {
+            data: pixels,
+            stride: largeur as usize * 4,
+        }),
     }
 }
 
@@ -508,6 +718,49 @@ fn appliquer_bascule_moniteur(capturer: &mut dyn ScreenCapturer, index: u32) -> 
             capture_cursor: false,
         })
         .is_ok()
+}
+
+/// Débit de base par défaut (palier 0 de l'ABR) sans plafond de qualité, kbit/s.
+const DEBIT_BASE_PAR_DEFAUT_KBPS: u32 = 8_000;
+
+/// Profil ABR effectif de la boucle de diffusion : le préréglage de qualité
+/// partagé ([`HostStreamOptions::quality`]) **prime** sur le profil statique des
+/// options ; à défaut, le profil statique est conservé.
+fn profil_abr_effectif(options: &HostStreamOptions) -> Option<ContentProfile> {
+    match &options.quality {
+        Some(qualite) => Some(qualite.profil()),
+        None => options.abr_profile,
+    }
+}
+
+/// Débit de base (kbit/s) du palier 0 de l'échelle ABR : **plafonné** par le
+/// préréglage de qualité s'il en fixe un (> 0), sinon le plein régime. L'échelle
+/// dégrade ensuite à partir de ce plafond, jamais au-dessus.
+fn debit_base_kbps(options: &HostStreamOptions) -> u32 {
+    let plafond = options
+        .quality
+        .as_ref()
+        .map_or(0, |qualite| qualite.plafond_kbps.load(Ordering::Relaxed));
+    if plafond == 0 {
+        DEBIT_BASE_PAR_DEFAUT_KBPS
+    } else {
+        plafond.min(DEBIT_BASE_PAR_DEFAUT_KBPS)
+    }
+}
+
+/// Chemin d'enregistrement voulu : le pilotage **à chaud** ([`SessionHandle`] →
+/// `set_recording`, matérialisé par [`HostStreamOptions::recording_switch`])
+/// prime dès son premier ordre (génération ≥ 1) ; sinon l'enregistrement
+/// statique d'[`HostStreamOptions::recording`] (comportement historique).
+fn enregistrement_voulu(options: &HostStreamOptions) -> Option<PathBuf> {
+    match &options.recording_switch {
+        Some(commande) if commande.generation.load(Ordering::Relaxed) > 0 => commande
+            .chemin
+            .lock()
+            .expect("verrou d'enregistrement à chaud")
+            .clone(),
+        _ => options.recording.clone(),
+    }
 }
 
 /// Options du flux hôte piloté ([`HostPipeline::run_streaming_pilote`]).
@@ -539,11 +792,35 @@ pub struct HostStreamOptions {
     /// change, le flux re-cible la capture au vol (best-effort : dépend du
     /// nombre de moniteurs réels).
     pub monitor_switch: Option<Arc<AtomicU32>>,
+    /// **Mode confidentialité** (rideau) partagé avec le récepteur : quand le
+    /// drapeau est levé, la boucle **cesse d'encoder l'écran réel** et diffuse
+    /// un cadre noir opaque (rendu via [`PrivacyState::render_screen_cache`]) —
+    /// une image-clé est forcée à chaque bascule pour une transition nette.
+    /// `None` = fonction inactive (comportement historique).
+    pub privacy: Option<Arc<AtomicBool>>,
+    /// **Région / cadre d'écran** partagée : quand la valeur change, la boucle
+    /// applique [`ScreenCapturer::set_region`] au vol (best-effort — un backend
+    /// qui ne sait pas restreindre **rejette** la demande sans jamais laisser
+    /// fuir la zone hors-cadre). `None` = plein écran (pas de restriction).
+    pub region_switch: Option<RegionPartagee>,
+    /// **Préréglage de qualité** partagé (profil ABR + plafond de débit) : quand
+    /// sa `generation` change, la boucle reconfigure l'encodeur et reconstruit
+    /// l'échelle ABR sous le nouveau plafond (image-clé de resynchro forcée).
+    /// `None` = qualité fixe issue d'[`Self::abr_profile`] (comportement
+    /// historique).
+    pub quality: Option<Arc<EtatQualite>>,
+    /// **Enregistrement à chaud** partagé : quand sa `generation` passe à ≥ 1, la
+    /// boucle ouvre (ou ferme proprement) le muxeur MP4 selon son `chemin`,
+    /// **au lieu** de l'enregistrement statique d'[`Self::recording`]. `None` =
+    /// pas de pilotage à chaud (seul [`Self::recording`] agit, comme avant).
+    pub recording_switch: Option<EnregistrementPartage>,
 }
 
 impl Default for HostStreamOptions {
     /// ABR actif (profil bureautique [`ContentProfile::Text`], ~1 Hz), delta
-    /// coupé, pas d'enregistrement, vidéo en datagrammes+FEC, pas de bascule.
+    /// coupé, pas d'enregistrement, vidéo en datagrammes+FEC, pas de bascule,
+    /// ni confidentialité, ni restriction de région, ni pilotage de qualité ou
+    /// d'enregistrement à chaud.
     fn default() -> Self {
         HostStreamOptions {
             abr_profile: Some(ContentProfile::Text),
@@ -552,6 +829,10 @@ impl Default for HostStreamOptions {
             recording: None,
             video_reliability: Reliability::UnreliableFec,
             monitor_switch: None,
+            privacy: None,
+            region_switch: None,
+            quality: None,
+            recording_switch: None,
         }
     }
 }
@@ -893,5 +1174,202 @@ mod tests {
         let mut s = Session::new(cfg(SessionRole::Controlled, None));
         s.close();
         assert_eq!(s.state(), SessionState::Closed);
+    }
+}
+
+/// Preuve **déterministe** (sans matériel) du mode confidentialité et du cadre
+/// d'écran dans la boucle de diffusion hôte : un capteur factice à motif clair,
+/// un transport collecteur, l'encodeur/décodeur **logiciels** réels. On décode
+/// ce qui part sur le fil et on vérifie le contenu (noir sous rideau, clair
+/// sinon) et les dimensions (rognées au cadre demandé).
+#[cfg(test)]
+mod tests_diffusion_avancee {
+    use super::*;
+    use nd_capture::{CaptureEvent, CapturedFrame};
+    use nd_codec::{create_decoder, create_encoder};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    /// Capteur factice : rend des frames au **motif clair uniforme** (240),
+    /// éventuellement rognées à la région active ; journalise les régions vues.
+    struct CapteurFactice {
+        largeur: u32,
+        hauteur: u32,
+        region: Option<Rect>,
+        regions_vues: Arc<Mutex<Vec<Option<Rect>>>>,
+    }
+
+    impl ScreenCapturer for CapteurFactice {
+        fn start(&mut self, _cfg: CaptureConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<CapturedFrame> {
+            let (w, h) = self
+                .region
+                .map_or((self.largeur, self.hauteur), |r| (r.w, r.h));
+            let data = vec![240u8; (w * h * 4) as usize];
+            Ok(CapturedFrame {
+                width: w,
+                height: h,
+                monitor: MonitorId(0),
+                format: PixelFormat::Bgra8,
+                dirty: vec![Rect { x: 0, y: 0, w, h }],
+                cursor: None,
+                timestamp_us: 0,
+                image: Some(FrameImage::Cpu {
+                    data,
+                    stride: (w * 4) as usize,
+                }),
+            })
+        }
+
+        fn poll_event(&mut self) -> Option<CaptureEvent> {
+            None
+        }
+
+        fn stop(&mut self) {}
+
+        fn set_region(&mut self, region: Option<Rect>) -> Result<()> {
+            self.region = region;
+            self.regions_vues
+                .lock()
+                .expect("verrou régions")
+                .push(region);
+            Ok(())
+        }
+    }
+
+    /// Transport collecteur : mémorise les charges vidéo émises, ne reçoit rien.
+    struct TransportCollecteur {
+        envoyes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Transport for TransportCollecteur {
+        fn open_channel(&mut self, _kind: ChannelKind) -> ChannelHandle {
+            ChannelHandle(0)
+        }
+
+        fn send(&mut self, _ch: ChannelHandle, data: Vec<u8>, _r: Reliability) -> Result<()> {
+            self.envoyes.lock().expect("verrou envoyés").push(data);
+            Ok(())
+        }
+
+        fn poll_recv(&mut self) -> Result<Option<(ChannelHandle, Vec<u8>)>> {
+            Ok(None)
+        }
+
+        fn path_estimate(&self) -> PathEstimate {
+            PathEstimate::default()
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    /// Fait tourner la boucle de diffusion ~250 ms avec le capteur factice et
+    /// rend `(charges vidéo émises, régions demandées à la capture)`.
+    fn diffuser(
+        privacy: Option<Arc<AtomicBool>>,
+        region_switch: Option<RegionPartagee>,
+    ) -> (Vec<Vec<u8>>, Vec<Option<Rect>>) {
+        let regions_vues = Arc::new(Mutex::new(Vec::new()));
+        let envoyes = Arc::new(Mutex::new(Vec::new()));
+        let capteur = Box::new(CapteurFactice {
+            largeur: 64,
+            hauteur: 64,
+            region: None,
+            regions_vues: Arc::clone(&regions_vues),
+        });
+        let encodeur = create_encoder(CodecKind::H264).expect("encodeur logiciel");
+        let transport = Box::new(TransportCollecteur {
+            envoyes: Arc::clone(&envoyes),
+        });
+        let mut hote = HostPipeline::new(capteur, encodeur, transport).expect("pipeline");
+        let options = HostStreamOptions {
+            abr_profile: None,
+            privacy,
+            region_switch,
+            ..HostStreamOptions::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_boucle = Arc::clone(&stop);
+        let jh = std::thread::spawn(move || {
+            let _ = hote.run_streaming_pilote(stop_boucle, options, |_tick| {});
+        });
+        std::thread::sleep(Duration::from_millis(250));
+        stop.store(true, Ordering::Relaxed);
+        jh.join().expect("thread de diffusion");
+        let envoyes = envoyes.lock().expect("verrou envoyés").clone();
+        let regions = regions_vues.lock().expect("verrou régions").clone();
+        (envoyes, regions)
+    }
+
+    /// Décode les charges collectées et rend `(dernière frame, rouge moyen)`.
+    fn decoder(charges: &[Vec<u8>]) -> Option<(DecodedFrame, u32)> {
+        let mut decodeur = create_decoder(CodecKind::H264).expect("décodeur logiciel");
+        let mut derniere = None;
+        for data in charges {
+            let chunk = EncodedChunk {
+                data: data.clone(),
+                is_keyframe: false,
+                monitor: MonitorId(0),
+                timestamp_us: 0,
+            };
+            if let Ok(Some(frame)) = decodeur.decode(&chunk) {
+                derniere = Some(frame);
+            }
+        }
+        derniere.map(|frame| {
+            let somme: u32 = frame.rgba.chunks_exact(4).map(|p| u32::from(p[0])).sum();
+            let moyenne = somme / (frame.rgba.len() / 4).max(1) as u32;
+            (frame, moyenne)
+        })
+    }
+
+    #[test]
+    fn confidentialite_diffuse_un_cadre_noir() {
+        let privacy = Arc::new(AtomicBool::new(true)); // rideau dès le départ
+        let (charges, _regions) = diffuser(Some(privacy), None);
+        assert!(!charges.is_empty(), "des cadres doivent être émis");
+        let (frame, rouge_moyen) = decoder(&charges).expect("au moins un cadre décodé");
+        // Le motif capté est clair (240) ; sous rideau, le décodé est noir.
+        assert!(
+            rouge_moyen < 64,
+            "cadre attendu noir sous confidentialité (rouge moyen = {rouge_moyen})"
+        );
+        assert_eq!((frame.width, frame.height), (64, 64));
+    }
+
+    #[test]
+    fn cadre_ecran_restreint_la_zone_et_laisse_passer_l_ecran() {
+        // Confidentialité coupée : l'écran réel (clair) doit passer, rogné au cadre.
+        let region: RegionPartagee = Arc::new(Mutex::new(Some(Rect {
+            x: 16,
+            y: 8,
+            w: 32,
+            h: 32,
+        })));
+        let (charges, regions) = diffuser(None, Some(Arc::clone(&region)));
+        assert!(
+            regions.contains(&Some(Rect {
+                x: 16,
+                y: 8,
+                w: 32,
+                h: 32
+            })),
+            "la capture doit avoir reçu le cadre d'écran demandé : {regions:?}"
+        );
+        let (frame, rouge_moyen) = decoder(&charges).expect("au moins un cadre décodé");
+        assert_eq!(
+            (frame.width, frame.height),
+            (32, 32),
+            "les cadres diffusés doivent être rognés à la sous-région"
+        );
+        assert!(
+            rouge_moyen > 160,
+            "hors confidentialité, l'écran réel (clair) doit passer (rouge moyen = {rouge_moyen})"
+        );
     }
 }

@@ -73,6 +73,10 @@ const CONTEXTE_ENREGISTREMENT: &[u8] = b"novadesk-rendezvous-enregistrement-v1";
 /// Tolérance par défaut sur l'horodatage d'un enregistrement (anti-rejeu).
 pub const TOLERANCE_HORODATAGE_DEFAUT: Duration = Duration::from_secs(300);
 
+/// Délai d'E/S par connexion cliente (une trame, une réponse) : une connexion
+/// muette ou au goutte-à-goutte ne retient ni thread ni socket indéfiniment.
+const DELAI_ECHANGE: Duration = Duration::from_secs(30);
+
 /// Configuration de la façade d'authentification.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigRendezvous {
@@ -112,6 +116,9 @@ impl ConfigRendezvous {
 /// ID enregistré ou déposer des candidats de punch à sa place ; l'épinglage
 /// de certificat de la couche transport borne l'impact à du dérangement.
 ///
+/// Chaque connexion cliente est bornée par un délai d'E/S ([`DELAI_ECHANGE`]) :
+/// un client muet ne retient ni thread ni socket indéfiniment.
+///
 /// # Errors
 /// Renvoie une erreur si la mise en place du moteur interne ou l'acceptation
 /// d'une connexion échoue.
@@ -138,11 +145,14 @@ pub fn servir_authentifie(
 }
 
 /// Traite une connexion cliente : une trame, un filtrage, une réponse.
+/// L'échange complet est borné par [`DELAI_ECHANGE`] côté lecture et écriture.
 fn traiter_connexion(
     mut client: TcpStream,
     adresse_moteur: SocketAddr,
     config: &ConfigRendezvous,
 ) -> io::Result<()> {
+    client.set_read_timeout(Some(DELAI_ECHANGE))?;
+    client.set_write_timeout(Some(DELAI_ECHANGE))?;
     let trame = lire_trame(&mut client)?;
     match trame.first().copied() {
         // Enregistrement nu : refusé, l'ID doit être prouvé.

@@ -20,15 +20,17 @@
 //! * Les conversions vers/depuis les types internes (`nd_core`, `nd_proto`,
 //!   `nd_features`) vivent ici : l'UI ne manipule jamais les types internes.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use nd_codec::DecodedFrame;
 use nd_core::{
-    ChatMessage, SessionConfig, SessionOptions, SessionRole, SessionState, SessionStats,
+    ChatMessage, PeerInfo, RemoteMonitor, SessionConfig, SessionOptions, SessionRole, SessionState,
+    SessionStats,
 };
-use nd_features::{PermissionSet, Permissions};
+use nd_features::{AnnotationLayer, MacAddr, PermissionSet, Permissions, Stroke};
 use nd_files::TransferEvent;
-use nd_proto::{InputEvent, NovaId};
+use nd_proto::{InputEvent, NdError, NovaId};
 use serde::{Deserialize, Serialize};
 
 use crate::frb_generated::StreamSink;
@@ -1225,4 +1227,1043 @@ pub fn record_access(peer_id: u64, accepte: bool) -> Result<(), String> {
 /// Renvoie le journal des accès, du plus récent au plus ancien.
 pub fn access_log() -> Result<Vec<AccessLogEntryDto>, String> {
     crate::etat::magasin().journal_acces()
+}
+
+// ===========================================================================
+// Wake-on-LAN
+// ===========================================================================
+
+/// Réveille un appareil par **Wake-on-LAN** : construit le « paquet magique »
+/// pour l'adresse MAC `mac` et l'émet en UDP (voir `nd_features::send_wol`).
+///
+/// * `mac` : adresse MAC de la carte réseau cible, écrite avec `:` ou `-`
+///   (« 01:23:45:67:89:AB » ou « 01-23-45-67-89-ab », casse indifférente).
+/// * `broadcast` : cible « ip:port » du paquet ; `None` (ou chaîne vide) diffuse
+///   vers `255.255.255.255:9` — diffusion limitée au sous-réseau local, port
+///   « discard » (9) habituel du Wake-on-LAN.
+///
+/// Renvoie un message d'erreur **français clair** si la MAC est mal formée, si
+/// l'adresse de diffusion est invalide, ou si l'émission UDP échoue. Fonction
+/// **synchrone** à DTO plats (`String`, `Option<String>`).
+pub fn send_wol(mac: String, broadcast: Option<String>) -> Result<(), String> {
+    // Les messages de `MacAddr` sont déjà clairs et en français ; on retire le
+    // préfixe technique « protocole : » qu'ajoute l'affichage de `NdError`.
+    let adresse_mac: MacAddr = mac.parse().map_err(|e| match e {
+        NdError::Protocol(message) => message,
+        autre => autre.to_string(),
+    })?;
+
+    // Cible : « ip:port » fournie, sinon diffusion limitée sur le port discard.
+    let cible = match broadcast {
+        Some(texte) if !texte.trim().is_empty() => {
+            texte.trim().parse::<SocketAddr>().map_err(|e| {
+                format!("adresse de diffusion « {texte} » invalide (attendu « ip:port ») : {e}")
+            })?
+        }
+        _ => nd_features::limited_broadcast(nd_features::WOL_PORT_DISCARD),
+    };
+
+    nd_features::send_wol(adresse_mac, cible)
+        .map_err(|e| format!("envoi du Wake-on-LAN impossible : {e}"))
+}
+
+#[cfg(test)]
+mod tests_wol {
+    use super::*;
+    use std::net::{Ipv4Addr, UdpSocket};
+    use std::time::Duration;
+
+    #[test]
+    fn send_wol_refuse_une_mac_invalide() {
+        let erreur = send_wol("pas-une-mac".to_owned(), None).expect_err("MAC invalide refusée");
+        assert!(
+            erreur.contains("MAC"),
+            "message peu clair pour une MAC invalide : {erreur}"
+        );
+        // Le préfixe technique « protocole : » de `NdError` ne fuite pas à l'UI.
+        assert!(
+            !erreur.starts_with("protocole :"),
+            "préfixe technique non retiré : {erreur}"
+        );
+    }
+
+    #[test]
+    fn send_wol_refuse_une_adresse_de_diffusion_invalide() {
+        let erreur = send_wol(
+            "01:23:45:67:89:AB".to_owned(),
+            Some("pas-ip-port".to_owned()),
+        )
+        .expect_err("diffusion invalide refusée");
+        assert!(
+            erreur.contains("diffusion"),
+            "message peu clair pour une diffusion invalide : {erreur}"
+        );
+    }
+
+    #[test]
+    fn send_wol_emet_le_paquet_magique_vers_la_cible() {
+        // `wake_on_lan` ouvre le socket en SO_BROADCAST mais émet aussi bien vers
+        // une adresse unicast (loopback) : pas de diffusion réelle nécessaire.
+        let recepteur = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("socket récepteur");
+        recepteur
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("délai de lecture");
+        let cible = recepteur.local_addr().expect("adresse locale");
+
+        send_wol("de:ad:be:ef:00:42".to_owned(), Some(cible.to_string())).expect("émission WoL");
+
+        let mut tampon = [0u8; 128];
+        let (recus, _) = recepteur.recv_from(&mut tampon).expect("réception");
+        let attendu = nd_features::magic_packet([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x42]);
+        assert_eq!(&tampon[..recus], &attendu[..]);
+    }
+
+    #[test]
+    fn send_wol_accepte_le_format_a_tirets() {
+        // Format à tirets accepté par `MacAddr` ; émission vers un récepteur local.
+        let recepteur = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("socket récepteur");
+        recepteur
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("délai de lecture");
+        let cible = recepteur.local_addr().expect("adresse locale");
+
+        send_wol("01-23-45-67-89-ab".to_owned(), Some(cible.to_string()))
+            .expect("MAC à tirets acceptée");
+        let mut tampon = [0u8; 128];
+        let (recus, _) = recepteur.recv_from(&mut tampon).expect("réception");
+        let attendu = nd_features::magic_packet([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB]);
+        assert_eq!(&tampon[..recus], &attendu[..]);
+    }
+}
+
+// ===========================================================================
+// Capacités moteur avancées : confidentialité, cadre d'écran, tunnel TCP,
+// annotations / tableau blanc, relecture d'enregistrement
+// ===========================================================================
+//
+// Ces fonctions mettent à portée du Dart des capacités **déjà implémentées** —
+// dans le moteur ([`nd_core::SessionHandle`]) pour les quatre premières, dans
+// [`nd_features`]/[`nd_codec`] pour la relecture — jusqu'ici inatteignables
+// depuis l'UI. Comme les autres fonctions `session_*`, celles qui pilotent une
+// session prennent son identifiant opaque en premier argument ; elles restent
+// inertes hors mode étendu ou permission absente (mais renvoient `Ok` tant que
+// la session existe), à l'exception du tunnel qui lie un écouteur réel.
+
+// ---------------------------------------------------------------------------
+// 1. Mode confidentialité
+// ---------------------------------------------------------------------------
+
+/// Active (ou lève) le **mode confidentialité** de la session : côté contrôleur,
+/// une demande est transmise à l'hôte qui — s'il détient la capacité — cesse de
+/// diffuser son écran réel (cadre noir) ; côté hôte, le rideau est appliqué
+/// directement. L'état effectif se lit via [`privacy_active`]. Sans effet hors
+/// mode étendu ([`SessionOptionsDto::extended_features`]).
+pub fn set_privacy(session_id: u64, actif: bool) -> Result<(), String> {
+    crate::flux::definir_confidentialite(session_id, actif)
+}
+
+/// État du mode confidentialité **connu localement** : côté contrôleur, le
+/// dernier drapeau annoncé par l'hôte (l'indicateur « rideau actif » à
+/// afficher) ; côté hôte, le rideau qu'il applique.
+pub fn privacy_active(session_id: u64) -> Result<bool, String> {
+    crate::flux::confidentialite_active(session_id)
+}
+
+// ---------------------------------------------------------------------------
+// 2. Cadre d'écran (région)
+// ---------------------------------------------------------------------------
+
+/// Zone rectangulaire d'écran à partager (« cadre d'écran »), en **pixels du
+/// moniteur** de l'hôte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionDto {
+    /// Abscisse du coin supérieur gauche.
+    pub x: u32,
+    /// Ordonnée du coin supérieur gauche.
+    pub y: u32,
+    /// Largeur de la zone, en pixels.
+    pub largeur: u32,
+    /// Hauteur de la zone, en pixels.
+    pub hauteur: u32,
+}
+
+/// Restreint la zone d'écran partagée au `RegionDto` fourni, ou **rétablit le
+/// plein écran** avec `None`. Côté contrôleur, la demande est transmise à
+/// l'hôte, qui l'applique au mieux ; côté hôte, elle est appliquée directement.
+/// Sans effet hors mode étendu.
+pub fn set_session_region(session_id: u64, region: Option<RegionDto>) -> Result<(), String> {
+    crate::flux::definir_region(session_id, region.map(|r| (r.x, r.y, r.largeur, r.hauteur)))
+}
+
+/// Cadre d'écran actuellement demandé (`None` = plein écran). Côté hôte, reflète
+/// la demande reçue du contrôleur — utile pour prouver qu'une commande de région
+/// a bien traversé la session, ou pour refléter l'état dans l'UI.
+pub fn session_requested_region(session_id: u64) -> Result<Option<RegionDto>, String> {
+    Ok(
+        crate::flux::region_demandee(session_id)?.map(|(x, y, largeur, hauteur)| RegionDto {
+            x,
+            y,
+            largeur,
+            hauteur,
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 3. Tunnel TCP de session
+// ---------------------------------------------------------------------------
+
+/// Tunnel TCP de session ouvert : coordonnées de l'écouteur local à utiliser
+/// côté contrôleur (renvoyé par [`open_tunnel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelOuvertDto {
+    /// Adresse locale réellement écoutée (« 127.0.0.1:port », port résolu si le
+    /// port demandé était `0`).
+    pub adresse_locale: String,
+    /// Port local réellement écouté (pratique pour l'UI sans reparser l'adresse).
+    pub port_local: u16,
+}
+
+/// Ouvre un **tunnel TCP de session** : écoute sur `127.0.0.1:port_local`
+/// (`port_local = 0` → port éphémère) et relaie chaque connexion locale vers
+/// `cible` (« ip:port ») **à travers le canal fiable de la session** (l'hôte
+/// compose la connexion réelle vers la cible). Renvoie l'adresse locale écoutée.
+///
+/// La durée de vie du tunnel est gérée par la façade : la poignée est conservée
+/// jusqu'à [`close_tunnels`] ou l'arrêt de la session ([`stop_session`]).
+/// Best-effort : exige le mode étendu et la capacité côté hôte. Erreur française
+/// claire si `cible` n'est pas « ip:port » ou si l'écouteur local ne peut être
+/// lié (port pris, droits…).
+pub fn open_tunnel(
+    session_id: u64,
+    port_local: u16,
+    cible: String,
+) -> Result<TunnelOuvertDto, String> {
+    crate::flux::ouvrir_tunnel(session_id, port_local, cible)
+}
+
+/// Ferme **tous** les tunnels TCP ouverts pour la session (cesse d'accepter de
+/// nouvelles connexions locales, joint les fils d'acceptation). Idempotent :
+/// aucune erreur si la session n'a aucun tunnel. Les tunnels sont aussi fermés
+/// automatiquement à l'arrêt de la session.
+pub fn close_tunnels(session_id: u64) -> Result<(), String> {
+    crate::flux::fermer_tunnels(session_id)
+}
+
+// ---------------------------------------------------------------------------
+// 4. Annotations / tableau blanc
+// ---------------------------------------------------------------------------
+
+/// Un **trait d'annotation** (« tableau blanc ») dessiné par-dessus l'image,
+/// sous forme plate — miroir d'un [`nd_features::Stroke`].
+///
+/// # Conventions
+///
+/// * `genre` sélectionne la forme : `0` = trait libre / polyligne, `1` =
+///   rectangle, `2` = ellipse, `3` = flèche, `4` = texte.
+/// * `points` est une liste plate de coordonnées `[x0, y0, x1, y1, …]`,
+///   **normalisées** dans `0.0..=1.0` (repère partagé émetteur/récepteur). Le
+///   nombre de points attendu dépend du `genre` : trait libre = 1 point ou plus
+///   (la polyligne) ; rectangle = 2 points (coins opposés) ; ellipse = 2 points
+///   (centre puis demi-axes `rx`,`ry`) ; flèche = 2 points (origine, pointe) ;
+///   texte = 1 point (position). Un nombre incorrect est refusé.
+/// * `couleur_argb` est empaquetée **ARGB** (`0xAARRGGBB`, convention `Color` de
+///   Flutter). La façade la convertit vers le RGBA interne et inversement.
+/// * `epaisseur` est l'épaisseur du tracé ; pour le **texte**, c'est la hauteur
+///   de police (`size`).
+/// * `texte` ne concerne que le genre texte (`4`) ; il y est **requis** et
+///   ignoré (laissé `None`) pour les autres genres.
+///
+/// **Champs non représentables** : une couche reçue peut porter plusieurs traits
+/// et chacun a un identifiant stable interne (gomme ciblée) ; le DTO plat, lui,
+/// décrit **un seul** trait sans identifiant. À la réception
+/// ([`session_annotation_stream`]), une couche de `n` traits est donc livrée
+/// comme `n` `AnnotationDto` successifs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnotationDto {
+    /// Forme du trait (voir la doc du type).
+    pub genre: i32,
+    /// Coordonnées plates `[x0, y0, x1, y1, …]`, normalisées `0.0..=1.0`.
+    pub points: Vec<f32>,
+    /// Couleur ARGB empaquetée (`0xAARRGGBB`).
+    pub couleur_argb: u32,
+    /// Épaisseur du tracé (ou hauteur de police pour le texte).
+    pub epaisseur: f32,
+    /// Contenu textuel (genre texte uniquement ; requis pour lui, sinon `None`).
+    pub texte: Option<String>,
+}
+
+// Genres d'annotation : miroir plat des variantes de [`nd_features::Stroke`].
+const ANNOTATION_TRAIT_LIBRE: i32 = 0;
+const ANNOTATION_RECTANGLE: i32 = 1;
+const ANNOTATION_ELLIPSE: i32 = 2;
+const ANNOTATION_FLECHE: i32 = 3;
+const ANNOTATION_TEXTE: i32 = 4;
+
+/// Couleur ARGB empaquetée (`0xAARRGGBB`, convention `Color` de Flutter) →
+/// RGBA (`0xRRGGBBAA`, convention interne [`nd_features::Stroke`]). Les deux
+/// formats ne diffèrent que d'une rotation d'octet : l'alpha de tête passe en
+/// queue.
+fn argb_vers_rgba(argb: u32) -> u32 {
+    argb.rotate_left(8)
+}
+
+/// Couleur RGBA (`0xRRGGBBAA`) → ARGB (`0xAARRGGBB`) : rotation inverse.
+fn rgba_vers_argb(rgba: u32) -> u32 {
+    rgba.rotate_right(8)
+}
+
+/// Regroupe une liste plate `[x0, y0, x1, y1, …]` en points `(x, y)`.
+fn en_points(coords: &[f32]) -> Vec<(f32, f32)> {
+    coords.chunks_exact(2).map(|p| (p[0], p[1])).collect()
+}
+
+/// Aplatit des points `(x, y)` en `[x0, y0, x1, y1, …]`.
+fn aplatir(points: &[(f32, f32)]) -> Vec<f32> {
+    points.iter().flat_map(|(x, y)| [*x, *y]).collect()
+}
+
+/// Exige exactement 2 points (message d'erreur situant la forme fautive).
+fn deux_points(points: &[(f32, f32)], quoi: &str) -> Result<[(f32, f32); 2], String> {
+    match points {
+        [a, b] => Ok([*a, *b]),
+        _ => Err(format!(
+            "annotation « {quoi} » : exactement 2 points (4 coordonnées) attendus, {} reçu(s)",
+            points.len()
+        )),
+    }
+}
+
+/// Exige exactement 1 point.
+fn un_point(points: &[(f32, f32)], quoi: &str) -> Result<[(f32, f32); 1], String> {
+    match points {
+        [a] => Ok([*a]),
+        _ => Err(format!(
+            "annotation « {quoi} » : exactement 1 point (2 coordonnées) attendu, {} reçu(s)",
+            points.len()
+        )),
+    }
+}
+
+/// Construit le [`nd_features::Stroke`] correspondant au DTO plat, en validant
+/// le genre et le nombre de points.
+fn stroke_depuis_dto(dto: &AnnotationDto) -> Result<Stroke, String> {
+    if !dto.points.len().is_multiple_of(2) {
+        return Err(format!(
+            "annotation : nombre impair de coordonnées ({}) — attendu des paires (x, y)",
+            dto.points.len()
+        ));
+    }
+    let couleur = argb_vers_rgba(dto.couleur_argb);
+    let points = en_points(&dto.points);
+    match dto.genre {
+        ANNOTATION_TRAIT_LIBRE => {
+            if points.is_empty() {
+                return Err(
+                    "annotation « trait libre » : au moins un point (2 coordonnées) requis"
+                        .to_owned(),
+                );
+            }
+            Ok(Stroke::Line {
+                points,
+                color: couleur,
+                width: dto.epaisseur,
+            })
+        }
+        ANNOTATION_RECTANGLE => {
+            let [min, max] = deux_points(&points, "rectangle")?;
+            Ok(Stroke::Rect {
+                min,
+                max,
+                color: couleur,
+                width: dto.epaisseur,
+            })
+        }
+        ANNOTATION_ELLIPSE => {
+            let [centre, rayons] = deux_points(&points, "ellipse")?;
+            Ok(Stroke::Ellipse {
+                center: centre,
+                radii: rayons,
+                color: couleur,
+                width: dto.epaisseur,
+            })
+        }
+        ANNOTATION_FLECHE => {
+            let [de, vers] = deux_points(&points, "flèche")?;
+            Ok(Stroke::Arrow {
+                from: de,
+                to: vers,
+                color: couleur,
+                width: dto.epaisseur,
+            })
+        }
+        ANNOTATION_TEXTE => {
+            let [position] = un_point(&points, "texte")?;
+            let contenu = dto
+                .texte
+                .clone()
+                .ok_or_else(|| "annotation « texte » : le champ `texte` est requis".to_owned())?;
+            Ok(Stroke::Text {
+                position,
+                contenu,
+                color: couleur,
+                size: dto.epaisseur,
+            })
+        }
+        autre => Err(format!(
+            "genre d'annotation inconnu : {autre} (attendu 0=trait libre, 1=rectangle, \
+             2=ellipse, 3=flèche, 4=texte)"
+        )),
+    }
+}
+
+/// Aplatit un [`nd_features::Stroke`] en DTO plat (l'identifiant de couche est
+/// perdu — voir la doc d'[`AnnotationDto`]).
+fn dto_depuis_stroke(stroke: &Stroke) -> AnnotationDto {
+    match stroke {
+        Stroke::Line {
+            points,
+            color,
+            width,
+        } => AnnotationDto {
+            genre: ANNOTATION_TRAIT_LIBRE,
+            points: aplatir(points),
+            couleur_argb: rgba_vers_argb(*color),
+            epaisseur: *width,
+            texte: None,
+        },
+        Stroke::Rect {
+            min,
+            max,
+            color,
+            width,
+        } => AnnotationDto {
+            genre: ANNOTATION_RECTANGLE,
+            points: vec![min.0, min.1, max.0, max.1],
+            couleur_argb: rgba_vers_argb(*color),
+            epaisseur: *width,
+            texte: None,
+        },
+        Stroke::Ellipse {
+            center,
+            radii,
+            color,
+            width,
+        } => AnnotationDto {
+            genre: ANNOTATION_ELLIPSE,
+            points: vec![center.0, center.1, radii.0, radii.1],
+            couleur_argb: rgba_vers_argb(*color),
+            epaisseur: *width,
+            texte: None,
+        },
+        Stroke::Arrow {
+            from,
+            to,
+            color,
+            width,
+        } => AnnotationDto {
+            genre: ANNOTATION_FLECHE,
+            points: vec![from.0, from.1, to.0, to.1],
+            couleur_argb: rgba_vers_argb(*color),
+            epaisseur: *width,
+            texte: None,
+        },
+        Stroke::Text {
+            position,
+            contenu,
+            color,
+            size,
+        } => AnnotationDto {
+            genre: ANNOTATION_TEXTE,
+            points: vec![position.0, position.1],
+            couleur_argb: rgba_vers_argb(*color),
+            epaisseur: *size,
+            texte: Some(contenu.clone()),
+        },
+    }
+}
+
+/// Construit une couche d'annotation (**un seul trait**) depuis le DTO plat.
+/// Utilisée par [`send_annotation`] ; exposée à la crate pour le drain du flux.
+pub(crate) fn couche_depuis_annotation(dto: &AnnotationDto) -> Result<AnnotationLayer, String> {
+    let mut couche = AnnotationLayer::new();
+    couche.add(stroke_depuis_dto(dto)?);
+    Ok(couche)
+}
+
+/// Aplatit une couche reçue en **un [`AnnotationDto`] par trait** (ordre de
+/// dessin). Utilisée par le drain de [`session_annotation_stream`].
+pub(crate) fn annotations_depuis_couche(couche: &AnnotationLayer) -> Vec<AnnotationDto> {
+    couche
+        .strokes()
+        .iter()
+        .map(|(_id, stroke)| dto_depuis_stroke(stroke))
+        .collect()
+}
+
+/// Envoie une annotation au pair (canal `Control` chiffré) : le trait décrit par
+/// `annotation` est émis comme une couche à un seul trait. Les annotations
+/// reçues du pair arrivent sur [`session_annotation_stream`]. Sans effet hors
+/// mode étendu. Erreur si le DTO est mal formé (genre inconnu, points
+/// incohérents, texte manquant).
+pub fn send_annotation(session_id: u64, annotation: AnnotationDto) -> Result<(), String> {
+    crate::flux::envoyer_annotation(session_id, annotation)
+}
+
+/// Pousse chaque annotation **reçue** du pair dans `sink`, à raison d'un
+/// [`AnnotationDto`] par trait de la couche reçue (voir [`AnnotationDto`]).
+///
+/// Un seul consommateur d'annotations par session (le drain prend définitivement
+/// le récepteur). Le drain s'arrête à la fin de la session (canal déconnecté) ou
+/// à l'annulation du `Stream` côté Dart.
+pub fn session_annotation_stream(
+    session_id: u64,
+    sink: StreamSink<AnnotationDto>,
+) -> Result<(), String> {
+    crate::flux::flux_annotations(session_id, sink)
+}
+
+// ---------------------------------------------------------------------------
+// 5. Relecture d'enregistrement
+// ---------------------------------------------------------------------------
+
+/// Métadonnées d'un enregistrement ouvert pour relecture, renvoyées par
+/// [`open_recording`]. `id` indexe le lecteur pour [`recording_next_frame`],
+/// [`recording_seek`] et [`close_recording`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingInfoDto {
+    /// Identifiant opaque du lecteur (à repasser aux autres fonctions `recording_*`).
+    pub id: u64,
+    /// Largeur des images, en pixels.
+    pub largeur: u32,
+    /// Hauteur des images, en pixels.
+    pub hauteur: u32,
+    /// Cadence nominale, en images par seconde.
+    pub fps: u32,
+    /// Durée de l'enregistrement, en microsecondes.
+    pub duree_us: u64,
+    /// Nombre d'images de l'enregistrement.
+    pub nb_images: u64,
+}
+
+/// Ouvre un enregistrement (`.mp4` **ou** archive interne `.ndr`, format
+/// auto-détecté) pour relecture et renvoie ses métadonnées + un identifiant
+/// opaque. L'enregistrement vit jusqu'à [`close_recording`].
+pub fn open_recording(chemin: String) -> Result<RecordingInfoDto, String> {
+    crate::lecture::ouvrir(chemin)
+}
+
+/// Décode et renvoie la **prochaine image** de l'enregistrement `id` (RGBA,
+/// même [`VideoFrameDto`] que [`session_video_stream`]), ou `Ok(None)` en fin de
+/// flux. Les échantillons qui ne produisent pas d'image sont sautés.
+pub fn recording_next_frame(id: u64) -> Result<Option<VideoFrameDto>, String> {
+    crate::lecture::image_suivante(id)
+}
+
+/// Repositionne la lecture sur l'**image-clé** la plus proche avant (ou à)
+/// `timestamp_us` (point de reprise décodable) et réinitialise le décodeur. Le
+/// prochain [`recording_next_frame`] repart de cette image-clé.
+pub fn recording_seek(id: u64, timestamp_us: u64) -> Result<(), String> {
+    crate::lecture::chercher(id, timestamp_us)
+}
+
+/// Ferme l'enregistrement `id` et libère ses ressources. L'identifiant devient
+/// invalide.
+pub fn close_recording(id: u64) -> Result<(), String> {
+    crate::lecture::fermer(id)
+}
+
+// ===========================================================================
+// Extras session & relecture
+// ===========================================================================
+//
+// Contrôles de session sous les noms `session_*` attendus par l'UI (mêmes
+// chemins `flux` que le lot « capacités moteur exposées », qui reste intact) et
+// relecture d'enregistrement **en flux poussé**. Tout ce lot est **sans nouvel
+// encodeur de pont** : les quatre contrôles sont synchrones à DTO plats déjà
+// bridgés ([`RegionDto`], [`AnnotationDto`]), [`recording_info`] réutilise
+// [`RecordingInfoDto`], et [`recording_frame_stream`] réutilise le
+// `StreamSink<VideoFrameDto>` de [`session_video_stream`] (son `SseEncode` est
+// déjà généré) — donc **aucun `pont_provisoire` n'est requis** ; la
+// régénération ne fera qu'ajouter le câblage des nouvelles fonctions.
+
+/// Active (ou lève) le **mode confidentialité** de la session `session_id` —
+/// même effet que [`set_privacy`], sous le nom `session_*` attendu par l'UI.
+///
+/// Côté contrôleur, la demande est transmise à l'hôte qui — s'il détient la
+/// capacité — cesse de diffuser son écran réel (cadre noir) ; côté hôte, le
+/// rideau est appliqué directement. Best-effort : sans effet hors mode étendu
+/// ([`SessionOptionsDto::extended_features`]) ou sans la capacité, mais `Ok`
+/// tant que la session existe. L'état effectif se lit via [`privacy_active`].
+pub fn session_set_privacy(session_id: u64, actif: bool) -> Result<(), String> {
+    crate::flux::definir_confidentialite(session_id, actif)
+}
+
+/// Restreint la zone d'écran partagée de la session `session_id` au
+/// [`RegionDto`] fourni (pixels du moniteur de l'hôte), ou **rétablit le plein
+/// écran** avec `None` — même effet que [`set_session_region`], sous le nom
+/// `session_*` attendu par l'UI.
+///
+/// Côté contrôleur, la demande est transmise à l'hôte, qui l'applique au mieux ;
+/// côté hôte, elle est appliquée directement. Sans effet hors mode étendu. La
+/// région effectivement demandée se relit via [`session_requested_region`].
+pub fn session_set_region(session_id: u64, region: Option<RegionDto>) -> Result<(), String> {
+    crate::flux::definir_region(session_id, region.map(|r| (r.x, r.y, r.largeur, r.hauteur)))
+}
+
+/// Envoie une annotation (« tableau blanc ») au pair de la session
+/// `session_id` — même effet que [`send_annotation`], sous le nom `session_*`
+/// attendu par l'UI.
+///
+/// Le trait décrit par `annotation` (genre, points normalisés `0.0..=1.0`,
+/// couleur ARGB, épaisseur — voir [`AnnotationDto`]) part comme une couche à un
+/// seul trait sur le canal `Control` chiffré ; les annotations du pair arrivent
+/// sur [`session_annotation_stream`]. Erreur si le DTO est mal formé (genre
+/// inconnu, points incohérents, texte manquant) ; sans effet hors mode étendu.
+pub fn session_send_annotation(session_id: u64, annotation: AnnotationDto) -> Result<(), String> {
+    crate::flux::envoyer_annotation(session_id, annotation)
+}
+
+/// Ouvre un **tunnel TCP de session** vers `hote_distant:port_distant` — comme
+/// [`open_tunnel`], mais avec l'hôte et le port distants **séparés** et sans
+/// valeur de retour. L'UI qui veut connaître l'adresse locale réellement
+/// écoutée (notamment avec `port_local = 0`, port éphémère) passera par
+/// [`open_tunnel`].
+///
+/// Écoute sur `127.0.0.1:port_local` et relaie chaque connexion locale vers la
+/// cible **à travers le canal fiable de la session** (l'hôte compose la
+/// connexion réelle vers la cible). `hote_distant` est une adresse IP (v4 ou
+/// v6) ; erreur française claire sinon. Exige le mode étendu et la capacité
+/// côté hôte. La poignée du tunnel est conservée par la façade jusqu'à
+/// [`close_tunnels`] ou l'arrêt de la session ([`stop_session`]).
+pub fn session_open_tunnel(
+    session_id: u64,
+    port_local: u16,
+    hote_distant: String,
+    port_distant: u16,
+) -> Result<(), String> {
+    // L'analyse de l'hôte précède la recherche de session : une saisie invalide
+    // échoue avec un message clair, sans toucher à la session.
+    let ip: IpAddr = hote_distant.trim().parse().map_err(|e| {
+        format!(
+            "hôte distant « {hote_distant} » invalide \
+             (adresse IP attendue, ex. « 192.168.1.10 ») : {e}"
+        )
+    })?;
+    crate::flux::ouvrir_tunnel_vers(session_id, port_local, SocketAddr::new(ip, port_distant))
+        .map(|_tunnel| ())
+}
+
+/// Métadonnées de l'enregistrement `chemin` (`.mp4` **ou** `.ndr`, format
+/// auto-détecté) **sans lecteur durable** : le fichier est lu puis refermé
+/// aussitôt, rien à fermer ensuite — contrairement à [`open_recording`], qui
+/// garde un lecteur ouvert pour décoder.
+///
+/// Le champ [`RecordingInfoDto::id`] du résultat vaut `0`, valeur jamais
+/// attribuée à un lecteur réel : il n'est **pas** utilisable avec les fonctions
+/// `recording_*` à identifiant.
+pub fn recording_info(chemin: String) -> Result<RecordingInfoDto, String> {
+    crate::lecture::infos(chemin)
+}
+
+/// Relit l'enregistrement `chemin` en **flux poussé** : chaque image décodée
+/// (RGBA, même [`VideoFrameDto`] que [`session_video_stream`]) est poussée dans
+/// `sink` dans l'ordre de présentation, jusqu'à la fin du fichier.
+///
+/// L'ouverture du fichier, l'extraction des échantillons H.264 et la création
+/// du décodeur sont **synchrones** (erreur immédiate) ; le décodage se fait
+/// ensuite sur un thread dédié. Le `Stream` Dart se clôt en fin
+/// d'enregistrement ; une erreur de décodage lui est signalée comme erreur de
+/// flux ; son annulation côté Dart arrête la relecture. Alternative **tirée**
+/// (image par image, recherche par horodatage) : [`open_recording`] /
+/// [`recording_next_frame`] / [`recording_seek`].
+pub fn recording_frame_stream(
+    chemin: String,
+    sink: StreamSink<VideoFrameDto>,
+) -> Result<(), String> {
+    crate::lecture::flux_images(chemin, sink)
+}
+
+// ===========================================================================
+// Plan de contrôle de session
+// ===========================================================================
+//
+// Cinq capacités que l'UI ne pouvait pas encore piloter, chacune additive sur
+// le canal `Control` existant (ou locale à l'hôte pour l'enregistrement) et
+// gardée par les permissions le cas échéant. Toutes **synchrones à DTO plats**
+// (aucun `StreamSink`) : aucun `pont_provisoire` requis — la régénération ne
+// fera qu'ajouter le câblage des nouvelles fonctions et des DTO neufs
+// ([`MonitorInfoDto`], [`PeerInfoDto`]). Comme les autres `session_*`, elles
+// prennent l'identifiant opaque de session en premier argument et restent
+// inertes hors mode étendu ([`SessionOptionsDto::extended_features`]) ou
+// permission absente (mais renvoient `Ok` tant que la session existe), à
+// l'exception des lectures ([`session_monitors`], [`session_peer_info`]).
+
+// ---------------------------------------------------------------------------
+// 1. Permissions à chaud
+// ---------------------------------------------------------------------------
+
+/// Renégocie **une** permission de la session **en cours** : accorde
+/// (`autorise = true`) ou retire (`false`) la capacité `capacite` de l'ensemble
+/// vivant. Côté contrôleur, la demande est transmise à l'hôte, qui l'applique au
+/// vol — le filtre d'injection lit le nouvel ensemble à l'entrée suivante ; côté
+/// hôte, elle est appliquée directement. Sans effet hors mode étendu.
+///
+/// `capacite` est une **clé stable** (contrat UI) parmi : `voir_ecran`,
+/// `souris`, `clavier`, `presse_papiers_lecture`, `presse_papiers_ecriture`,
+/// `fichiers_envoi`, `fichiers_reception`, `audio`, `redemarrage`,
+/// `enregistrement`, `confidentialite`, `tunnel`. Toute autre valeur renvoie une
+/// erreur française explicite (sans toucher à la session).
+pub fn session_set_permission(
+    session_id: u64,
+    capacite: String,
+    autorise: bool,
+) -> Result<(), String> {
+    crate::flux::definir_permission(session_id, &capacite, autorise)
+}
+
+// ---------------------------------------------------------------------------
+// 2. Préréglage de qualité
+// ---------------------------------------------------------------------------
+
+/// Applique un **préréglage de qualité** à l'encodeur hôte : `preset` parmi
+/// `auto`, `fluide`, `equilibre`, `netteté` (mappé vers un profil ABR
+/// `ContentProfile` et un plafond de débit). Côté contrôleur, la demande est
+/// transmise à l'hôte, qui reconfigure son encodeur et son échelle ABR **sous**
+/// le plafond (l'ABR continue de dégrader à partir de là) ; côté hôte, elle est
+/// appliquée directement. Un `preset` inconnu renvoie une erreur française. Sans
+/// effet hors mode étendu.
+///
+/// | preset | profil ABR | plafond |
+/// |--------|-----------|---------|
+/// | `auto` | netteté (texte) | aucun |
+/// | `fluide` | fluidité (vidéo) | aucun |
+/// | `equilibre` | fluidité (vidéo) | 5 000 kbit/s |
+/// | `netteté` | netteté (texte) | aucun |
+pub fn session_set_quality(session_id: u64, preset: String) -> Result<(), String> {
+    crate::flux::definir_qualite(session_id, &preset)
+}
+
+// ---------------------------------------------------------------------------
+// 3. Enregistrement à chaud
+// ---------------------------------------------------------------------------
+
+/// Démarre (avec un `chemin` MP4) ou arrête (`None`) l'**enregistrement local**
+/// de l'hôte **en cours de session** (jusqu'ici figé au démarrage via
+/// `SessionOptionsDto::recording_path`). Démarrer ouvre une nouvelle époque MP4 ;
+/// arrêter clôt proprement le fichier (relisible). L'enregistrement est
+/// **côté hôte** (l'hôte encode et muxe son écran) : à appeler sur une session
+/// hôte, sans effet côté contrôleur ni hors mode étendu. Erreur si la session
+/// est inconnue.
+pub fn session_set_recording(session_id: u64, chemin: Option<String>) -> Result<(), String> {
+    crate::flux::definir_enregistrement(session_id, chemin.map(PathBuf::from))
+}
+
+// ---------------------------------------------------------------------------
+// 4. Liste des moniteurs
+// ---------------------------------------------------------------------------
+
+/// Un écran de l'hôte publié sur le plan de contrôle (miroir plat de
+/// `nd_core::RemoteMonitor`) : **remplace l'« Écran 1/2 » codé en dur** de l'UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorInfoDto {
+    /// Index du moniteur — l'argument attendu par [`switch_monitor`].
+    pub index: u32,
+    /// Largeur en pixels.
+    pub largeur: u32,
+    /// Hauteur en pixels.
+    pub hauteur: u32,
+    /// Vrai pour le moniteur principal.
+    pub principal: bool,
+}
+
+impl From<RemoteMonitor> for MonitorInfoDto {
+    fn from(m: RemoteMonitor) -> Self {
+        MonitorInfoDto {
+            index: m.index,
+            largeur: m.width,
+            hauteur: m.height,
+            principal: m.primary,
+        }
+    }
+}
+
+/// Liste des **moniteurs réels** de l'hôte, publiée par lui sur le canal
+/// `Control` à l'établissement de la session (rôle contrôleur). Renvoie une liste
+/// **vide** tant que l'annonce n'est pas arrivée **ou** si l'hôte n'a aucun écran
+/// énumérable. L'index de chaque entrée est celui qu'attend [`switch_monitor`].
+pub fn session_monitors(session_id: u64) -> Result<Vec<MonitorInfoDto>, String> {
+    crate::flux::moniteurs(session_id)
+}
+
+// ---------------------------------------------------------------------------
+// 5. Infos système du pair
+// ---------------------------------------------------------------------------
+
+/// Infos système du pair (miroir plat de `nd_core::PeerInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfoDto {
+    /// Nom d'hôte de la machine distante.
+    pub hote: String,
+    /// Système d'exploitation (chaîne libre, ex. « windows (x86_64) »).
+    pub os: String,
+}
+
+impl From<PeerInfo> for PeerInfoDto {
+    fn from(p: PeerInfo) -> Self {
+        PeerInfoDto {
+            hote: p.host,
+            os: p.os,
+        }
+    }
+}
+
+/// **Infos système du pair** (nom d'hôte + OS) publiées par l'hôte sur le canal
+/// `Control` à l'établissement (rôle contrôleur). Erreur tant que l'annonce n'est
+/// pas encore arrivée (ou si la session est inconnue).
+pub fn session_peer_info(session_id: u64) -> Result<PeerInfoDto, String> {
+    crate::flux::infos_pair(session_id)
+}
+
+#[cfg(test)]
+mod tests_extras_session {
+    use super::*;
+
+    /// Identifiant jamais attribué : le compteur de sessions démarre à 1 et
+    /// croît de un en un — `u64::MAX` reste hors d'atteinte.
+    const SESSION_INCONNUE: u64 = u64::MAX;
+
+    #[test]
+    fn session_set_privacy_exige_une_session_vivante() {
+        let err = session_set_privacy(SESSION_INCONNUE, true).unwrap_err();
+        assert!(err.contains("inconnue"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn session_set_region_exige_une_session_vivante() {
+        let region = RegionDto {
+            x: 10,
+            y: 20,
+            largeur: 640,
+            hauteur: 480,
+        };
+        let err = session_set_region(SESSION_INCONNUE, Some(region)).unwrap_err();
+        assert!(err.contains("inconnue"), "message peu utile : {err}");
+        // Le rétablissement du plein écran (None) passe par le même chemin.
+        let err = session_set_region(SESSION_INCONNUE, None).unwrap_err();
+        assert!(err.contains("inconnue"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn session_send_annotation_valide_le_dto_avant_la_session() {
+        // DTO mal formé : refusé avec un message sur le genre, sans exiger de
+        // session vivante (validation avant tout accès à la table).
+        let invalide = AnnotationDto {
+            genre: 42,
+            points: vec![0.0, 0.0],
+            couleur_argb: 0,
+            epaisseur: 1.0,
+            texte: None,
+        };
+        let err = session_send_annotation(SESSION_INCONNUE, invalide).unwrap_err();
+        assert!(err.contains("genre"), "message peu utile : {err}");
+
+        // DTO valide : l'erreur devient l'absence de session.
+        let valide = AnnotationDto {
+            genre: 0,
+            points: vec![0.1, 0.2],
+            couleur_argb: 0xFFFF_0000,
+            epaisseur: 2.0,
+            texte: None,
+        };
+        let err = session_send_annotation(SESSION_INCONNUE, valide).unwrap_err();
+        assert!(err.contains("inconnue"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn session_open_tunnel_refuse_un_hote_illisible() {
+        // L'analyse de l'hôte précède la recherche de session : aucune session
+        // requise, aucun écouteur lié.
+        let err =
+            session_open_tunnel(SESSION_INCONNUE, 0, "pas-une-ip".to_owned(), 80).unwrap_err();
+        assert!(err.contains("hôte distant"), "message peu utile : {err}");
+        assert!(err.contains("invalide"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn session_open_tunnel_accepte_ipv4_et_ipv6_mais_exige_une_session() {
+        // IP v4, v6 et espaces parasites acceptés : l'erreur restante est bien
+        // l'absence de session, pas l'analyse de l'hôte.
+        for hote in ["127.0.0.1", "::1", "  192.168.1.10  "] {
+            let err = session_open_tunnel(SESSION_INCONNUE, 0, hote.to_owned(), 8080).unwrap_err();
+            assert!(err.contains("inconnue"), "hôte « {hote} » : {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_plan_controle {
+    use super::*;
+
+    /// Identifiant jamais attribué (le compteur démarre à 1 et croît).
+    const SESSION_INCONNUE: u64 = u64::MAX;
+
+    #[test]
+    fn set_permission_valide_la_capacite_avant_la_session() {
+        // Clé inconnue : refusée avec un message sur la capacité, **sans** exiger
+        // de session vivante (analyse avant tout accès à la table).
+        let err = session_set_permission(SESSION_INCONNUE, "pas_une_capacite".to_owned(), true)
+            .unwrap_err();
+        assert!(
+            err.contains("capacité inconnue"),
+            "message peu utile : {err}"
+        );
+
+        // Clé valide : l'erreur devient l'absence de session.
+        let err = session_set_permission(SESSION_INCONNUE, "souris".to_owned(), false).unwrap_err();
+        assert!(err.contains("inconnue"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn set_quality_valide_le_preset_avant_la_session() {
+        let err = session_set_quality(SESSION_INCONNUE, "ultra".to_owned()).unwrap_err();
+        assert!(
+            err.contains("préréglage") && err.contains("inconnu"),
+            "message peu utile : {err}"
+        );
+        // Préréglages acceptés (avec et sans accent) : l'erreur devient l'absence
+        // de session.
+        for preset in ["auto", "fluide", "equilibre", "netteté", "nettete"] {
+            let err = session_set_quality(SESSION_INCONNUE, preset.to_owned()).unwrap_err();
+            assert!(err.contains("inconnue"), "préréglage « {preset} » : {err}");
+        }
+    }
+
+    #[test]
+    fn lectures_et_enregistrement_exigent_une_session_vivante() {
+        assert!(session_monitors(SESSION_INCONNUE)
+            .unwrap_err()
+            .contains("inconnue"));
+        assert!(session_peer_info(SESSION_INCONNUE)
+            .unwrap_err()
+            .contains("inconnue"));
+        assert!(
+            session_set_recording(SESSION_INCONNUE, Some("s.mp4".to_owned()))
+                .unwrap_err()
+                .contains("inconnue")
+        );
+        assert!(session_set_recording(SESSION_INCONNUE, None)
+            .unwrap_err()
+            .contains("inconnue"));
+    }
+}
+
+#[cfg(test)]
+mod tests_annotations {
+    use super::*;
+
+    /// DTO → couche (un trait) → DTO : doit rendre exactement l'entrée.
+    fn aller_retour(dto: &AnnotationDto) -> AnnotationDto {
+        let couche = couche_depuis_annotation(dto).expect("DTO valide → couche");
+        let mut dtos = annotations_depuis_couche(&couche);
+        assert_eq!(dtos.len(), 1, "une couche à un trait → un seul DTO");
+        dtos.pop().expect("un DTO")
+    }
+
+    #[test]
+    fn argb_rgba_aller_retour() {
+        let argb = 0x8899_AABBu32;
+        // ARGB 0xAARRGGBB → RGBA 0xRRGGBBAA.
+        assert_eq!(argb_vers_rgba(argb), 0x99AA_BB88);
+        assert_eq!(rgba_vers_argb(argb_vers_rgba(argb)), argb);
+    }
+
+    #[test]
+    fn aller_retour_trait_libre() {
+        let dto = AnnotationDto {
+            genre: 0,
+            points: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            couleur_argb: 0x80FF_0000,
+            epaisseur: 2.5,
+            texte: None,
+        };
+        assert_eq!(aller_retour(&dto), dto);
+    }
+
+    #[test]
+    fn aller_retour_formes_a_deux_points() {
+        // Rectangle, ellipse, flèche : mêmes 2 points, genres distincts.
+        for genre in [1, 2, 3] {
+            let dto = AnnotationDto {
+                genre,
+                points: vec![0.0, 0.25, 1.0, 0.75],
+                couleur_argb: 0xFF00_FF00,
+                epaisseur: 3.0,
+                texte: None,
+            };
+            assert_eq!(aller_retour(&dto), dto, "genre {genre}");
+        }
+    }
+
+    #[test]
+    fn aller_retour_texte() {
+        let dto = AnnotationDto {
+            genre: 4,
+            points: vec![0.2, 0.3],
+            couleur_argb: 0xFF11_2233,
+            epaisseur: 14.0,
+            texte: Some("Cliquez ici — été".to_owned()),
+        };
+        assert_eq!(aller_retour(&dto), dto);
+    }
+
+    #[test]
+    fn genre_inconnu_refuse() {
+        let dto = AnnotationDto {
+            genre: 99,
+            points: vec![0.0, 0.0],
+            couleur_argb: 0,
+            epaisseur: 1.0,
+            texte: None,
+        };
+        let err = couche_depuis_annotation(&dto).unwrap_err();
+        assert!(err.contains("genre"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn rectangle_mauvais_nombre_de_points_refuse() {
+        let dto = AnnotationDto {
+            genre: 1,
+            points: vec![0.0, 0.0],
+            couleur_argb: 0,
+            epaisseur: 1.0,
+            texte: None,
+        };
+        let err = couche_depuis_annotation(&dto).unwrap_err();
+        assert!(err.contains("2 points"), "message peu utile : {err}");
+    }
+
+    #[test]
+    fn texte_sans_contenu_refuse() {
+        let dto = AnnotationDto {
+            genre: 4,
+            points: vec![0.0, 0.0],
+            couleur_argb: 0,
+            epaisseur: 12.0,
+            texte: None,
+        };
+        assert!(couche_depuis_annotation(&dto).is_err());
+    }
+
+    #[test]
+    fn coordonnees_impaires_refusees() {
+        let dto = AnnotationDto {
+            genre: 0,
+            points: vec![0.0, 0.0, 1.0],
+            couleur_argb: 0,
+            epaisseur: 1.0,
+            texte: None,
+        };
+        assert!(couche_depuis_annotation(&dto).is_err());
+    }
 }

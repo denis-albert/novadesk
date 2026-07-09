@@ -241,6 +241,177 @@ class FrbNativeApi implements NativeApi {
       frb.switchMonitor(id: BigInt.from(id), moniteur: moniteur);
 
   // ---------------------------------------------------------------------------
+  // Capacités avancées de session, relecture et Wake-on-LAN — délégation aux
+  // fonctions générées (u64 ⇄ BigInt)
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<void> setPrivacy(int sessionId, bool actif) =>
+      frb.setPrivacy(sessionId: BigInt.from(sessionId), actif: actif);
+
+  @override
+  Future<bool> privacyActive(int sessionId) =>
+      frb.privacyActive(sessionId: BigInt.from(sessionId));
+
+  @override
+  Future<void> setSessionRegion(int sessionId, RegionDto? region) =>
+      frb.setSessionRegion(
+        sessionId: BigInt.from(sessionId),
+        region: region == null ? null : _regionVers(region),
+      );
+
+  @override
+  Future<RegionDto?> sessionRequestedRegion(int sessionId) async {
+    final r =
+        await frb.sessionRequestedRegion(sessionId: BigInt.from(sessionId));
+    return r == null ? null : _regionDepuis(r);
+  }
+
+  @override
+  Future<TunnelOuvertDto> openTunnel(
+    int sessionId,
+    int portLocal,
+    String cible,
+  ) async {
+    try {
+      final t = await frb.openTunnel(
+        sessionId: BigInt.from(sessionId),
+        portLocal: portLocal,
+        cible: cible,
+      );
+      return _tunnelDepuis(t);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> closeTunnels(int sessionId) =>
+      frb.closeTunnels(sessionId: BigInt.from(sessionId));
+
+  @override
+  Future<void> sendAnnotation(int sessionId, AnnotationDto annotation) async {
+    try {
+      await frb.sendAnnotation(
+        sessionId: BigInt.from(sessionId),
+        annotation: _annotationVers(annotation),
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Stream<AnnotationDto> sessionAnnotationStream(int sessionId) => frb
+      .sessionAnnotationStream(sessionId: BigInt.from(sessionId))
+      .map(_annotationDepuis);
+
+  @override
+  Future<RecordingInfoDto> openRecording(String chemin) async {
+    try {
+      final info = await frb.openRecording(chemin: chemin);
+      return _recordingInfoDepuis(info);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<VideoFrameDto?> recordingNextFrame(int id) async {
+    final f = await frb.recordingNextFrame(id: BigInt.from(id));
+    return f == null ? null : _frameDepuis(f);
+  }
+
+  @override
+  Future<void> recordingSeek(int id, int timestampUs) => frb.recordingSeek(
+        id: BigInt.from(id),
+        timestampUs: BigInt.from(timestampUs),
+      );
+
+  @override
+  Future<void> closeRecording(int id) =>
+      frb.closeRecording(id: BigInt.from(id));
+
+  // ---------------------------------------------------------------------------
+  // Plan de contrôle de session (lot « contrôles de session ») — délégation aux
+  // fonctions générées (u64 ⇄ BigInt) ; les `Result<_, String>` du cœur (clé de
+  // capacité ou préréglage inconnus, session inconnue, annonce absente) sont
+  // retransformés en [NovaApiException] au message français affichable.
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<void> sessionSetPermission(
+    int sessionId,
+    String capacite,
+    bool autorise,
+  ) async {
+    try {
+      await frb.sessionSetPermission(
+        sessionId: BigInt.from(sessionId),
+        capacite: capacite,
+        autorise: autorise,
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> sessionSetQuality(int sessionId, String preset) async {
+    try {
+      await frb.sessionSetQuality(
+        sessionId: BigInt.from(sessionId),
+        preset: preset,
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> sessionSetRecording(int sessionId, String? chemin) async {
+    try {
+      await frb.sessionSetRecording(
+        sessionId: BigInt.from(sessionId),
+        chemin: chemin,
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<List<MonitorInfoDto>> sessionMonitors(int sessionId) async {
+    try {
+      final moniteurs =
+          await frb.sessionMonitors(sessionId: BigInt.from(sessionId));
+      return moniteurs.map(_moniteurDepuis).toList();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<PeerInfoDto> sessionPeerInfo(int sessionId) async {
+    try {
+      final infos =
+          await frb.sessionPeerInfo(sessionId: BigInt.from(sessionId));
+      return PeerInfoDto(hote: infos.hote, os: infos.os);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> sendWol(String mac, {String? broadcast}) async {
+    try {
+      await frb.sendWol(mac: mac, broadcast: broadcast);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Hôte « accès non surveillé » — délégation aux fonctions générées
   // ---------------------------------------------------------------------------
 
@@ -553,6 +724,62 @@ class FrbNativeApi implements NativeApi {
   static VideoFrameDto _frameDepuis(frb.VideoFrameDto f) =>
       VideoFrameDto(width: f.width, height: f.height, rgba: f.rgba);
 
+  static frb.RegionDto _regionVers(RegionDto r) => frb.RegionDto(
+        x: r.x,
+        y: r.y,
+        largeur: r.largeur,
+        hauteur: r.hauteur,
+      );
+
+  static RegionDto _regionDepuis(frb.RegionDto r) => RegionDto(
+        x: r.x,
+        y: r.y,
+        largeur: r.largeur,
+        hauteur: r.hauteur,
+      );
+
+  static TunnelOuvertDto _tunnelDepuis(frb.TunnelOuvertDto t) => TunnelOuvertDto(
+        adresseLocale: t.adresseLocale,
+        portLocal: t.portLocal,
+      );
+
+  /// Aplatit un moniteur généré (index et dimensions déjà des `int` côté
+  /// généré : `u32` Rust ⇄ `int` Dart).
+  static MonitorInfoDto _moniteurDepuis(frb.MonitorInfoDto m) => MonitorInfoDto(
+        index: m.index,
+        largeur: m.largeur,
+        hauteur: m.hauteur,
+        principal: m.principal,
+      );
+
+  static frb.AnnotationDto _annotationVers(AnnotationDto a) => frb.AnnotationDto(
+        genre: a.genre,
+        points: a.points,
+        couleurArgb: a.couleurArgb,
+        epaisseur: a.epaisseur,
+        texte: a.texte,
+      );
+
+  static AnnotationDto _annotationDepuis(frb.AnnotationDto a) => AnnotationDto(
+        genre: a.genre,
+        points: a.points,
+        couleurArgb: a.couleurArgb,
+        epaisseur: a.epaisseur,
+        texte: a.texte,
+      );
+
+  /// Aplatit les métadonnées d'enregistrement (id, durée et nombre d'images
+  /// `u64` ⇄ `BigInt` ; dimensions et fps déjà des `int` côté généré).
+  static RecordingInfoDto _recordingInfoDepuis(frb.RecordingInfoDto i) =>
+      RecordingInfoDto(
+        id: i.id.toInt(),
+        largeur: i.largeur,
+        hauteur: i.hauteur,
+        fps: i.fps,
+        dureeUs: i.dureeUs.toInt(),
+        nbImages: i.nbImages.toInt(),
+      );
+
   static frb.PermissionsDto _permsVers(PermissionsDto p) => frb.PermissionsDto(
         keyboard: p.keyboard,
         mouse: p.mouse,
@@ -601,11 +828,11 @@ class FrbNativeApi implements NativeApi {
         permissions: _permsVers(o.permissions),
         recordingPath: o.recordingPath,
         deltaMode: o.deltaMode,
-        // Mode étendu : la session porte aussi audio / chat / fichiers /
-        // presse-papiers ; reconnexion transparente activée (endpoint Direct).
-        extendedFeatures: true,
-        transferDir: null,
-        transportReconnect: true,
+        // Le contrat porte désormais ces axes (défauts : mode étendu + audio /
+        // chat / fichiers / presse-papiers, reconnexion transparente activée).
+        extendedFeatures: o.extendedFeatures,
+        transferDir: o.transferDir,
+        transportReconnect: o.transportReconnect,
       );
 
   /// Conversion des statistiques (u64 ⇄ BigInt ; `targetBitrateKbps`,

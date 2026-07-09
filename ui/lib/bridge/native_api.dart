@@ -553,6 +553,9 @@ class SessionOptionsDto {
     required this.permissions,
     this.recordingPath,
     this.deltaMode = false,
+    this.extendedFeatures = true,
+    this.transferDir,
+    this.transportReconnect = true,
   });
 
   /// Permissions granulaires appliquées avant chaque injection d'entrée
@@ -567,19 +570,41 @@ class SessionOptionsDto {
   /// fidèlement les régions modifiées.
   final bool deltaMode;
 
+  /// Active les **fonctions étendues** de la session (canaux annexes : chat,
+  /// transfert de fichiers, audio, presse-papiers, bascule moniteur, ainsi que
+  /// confidentialité, cadre d'écran, tunnels et annotations), chacune gardée
+  /// par sa permission. **Vrai par défaut côté UI** pour que le parcours
+  /// complet soit démontrable ; `false` = session vidéo + entrées historique
+  /// seulement.
+  final bool extendedFeatures;
+
+  /// Répertoire de réception des fichiers transférés (canal `Files`) ; `null` =
+  /// dossier temporaire du système. Ignoré hors mode étendu.
+  final String? transferDir;
+
+  /// Reconnexion transparente **au niveau transport** pour un point de contact
+  /// [SessionEndpointDirect] côté contrôleur. **Vrai par défaut côté UI.**
+  final bool transportReconnect;
+
   @override
   bool operator ==(Object other) =>
       other is SessionOptionsDto &&
       other.permissions == permissions &&
       other.recordingPath == recordingPath &&
-      other.deltaMode == deltaMode;
+      other.deltaMode == deltaMode &&
+      other.extendedFeatures == extendedFeatures &&
+      other.transferDir == transferDir &&
+      other.transportReconnect == transportReconnect;
 
   @override
-  int get hashCode => Object.hash(permissions, recordingPath, deltaMode);
+  int get hashCode => Object.hash(permissions, recordingPath, deltaMode,
+      extendedFeatures, transferDir, transportReconnect);
 
   @override
   String toString() => 'SessionOptionsDto(permissions: $permissions, '
-      'recordingPath: $recordingPath, deltaMode: $deltaMode)';
+      'recordingPath: $recordingPath, deltaMode: $deltaMode, '
+      'extendedFeatures: $extendedFeatures, transferDir: $transferDir, '
+      'transportReconnect: $transportReconnect)';
 }
 
 /// Demande d'accès entrante vers un hôte « accès non surveillé », poussée par
@@ -959,6 +984,265 @@ class AccessLogEntryDto {
 }
 
 // ---------------------------------------------------------------------------
+// Capacités avancées de session : confidentialité, cadre d'écran, tunnels,
+// annotations et relecture d'enregistrements (lot « capacités moteur »).
+//
+// Miroirs des DTO de `nd-ffi` fraîchement exposés. Les identifiants et
+// dimensions sont des `int` Dart : l'adaptateur FRB convertit les `u64`
+// (exposés en `BigInt`) du pont.
+// ---------------------------------------------------------------------------
+
+/// Zone rectangulaire d'écran à partager (« cadre d'écran »), en **pixels du
+/// moniteur** de l'hôte (miroir de `nd_ffi::RegionDto`).
+class RegionDto {
+  const RegionDto({
+    required this.x,
+    required this.y,
+    required this.largeur,
+    required this.hauteur,
+  });
+
+  /// Abscisse du coin supérieur gauche.
+  final int x;
+
+  /// Ordonnée du coin supérieur gauche.
+  final int y;
+
+  /// Largeur de la zone, en pixels.
+  final int largeur;
+
+  /// Hauteur de la zone, en pixels.
+  final int hauteur;
+
+  @override
+  bool operator ==(Object other) =>
+      other is RegionDto &&
+      other.x == x &&
+      other.y == y &&
+      other.largeur == largeur &&
+      other.hauteur == hauteur;
+
+  @override
+  int get hashCode => Object.hash(x, y, largeur, hauteur);
+
+  @override
+  String toString() =>
+      'RegionDto(x: $x, y: $y, largeur: $largeur, hauteur: $hauteur)';
+}
+
+/// Tunnel TCP de session ouvert : coordonnées de l'écouteur local à utiliser
+/// côté contrôleur (miroir de `nd_ffi::TunnelOuvertDto`, renvoyé par
+/// [NativeApi.openTunnel]).
+class TunnelOuvertDto {
+  const TunnelOuvertDto({
+    required this.adresseLocale,
+    required this.portLocal,
+  });
+
+  /// Adresse locale réellement écoutée (« 127.0.0.1:port », port résolu si le
+  /// port demandé était `0`).
+  final String adresseLocale;
+
+  /// Port local réellement écouté (pratique pour l'UI sans reparser l'adresse).
+  final int portLocal;
+
+  @override
+  bool operator ==(Object other) =>
+      other is TunnelOuvertDto &&
+      other.adresseLocale == adresseLocale &&
+      other.portLocal == portLocal;
+
+  @override
+  int get hashCode => Object.hash(adresseLocale, portLocal);
+
+  @override
+  String toString() =>
+      'TunnelOuvertDto(adresseLocale: $adresseLocale, portLocal: $portLocal)';
+}
+
+/// Un **trait d'annotation** (« tableau blanc ») dessiné par-dessus l'image,
+/// sous forme plate (miroir de `nd_ffi::AnnotationDto`).
+///
+///  * [genre] sélectionne la forme : `0` = trait libre / polyligne, `1` =
+///    rectangle, `2` = ellipse, `3` = flèche, `4` = texte.
+///  * [points] est une liste plate de coordonnées `[x0, y0, x1, y1, …]`,
+///    **normalisées** dans `0.0..=1.0`. Le nombre de points attendu dépend du
+///    [genre] : trait libre = 1 point ou plus ; rectangle = 2 points (coins
+///    opposés) ; ellipse = 2 points (centre puis demi-axes) ; flèche =
+///    2 points (origine, pointe) ; texte = 1 point (position).
+///  * [couleurArgb] est empaquetée **ARGB** (`0xAARRGGBB`, convention `Color`
+///    de Flutter).
+///  * [epaisseur] est l'épaisseur du tracé ; pour le texte, la hauteur de
+///    police.
+///  * [texte] ne concerne que le genre texte (`4`) : requis pour lui, `null`
+///    sinon.
+///
+/// À la réception ([NativeApi.sessionAnnotationStream]), une couche de `n`
+/// traits est livrée comme `n` [AnnotationDto] successifs.
+class AnnotationDto {
+  const AnnotationDto({
+    required this.genre,
+    required this.points,
+    required this.couleurArgb,
+    required this.epaisseur,
+    this.texte,
+  });
+
+  /// Forme du trait (voir la doc du type).
+  final int genre;
+
+  /// Coordonnées plates `[x0, y0, x1, y1, …]`, normalisées `0.0..=1.0`.
+  final Float32List points;
+
+  /// Couleur ARGB empaquetée (`0xAARRGGBB`).
+  final int couleurArgb;
+
+  /// Épaisseur du tracé (ou hauteur de police pour le texte).
+  final double epaisseur;
+
+  /// Contenu textuel (genre texte uniquement ; requis pour lui, sinon `null`).
+  final String? texte;
+
+  @override
+  bool operator ==(Object other) =>
+      other is AnnotationDto &&
+      other.genre == genre &&
+      listEquals(other.points, points) &&
+      other.couleurArgb == couleurArgb &&
+      other.epaisseur == epaisseur &&
+      other.texte == texte;
+
+  @override
+  int get hashCode => Object.hash(
+      genre, Object.hashAll(points), couleurArgb, epaisseur, texte);
+
+  @override
+  String toString() =>
+      'AnnotationDto(genre: $genre, points: ${points.length}, '
+      'couleurArgb: $couleurArgb, epaisseur: $epaisseur, texte: $texte)';
+}
+
+/// Métadonnées d'un enregistrement ouvert pour relecture (miroir de
+/// `nd_ffi::RecordingInfoDto`, renvoyé par [NativeApi.openRecording]). [id]
+/// indexe le lecteur pour [NativeApi.recordingNextFrame],
+/// [NativeApi.recordingSeek] et [NativeApi.closeRecording].
+class RecordingInfoDto {
+  const RecordingInfoDto({
+    required this.id,
+    required this.largeur,
+    required this.hauteur,
+    required this.fps,
+    required this.dureeUs,
+    required this.nbImages,
+  });
+
+  /// Identifiant opaque du lecteur (à repasser aux fonctions `recording*`).
+  final int id;
+
+  /// Largeur des images, en pixels.
+  final int largeur;
+
+  /// Hauteur des images, en pixels.
+  final int hauteur;
+
+  /// Cadence nominale, en images par seconde.
+  final int fps;
+
+  /// Durée de l'enregistrement, en microsecondes.
+  final int dureeUs;
+
+  /// Nombre d'images de l'enregistrement.
+  final int nbImages;
+
+  @override
+  bool operator ==(Object other) =>
+      other is RecordingInfoDto &&
+      other.id == id &&
+      other.largeur == largeur &&
+      other.hauteur == hauteur &&
+      other.fps == fps &&
+      other.dureeUs == dureeUs &&
+      other.nbImages == nbImages;
+
+  @override
+  int get hashCode => Object.hash(id, largeur, hauteur, fps, dureeUs, nbImages);
+
+  @override
+  String toString() => 'RecordingInfoDto(id: $id, ${largeur}x$hauteur, '
+      'fps: $fps, dureeUs: $dureeUs, nbImages: $nbImages)';
+}
+
+// ---------------------------------------------------------------------------
+// Plan de contrôle de session : moniteurs réels et infos système du pair
+// (lot « contrôles de session »).
+//
+// Miroirs des DTO de `nd-ffi`. Comme pour [RegionDto], l'adaptateur FRB
+// convertit les types générés vers ces miroirs écrits à la main.
+// ---------------------------------------------------------------------------
+
+/// Un écran de l'hôte publié sur le plan de contrôle (miroir de
+/// `nd_ffi::MonitorInfoDto`, lui-même miroir plat de `nd_core::RemoteMonitor`) :
+/// remplace l'« Écran 1/2 » codé en dur du sous-menu moniteurs.
+class MonitorInfoDto {
+  const MonitorInfoDto({
+    required this.index,
+    required this.largeur,
+    required this.hauteur,
+    required this.principal,
+  });
+
+  /// Index du moniteur — l'argument attendu par [NativeApi.switchMonitor].
+  final int index;
+
+  /// Largeur en pixels.
+  final int largeur;
+
+  /// Hauteur en pixels.
+  final int hauteur;
+
+  /// Vrai pour le moniteur principal.
+  final bool principal;
+
+  @override
+  bool operator ==(Object other) =>
+      other is MonitorInfoDto &&
+      other.index == index &&
+      other.largeur == largeur &&
+      other.hauteur == hauteur &&
+      other.principal == principal;
+
+  @override
+  int get hashCode => Object.hash(index, largeur, hauteur, principal);
+
+  @override
+  String toString() => 'MonitorInfoDto(index: $index, ${largeur}x$hauteur, '
+      'principal: $principal)';
+}
+
+/// Infos système du pair (miroir de `nd_ffi::PeerInfoDto`, lui-même miroir
+/// plat de `nd_core::PeerInfo`) : remplace le contenu inventé du panneau
+/// « Infos système » de la session.
+class PeerInfoDto {
+  const PeerInfoDto({required this.hote, required this.os});
+
+  /// Nom d'hôte de la machine distante.
+  final String hote;
+
+  /// Système d'exploitation (chaîne libre, ex. « windows (x86_64) »).
+  final String os;
+
+  @override
+  bool operator ==(Object other) =>
+      other is PeerInfoDto && other.hote == hote && other.os == os;
+
+  @override
+  int get hashCode => Object.hash(hote, os);
+
+  @override
+  String toString() => 'PeerInfoDto(hote: $hote, os: $os)';
+}
+
+// ---------------------------------------------------------------------------
 // Interface de la façade
 // ---------------------------------------------------------------------------
 
@@ -1264,4 +1548,134 @@ abstract interface class NativeApi {
   /// Renvoie le journal des accès, du plus récent au plus ancien. Miroir de
   /// `nd_ffi::access_log`.
   Future<List<AccessLogEntryDto>> accessLog();
+
+  // -------------------------------------------------------------------------
+  // Capacités avancées de session (lot « capacités moteur ») — chacune gardée
+  // par le mode étendu ([SessionOptionsDto.extendedFeatures]) côté cœur. Le
+  // [sessionId] est du même type (`int`) que celui de [sendChat]/[switchMonitor].
+  // -------------------------------------------------------------------------
+
+  /// Active ou lève le **mode confidentialité** de la session : l'hôte cesse de
+  /// diffuser son écran réel (rideau noir). L'état effectif se relit via
+  /// [privacyActive]. Sans effet hors mode étendu. Miroir de
+  /// `nd_ffi::set_privacy`.
+  Future<void> setPrivacy(int sessionId, bool actif);
+
+  /// État du mode confidentialité connu localement (rideau actif à afficher).
+  /// Miroir de `nd_ffi::privacy_active`.
+  Future<bool> privacyActive(int sessionId);
+
+  /// Restreint la zone d'écran partagée au [region] fourni, ou **rétablit le
+  /// plein écran** avec `null`. Sans effet hors mode étendu. Miroir de
+  /// `nd_ffi::set_session_region`.
+  Future<void> setSessionRegion(int sessionId, RegionDto? region);
+
+  /// Cadre d'écran actuellement demandé (`null` = plein écran). Miroir de
+  /// `nd_ffi::session_requested_region`.
+  Future<RegionDto?> sessionRequestedRegion(int sessionId);
+
+  /// Ouvre un **tunnel TCP de session** : écoute sur `127.0.0.1:portLocal`
+  /// ([portLocal] `== 0` → port éphémère) et relaie chaque connexion locale
+  /// vers [cible] (« ip:port ») à travers la session. Renvoie l'adresse locale
+  /// écoutée ; lève [NovaApiException] si [cible] est mal formée ou si
+  /// l'écouteur local ne peut être lié. Miroir de `nd_ffi::open_tunnel`.
+  Future<TunnelOuvertDto> openTunnel(
+    int sessionId,
+    int portLocal,
+    String cible,
+  );
+
+  /// Ferme **tous** les tunnels TCP ouverts pour la session (idempotent).
+  /// Miroir de `nd_ffi::close_tunnels`.
+  Future<void> closeTunnels(int sessionId);
+
+  /// Envoie une [annotation] au pair (un trait). Les annotations reçues du pair
+  /// arrivent sur [sessionAnnotationStream]. Sans effet hors mode étendu ; lève
+  /// [NovaApiException] si le DTO est mal formé (genre inconnu, points
+  /// incohérents, texte manquant). Miroir de `nd_ffi::send_annotation`.
+  Future<void> sendAnnotation(int sessionId, AnnotationDto annotation);
+
+  /// Flux des annotations **reçues** du pair, à raison d'un [AnnotationDto] par
+  /// trait de la couche reçue. Miroir de `nd_ffi::session_annotation_stream`.
+  Stream<AnnotationDto> sessionAnnotationStream(int sessionId);
+
+  /// Ouvre un enregistrement (`.mp4` ou `.ndr`, format auto-détecté) pour
+  /// relecture et renvoie ses métadonnées + un identifiant opaque ; lève
+  /// [NovaApiException] en cas d'échec. L'enregistrement vit jusqu'à
+  /// [closeRecording]. Miroir de `nd_ffi::open_recording`.
+  Future<RecordingInfoDto> openRecording(String chemin);
+
+  /// Décode et renvoie la **prochaine image** de l'enregistrement [id] (même
+  /// [VideoFrameDto] que [sessionVideoStream]), ou `null` en fin de flux.
+  /// Miroir de `nd_ffi::recording_next_frame`.
+  Future<VideoFrameDto?> recordingNextFrame(int id);
+
+  /// Repositionne la lecture sur l'image-clé la plus proche avant (ou à)
+  /// [timestampUs] (microsecondes). Le prochain [recordingNextFrame] repart de
+  /// cette image-clé. Miroir de `nd_ffi::recording_seek`.
+  Future<void> recordingSeek(int id, int timestampUs);
+
+  /// Ferme l'enregistrement [id] et libère ses ressources (identifiant
+  /// invalidé). Miroir de `nd_ffi::close_recording`.
+  Future<void> closeRecording(int id);
+
+  // -------------------------------------------------------------------------
+  // Plan de contrôle de session (lot « contrôles de session ») : permissions à
+  // chaud, préréglage de qualité, enregistrement à chaud, moniteurs réels,
+  // infos système du pair. Même [sessionId] que [sendChat]/[switchMonitor].
+  // -------------------------------------------------------------------------
+
+  /// Renégocie **une** permission de la session **en cours** : accorde
+  /// (`autorise` vrai) ou retire (faux) la capacité [capacite] de l'ensemble
+  /// vivant — l'hôte l'applique au vol à son filtre d'injection. [capacite]
+  /// est une **clé stable** parmi : `voir_ecran`, `souris`, `clavier`,
+  /// `presse_papiers_lecture`, `presse_papiers_ecriture`, `fichiers_envoi`,
+  /// `fichiers_reception`, `audio`, `redemarrage`, `enregistrement`,
+  /// `confidentialite`, `tunnel` ; toute autre clé lève [NovaApiException]
+  /// (sans toucher à la session). Sans effet hors mode étendu. Miroir de
+  /// `nd_ffi::session_set_permission`.
+  Future<void> sessionSetPermission(
+    int sessionId,
+    String capacite,
+    bool autorise,
+  );
+
+  /// Applique un **préréglage de qualité** à l'encodeur hôte : [preset] parmi
+  /// `auto`, `fluide`, `equilibre`, `netteté` (mappé vers un profil ABR et un
+  /// plafond de débit ; l'ABR continue de dégrader **sous** le plafond). Un
+  /// préréglage inconnu lève [NovaApiException]. Sans effet hors mode étendu.
+  /// Miroir de `nd_ffi::session_set_quality`.
+  Future<void> sessionSetQuality(int sessionId, String preset);
+
+  /// Démarre (avec un [chemin] MP4) ou arrête (`null`) l'**enregistrement
+  /// local** de l'hôte **en cours de session** : démarrer ouvre une nouvelle
+  /// époque MP4, arrêter clôt proprement le fichier (relisible). Côté hôte
+  /// uniquement (sans effet côté contrôleur) ; lève [NovaApiException] si la
+  /// session est inconnue. Miroir de `nd_ffi::session_set_recording`.
+  Future<void> sessionSetRecording(int sessionId, String? chemin);
+
+  /// Liste des **moniteurs réels** de l'hôte, publiée par lui sur le canal
+  /// `Control` à l'établissement (rôle contrôleur). Liste **vide** tant que
+  /// l'annonce n'est pas arrivée ou si l'hôte n'a aucun écran énumérable ;
+  /// l'index de chaque entrée est celui qu'attend [switchMonitor]. Miroir de
+  /// `nd_ffi::session_monitors`.
+  Future<List<MonitorInfoDto>> sessionMonitors(int sessionId);
+
+  /// **Infos système du pair** (nom d'hôte + OS) publiées par l'hôte à
+  /// l'établissement (rôle contrôleur) ; lève [NovaApiException] tant que
+  /// l'annonce n'est pas arrivée (ou si la session est inconnue). Miroir de
+  /// `nd_ffi::session_peer_info`.
+  Future<PeerInfoDto> sessionPeerInfo(int sessionId);
+
+  // -------------------------------------------------------------------------
+  // Réseau annexe : Wake-on-LAN
+  // -------------------------------------------------------------------------
+
+  /// Réveille un appareil par **Wake-on-LAN** : émet le « paquet magique » pour
+  /// l'adresse [mac] (« 01:23:45:67:89:AB », séparateurs `:` ou `-`, casse
+  /// indifférente) vers [broadcast] (« ip:port ») ou, si `null`/vide, vers
+  /// `255.255.255.255:9` (diffusion limitée au sous-réseau local, port 9). Lève
+  /// [NovaApiException] si la MAC ou l'adresse de diffusion est invalide, ou si
+  /// l'émission UDP échoue. Miroir de `nd_ffi::send_wol`.
+  Future<void> sendWol(String mac, {String? broadcast});
 }

@@ -8,6 +8,13 @@ description = "Client de rendez-vous, ICE/STUN/TURN, mise en relation P2P (voir 
 [dependencies]
 nd-proto = { workspace = true }
 
+# Serveur de rendez-vous local exécutable : registre « nu » (non authentifié)
+# que `establish_p2p`/`await_p2p` consomment via `RendezvousClient`. Mince
+# enveloppe autour de `nd_signaling::serve` (voir l'en-tête du binaire).
+[[bin]]
+name = "nd-registre"
+path = "src/bin/nd-registre.rs"
+
 # Dépendance de DEV uniquement (sonde examples/p2p_two_process.rs et test
 # d'intégration tests/p2p_quic.rs : porter QUIC sur la socket percée).
 # À l'exécution, nd-signaling reste sans dépendance transport — c'est nd-core

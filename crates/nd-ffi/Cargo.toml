@@ -43,6 +43,11 @@ flutter_rust_bridge = "=2.12.0"
 # Répertoires temporaires uniques pour les tests de persistance (round-trips,
 # réouverture depuis disque).
 tempfile = "3"
+# Relecture d'enregistrement : fabrication d'un vrai MP4 H.264 dans les tests
+# (image synthétique `CapturedFrame` → encodeur `nd-codec` → muxeur
+# `nd-features`), afin d'exercer `open_recording`/`recording_next_frame` de bout
+# en bout. Uniquement pour les tests — pas une dépendance de la façade.
+nd-capture = { workspace = true }
 
 [lints]
 workspace = true

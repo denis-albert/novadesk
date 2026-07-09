@@ -40,6 +40,7 @@
 //! démarrage (le premier échantillon d'un MP4 doit être une image-clé).
 
 pub mod mp4;
+pub mod player;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -77,6 +78,28 @@ pub struct RecordedFrame {
     /// Vrai si l'image est une image clef (décodable sans les précédentes).
     pub keyframe: bool,
     /// Données encodées, opaques pour l'enregistreur.
+    pub data: Vec<u8>,
+}
+
+/// Un échantillon encodé **prêt à décoder**, extrait d'un enregistrement pour
+/// la relecture.
+///
+/// Contrairement à [`mp4::Mp4Sample`] (données AVCC, longueurs préfixées,
+/// internes au conteneur MP4), `data` est ici du **H.264 Annex B** directement
+/// consommable par un décodeur : codes de départ `00 00 00 01`, SPS/PPS
+/// réinjectés en tête de chaque image-clé. De quoi bâtir un
+/// [`nd_codec::EncodedChunk`] et appeler [`nd_codec::VideoDecoder::decode`]
+/// sans autre traitement (voir [`mp4::Mp4Reader::samples`],
+/// [`SessionReader::samples`] et [`player::RecordingPlayer`]).
+///
+/// L'extraction ne fait que lire le conteneur : elle ne dépend d'aucun codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedSample {
+    /// Horodatage de présentation, en microsecondes depuis le début.
+    pub timestamp_us: u64,
+    /// Vrai si l'échantillon est une image-clé (décodable seul).
+    pub is_keyframe: bool,
+    /// Données H.264 Annex B, prêtes pour le décodeur.
     pub data: Vec<u8>,
 }
 
@@ -885,6 +908,31 @@ impl<R: Read + Seek> SessionReader<R> {
         })
     }
 
+    /// Repositionne la lecture au tout début des images. Utile pour relire un
+    /// conteneur après [`SessionReader::samples`] ou
+    /// [`SessionReader::seek_to_keyframe`].
+    pub fn rewind(&mut self) -> Result<()> {
+        self.rembobiner()
+    }
+
+    /// Extrait **tous** les échantillons encodés du conteneur pour la
+    /// relecture : rembobine, parcourt les images et rend leurs données
+    /// **telles quelles** — déjà du H.264 Annex B pour un enregistrement
+    /// `nova-h264` (chaque image-clé porte ses SPS/PPS). Laisse la lecture en
+    /// fin de flux.
+    pub fn samples(&mut self) -> Result<Vec<EncodedSample>> {
+        self.rewind()?;
+        let mut sortie = Vec::new();
+        while let Some(image) = self.next_frame()? {
+            sortie.push(EncodedSample {
+                timestamp_us: image.timestamp_us,
+                is_keyframe: image.keyframe,
+                data: image.data,
+            });
+        }
+        Ok(sortie)
+    }
+
     /// Repositionne le lecteur au tout début des images.
     fn rembobiner(&mut self) -> Result<()> {
         self.position = self
@@ -1102,6 +1150,23 @@ mod tests_v2 {
         assert_eq!(lecteur.seek_to_keyframe(80_000).unwrap(), 80_000);
         assert_eq!(lecteur.seek_to_keyframe(u64::MAX).unwrap(), 80_000);
         assert_eq!(lecteur.seek_to_keyframe(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn v2_samples_extrait_tout_et_rewind_relit() {
+        let mut lecteur = SessionReader::new(Cursor::new(enregistrement(true))).unwrap();
+        let echs = lecteur.samples().unwrap();
+        assert_eq!(echs.len(), 9);
+        for (i, e) in echs.iter().enumerate() {
+            assert_eq!(e.timestamp_us, i as u64 * 10_000);
+            assert_eq!(e.is_keyframe, i % 4 == 0);
+            assert_eq!(e.data, vec![i as u8; 5]);
+        }
+        // rewind repositionne au début pour une relecture séquentielle.
+        lecteur.rewind().unwrap();
+        assert_eq!(lecteur.next_frame().unwrap().unwrap().timestamp_us, 0);
+        // samples() est idempotent (rembobinage interne).
+        assert_eq!(lecteur.samples().unwrap(), echs);
     }
 
     #[test]

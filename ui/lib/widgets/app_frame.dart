@@ -16,6 +16,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
 import 'nova_icons.dart';
+import 'nova_kit.dart';
 
 /// Vue active — pilote la mise en évidence du rail et de l'onglet.
 enum NovaVue { accueil, carnet, enregistrements, nonSurveille, reglages, session }
@@ -27,6 +28,7 @@ class NovaAppFrame extends StatelessWidget {
     required this.corps,
     this.vue = NovaVue.accueil,
     this.libelleSession,
+    this.latenceSessionMs,
     this.masquerChrome = false,
     this.afficherRail = true,
     this.etatGauche,
@@ -40,6 +42,10 @@ class NovaAppFrame extends StatelessWidget {
 
   /// Si non nul : un onglet de session (pastille verte + alias) est affiché.
   final String? libelleSession;
+
+  /// Latence mesurée de la session (ms), affichée dans l'onglet de session
+  /// (maquette `.stab2 .lt` — « 14 ms » en chiffres tabulaires).
+  final int? latenceSessionMs;
 
   /// Plein écran : masque tout le chrome, ne laisse que le corps.
   final bool masquerChrome;
@@ -55,7 +61,11 @@ class NovaAppFrame extends StatelessWidget {
     if (masquerChrome) return corps;
     return Column(
       children: [
-        _BarreTitre(vue: vue, libelleSession: libelleSession),
+        _BarreTitre(
+          vue: vue,
+          libelleSession: libelleSession,
+          latenceMs: latenceSessionMs,
+        ),
         Expanded(
           child: afficherRail
               ? Row(
@@ -98,10 +108,11 @@ void naviguerVersVue(WidgetRef ref, BuildContext context, NovaVue vue) {
 // ---------------------------------------------------------------------------
 
 class _BarreTitre extends ConsumerWidget {
-  const _BarreTitre({required this.vue, this.libelleSession});
+  const _BarreTitre({required this.vue, this.libelleSession, this.latenceMs});
 
   final NovaVue vue;
   final String? libelleSession;
+  final int? latenceMs;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -134,19 +145,19 @@ class _BarreTitre extends ConsumerWidget {
             _OngletSession(
               libelle: libelleSession!,
               actif: enSession,
+              latenceMs: latenceMs,
               onFermer: () => Navigator.of(context).maybePop(),
             ),
           _BoutonPlus(
-            onTap: () => ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                  content: Text('Connexions multiples en onglets — à venir.')),
-            ),
+            onTap: () => NovaToast.montrer(
+                context, 'Connexions multiples en onglets — à venir.',
+                info: true),
           ),
           const Spacer(),
           _BoutonCompte(
-            onTap: () => ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Gestion du compte — à venir.')),
-            ),
+            onTap: () => NovaToast.montrer(
+                context, 'Gestion du compte — à venir.',
+                info: true),
           ),
           const _ControlesFenetre(),
         ],
@@ -156,7 +167,7 @@ class _BarreTitre extends ConsumerWidget {
 }
 
 /// Onglet de la barre de titre (hauteur pleine, filet actif rouge 2 px bas).
-class _OngletTitre extends StatefulWidget {
+class _OngletTitre extends StatelessWidget {
   const _OngletTitre({
     required this.libelle,
     required this.icone,
@@ -170,69 +181,62 @@ class _OngletTitre extends StatefulWidget {
   final VoidCallback onTap;
 
   @override
-  State<_OngletTitre> createState() => _OngletTitreState();
-}
-
-class _OngletTitreState extends State<_OngletTitre> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: Container(
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: widget.actif ? t.fenetre : Colors.transparent,
-            border: Border(
-              right: BorderSide(color: t.filet),
-              bottom: BorderSide(
-                width: 2,
-                color: widget.actif ? kNovaRouge : Colors.transparent,
-              ),
+    return NovaActivable(
+      onTap: onTap,
+      rayonFocus: 0,
+      label: libelle,
+      builder: (context, survole, focus) => Container(
+        height: 38,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: actif ? t.fenetre : Colors.transparent,
+          border: Border(
+            right: BorderSide(color: t.filet),
+            bottom: BorderSide(
+              width: 2,
+              color: actif ? kNovaRouge : Colors.transparent,
             ),
           ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              NovaIcone(widget.icone,
-                  taille: 14,
-                  couleur: widget.actif || _survole ? t.texte : t.texte2),
-              const SizedBox(width: 8),
-              Text(
-                widget.libelle,
-                style: TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: widget.actif ? FontWeight.w600 : FontWeight.w400,
-                  color: widget.actif || _survole ? t.texte : t.texte2,
-                ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            NovaIcone(icone,
+                taille: 14, couleur: actif || survole ? t.texte : t.texte2),
+            const SizedBox(width: 8),
+            Text(
+              libelle,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: actif ? FontWeight.w600 : FontWeight.w400,
+                color: actif || survole ? t.texte : t.texte2,
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
   }
 }
 
-/// Onglet de session : pastille verte + alias + croix de fermeture.
+/// Onglet de session : pastille verte + alias + latence + croix de fermeture
+/// (maquette `.stab2` avec `.d`, `.lt` et `.x`).
 class _OngletSession extends StatelessWidget {
   const _OngletSession({
     required this.libelle,
     required this.actif,
     required this.onFermer,
+    this.latenceMs,
   });
 
   final String libelle;
   final bool actif;
   final VoidCallback onFermer;
+
+  /// Latence mesurée (ms), en petit à droite de l'alias (`.lt tnum`).
+  final int? latenceMs;
 
   @override
   Widget build(BuildContext context) {
@@ -259,14 +263,31 @@ class _OngletSession extends StatelessWidget {
             decoration: BoxDecoration(color: t.vert, shape: BoxShape.circle),
           ),
           const SizedBox(width: 8),
-          Text(
-            libelle,
-            style: TextStyle(
-              fontSize: 12.5,
-              fontWeight: actif ? FontWeight.w600 : FontWeight.w400,
-              color: actif ? t.texte : t.texte2,
+          // Alias borné : jamais d'overflow de la barre de titre.
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 180),
+            child: Text(
+              libelle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: actif ? FontWeight.w600 : FontWeight.w400,
+                color: actif ? t.texte : t.texte2,
+              ),
             ),
           ),
+          if (latenceMs != null) ...[
+            const SizedBox(width: 8),
+            Text(
+              '$latenceMs ms',
+              style: TextStyle(
+                fontSize: 10,
+                color: t.texte3,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
           const SizedBox(width: 8),
           _CroixOnglet(onTap: onFermer),
         ],
@@ -275,111 +296,78 @@ class _OngletSession extends StatelessWidget {
   }
 }
 
-class _CroixOnglet extends StatefulWidget {
+class _CroixOnglet extends StatelessWidget {
   const _CroixOnglet({required this.onTap});
   final VoidCallback onTap;
 
   @override
-  State<_CroixOnglet> createState() => _CroixOngletState();
-}
-
-class _CroixOngletState extends State<_CroixOnglet> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: Container(
-          width: 16,
-          height: 16,
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: _survole ? t.survol : Colors.transparent,
-            borderRadius: BorderRadius.circular(3),
-          ),
-          child: NovaIcone(NovaIcones.fermer,
-              taille: 11, couleur: _survole ? t.texte : t.texte3),
+    return NovaActivable(
+      onTap: onTap,
+      rayonFocus: 3,
+      label: 'Fermer la session',
+      builder: (context, survole, focus) => Container(
+        width: 16,
+        height: 16,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: survole ? t.survol : Colors.transparent,
+          borderRadius: BorderRadius.circular(3),
         ),
+        child: NovaIcone(NovaIcones.fermer,
+            taille: 11, couleur: survole ? t.texte : t.texte3),
       ),
     );
   }
 }
 
 /// Bouton « + » (nouvelle connexion en onglet).
-class _BoutonPlus extends StatefulWidget {
+class _BoutonPlus extends StatelessWidget {
   const _BoutonPlus({required this.onTap});
   final VoidCallback onTap;
 
   @override
-  State<_BoutonPlus> createState() => _BoutonPlusState();
-}
-
-class _BoutonPlusState extends State<_BoutonPlus> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: Container(
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          alignment: Alignment.center,
-          child: NovaIcone(NovaIcones.plus,
-              taille: 15, couleur: _survole ? t.texte : t.texte3),
-        ),
+    return NovaActivable(
+      onTap: onTap,
+      rayonFocus: 0,
+      label: 'Nouvelle connexion',
+      builder: (context, survole, focus) => Container(
+        height: 38,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        alignment: Alignment.center,
+        child: NovaIcone(NovaIcones.plus,
+            taille: 15, couleur: survole ? t.texte : t.texte3),
       ),
     );
   }
 }
 
 /// « Compte » à droite de la barre de titre (maquette `.acct`).
-class _BoutonCompte extends StatefulWidget {
+class _BoutonCompte extends StatelessWidget {
   const _BoutonCompte({required this.onTap});
   final VoidCallback onTap;
 
   @override
-  State<_BoutonCompte> createState() => _BoutonCompteState();
-}
-
-class _BoutonCompteState extends State<_BoutonCompte> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: Container(
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 11),
-          color: _survole ? t.survol : Colors.transparent,
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              NovaIcone(NovaIcones.utilisateur, taille: 15, couleur: t.texte2),
-              const SizedBox(width: 7),
-              Text('Compte',
-                  style: TextStyle(fontSize: 12, color: t.texte2)),
-            ],
-          ),
+    return NovaActivable(
+      onTap: onTap,
+      rayonFocus: 0,
+      label: 'Compte',
+      builder: (context, survole, focus) => Container(
+        height: 38,
+        padding: const EdgeInsets.symmetric(horizontal: 11),
+        color: survole ? t.survol : Colors.transparent,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            NovaIcone(NovaIcones.utilisateur, taille: 15, couleur: t.texte2),
+            const SizedBox(width: 7),
+            Text('Compte', style: TextStyle(fontSize: 12, color: t.texte2)),
+          ],
         ),
       ),
     );
@@ -416,7 +404,7 @@ class _ControlesFenetre extends StatelessWidget {
   }
 }
 
-class _BoutonFenetre extends StatefulWidget {
+class _BoutonFenetre extends StatelessWidget {
   const _BoutonFenetre({
     required this.icone,
     required this.infobulle,
@@ -430,39 +418,30 @@ class _BoutonFenetre extends StatefulWidget {
   final bool fermeture;
 
   @override
-  State<_BoutonFenetre> createState() => _BoutonFenetreState();
-}
-
-class _BoutonFenetreState extends State<_BoutonFenetre> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final Color fond = !_survole
-        ? Colors.transparent
-        : widget.fermeture
-            ? kNovaRouge
-            : t.survol;
-    final Color couleur = _survole
-        ? (widget.fermeture ? Colors.white : t.texte)
-        : t.texte2;
     return Tooltip(
-      message: widget.infobulle,
-      child: MouseRegion(
-        onEnter: (_) => setState(() => _survole = true),
-        onExit: (_) => setState(() => _survole = false),
-        child: GestureDetector(
-          onTap: widget.onTap,
-          behavior: HitTestBehavior.opaque,
-          child: Container(
+      message: infobulle,
+      child: NovaActivable(
+        onTap: onTap,
+        rayonFocus: 0,
+        label: infobulle,
+        builder: (context, survole, focus) {
+          final Color fond = !survole
+              ? Colors.transparent
+              : fermeture
+                  ? kNovaRouge
+                  : t.survol;
+          final Color couleur =
+              survole ? (fermeture ? Colors.white : t.texte) : t.texte2;
+          return Container(
             width: 38,
             height: 38,
             color: fond,
             alignment: Alignment.center,
-            child: NovaIcone(widget.icone, taille: 15, couleur: couleur),
-          ),
-        ),
+            child: NovaIcone(icone, taille: 15, couleur: couleur),
+          );
+        },
       ),
     );
   }
@@ -526,7 +505,7 @@ class _RailNavigation extends ConsumerWidget {
   }
 }
 
-class _RailItem extends StatefulWidget {
+class _RailItem extends StatelessWidget {
   const _RailItem({
     required this.icone,
     required this.infobulle,
@@ -540,35 +519,23 @@ class _RailItem extends StatefulWidget {
   final VoidCallback onTap;
 
   @override
-  State<_RailItem> createState() => _RailItemState();
-}
-
-class _RailItemState extends State<_RailItem> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final couleur = widget.actif
-        ? kNovaRouge
-        : (_survole ? t.texte : t.texte3);
     return Tooltip(
-      message: widget.infobulle,
+      message: infobulle,
       preferBelow: false,
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => _survole = true),
-        onExit: (_) => setState(() => _survole = false),
-        child: GestureDetector(
-          onTap: widget.onTap,
-          behavior: HitTestBehavior.opaque,
-          child: SizedBox(
+      child: NovaActivable(
+        onTap: onTap,
+        label: infobulle,
+        builder: (context, survole, focus) {
+          final couleur = actif ? kNovaRouge : (survole ? t.texte : t.texte3);
+          return SizedBox(
             width: 50,
             height: 40,
             child: Stack(
               alignment: Alignment.center,
               children: [
-                if (widget.actif)
+                if (actif)
                   Positioned(
                     left: 0,
                     top: 8,
@@ -587,17 +554,17 @@ class _RailItemState extends State<_RailItem> {
                   height: 36,
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
-                    color: widget.actif
+                    color: actif
                         ? t.fenetre
-                        : (_survole ? t.survol : Colors.transparent),
+                        : (survole ? t.survol : Colors.transparent),
                     borderRadius: BorderRadius.circular(kNovaRayon),
                   ),
-                  child: NovaIcone(widget.icone, taille: 19, couleur: couleur),
+                  child: NovaIcone(icone, taille: 19, couleur: couleur),
                 ),
               ],
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
   }

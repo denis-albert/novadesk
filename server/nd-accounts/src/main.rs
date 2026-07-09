@@ -2,7 +2,12 @@
 //!
 //! Opérations : `register(email, password)` (mot de passe haché **Argon2id**,
 //! format PHC) et `login(email, password)` → jeton de session opaque (32 octets
-//! aléatoires, encodés en hexadécimal).
+//! aléatoires, encodés en hexadécimal), valable [`DUREE_SESSION_S`] (24 h) et
+//! révocable par `deconnecter` (requête réseau `Deconnexion`). Les tentatives
+//! de connexion (mot de passe **et** code TOTP) sont freinées : après
+//! [`SEUIL_ECHECS_CONNEXION`] échecs consécutifs sur un e-mail — même
+//! inconnu, pour ne rien révéler —, les tentatives sont bloquées pendant
+//! [`DUREE_BLOCAGE_CONNEXION_S`] (anti-force-brute).
 //!
 //! Persistance (module [`storage`]) : [`AccountStore::open`] attache le
 //! magasin à une base **redb** transactionnelle — comptes, secrets 2FA, liens
@@ -76,6 +81,21 @@ use licensing::Plan;
 /// Adresse d'écoute par défaut (9000 = rendez-vous, 9100 = relais).
 const ADRESSE_DEFAUT: &str = "0.0.0.0:9200";
 
+/// Durée de vie d'une session opaque, en secondes (24 h) : au-delà, le jeton
+/// est refusé comme périmé et l'utilisateur doit se reconnecter.
+const DUREE_SESSION_S: u64 = 86_400;
+
+/// Nombre d'échecs de connexion consécutifs (mot de passe ou code TOTP) avant
+/// blocage temporaire des tentatives sur l'e-mail présenté.
+const SEUIL_ECHECS_CONNEXION: u32 = 10;
+
+/// Durée du blocage anti-force-brute après le seuil d'échecs, en secondes.
+const DUREE_BLOCAGE_CONNEXION_S: u64 = 300;
+
+/// Délai d'E/S par connexion TCP (une requête, une réponse) : un client muet
+/// ou au goutte-à-goutte ne retient ni thread ni socket indéfiniment.
+const DELAI_ECHANGE: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Erreurs
 // ---------------------------------------------------------------------------
@@ -101,8 +121,13 @@ pub enum AccountError {
     /// Compte inconnu (activation 2FA sur un e-mail non enregistré, sujet
     /// OIDC jamais lié, etc.).
     CompteInconnu,
-    /// Jeton de session inconnu ou périmé.
+    /// Jeton de session inconnu, périmé ou révoqué par déconnexion.
     SessionInvalide,
+    /// Trop d'échecs de connexion consécutifs sur cet e-mail : les tentatives
+    /// sont bloquées pendant [`DUREE_BLOCAGE_CONNEXION_S`] (anti-force-brute,
+    /// mot de passe et code TOTP confondus). S'applique aussi aux e-mails
+    /// inconnus, pour ne pas révéler l'existence d'un compte.
+    TropDeTentatives,
     /// Le sujet OIDC est déjà lié à un **autre** compte local.
     SujetOidcDejaLie,
     /// Erreur du stockage persistant (chargement ou sauvegarde du fichier de
@@ -128,6 +153,9 @@ impl fmt::Display for AccountError {
             }
             AccountError::CompteInconnu => write!(f, "compte inconnu"),
             AccountError::SessionInvalide => write!(f, "session invalide ou expirée"),
+            AccountError::TropDeTentatives => {
+                write!(f, "trop de tentatives de connexion, réessayer plus tard")
+            }
             AccountError::SujetOidcDejaLie => {
                 write!(f, "ce sujet OIDC est déjà lié à un autre compte")
             }
@@ -143,22 +171,40 @@ impl std::error::Error for AccountError {}
 // Logique métier
 // ---------------------------------------------------------------------------
 
-/// État interne : e-mail → hachage PHC, jeton de session → e-mail,
-/// e-mail → secret TOTP pour les comptes ayant activé la 2FA, sujet OIDC
-/// (`iss|sub`) → e-mail pour les identités fédérées liées, et e-mail → plan
-/// de licence attribué.
+/// Session ouverte : compte authentifié et échéance (secondes UNIX).
+struct SessionOuverte {
+    email: String,
+    expire_a: u64,
+}
+
+/// Suivi des échecs de connexion consécutifs sur un e-mail (anti-force-brute).
+struct EchecsConnexion {
+    /// Échecs consécutifs depuis le dernier succès (mot de passe ou TOTP).
+    consecutifs: u32,
+    /// Horodatage du dernier échec (purge des entrées dormantes).
+    dernier_echec: u64,
+    /// Fin du blocage (secondes UNIX), 0 si aucun blocage en cours.
+    bloque_jusqu_a: u64,
+}
+
+/// État interne : e-mail → hachage PHC, jeton de session → session ouverte
+/// (compte + échéance), e-mail → secret TOTP pour les comptes ayant activé la
+/// 2FA, sujet OIDC (`iss|sub`) → e-mail pour les identités fédérées liées,
+/// e-mail → plan de licence attribué, et e-mail → échecs de connexion
+/// consécutifs (anti-force-brute).
 #[derive(Default)]
 struct Etat {
     comptes: HashMap<String, String>,
-    sessions: HashMap<String, String>,
+    sessions: HashMap<String, SessionOuverte>,
     secrets_2fa: HashMap<String, Vec<u8>>,
     liens_oidc: HashMap<String, String>,
     licences: HashMap<String, Plan>,
+    echecs_connexion: HashMap<String, EchecsConnexion>,
 }
 
 impl Etat {
     /// Reconstruit l'état depuis la base (secrets déjà déchiffrés). Les
-    /// sessions repartent vides (volatiles par conception).
+    /// sessions et compteurs d'échecs repartent vides (volatils par conception).
     fn depuis_durable(durable: storage::EtatDurable) -> Self {
         Self {
             comptes: durable.comptes,
@@ -166,6 +212,20 @@ impl Etat {
             secrets_2fa: durable.secrets_2fa,
             liens_oidc: durable.liens_oidc,
             licences: durable.licences,
+            echecs_connexion: HashMap::new(),
+        }
+    }
+
+    /// E-mail de la session `jeton` si elle existe et n'est pas périmée ; une
+    /// session périmée est retirée au passage (purge paresseuse).
+    fn email_de_session(&mut self, jeton: &str, maintenant: u64) -> Option<String> {
+        match self.sessions.get(jeton) {
+            Some(session) if session.expire_a > maintenant => Some(session.email.clone()),
+            Some(_) => {
+                self.sessions.remove(jeton);
+                None
+            }
+            None => None,
         }
     }
 }
@@ -346,53 +406,132 @@ impl AccountStore {
             .map_err(|_| AccountError::IdentifiantsInvalides)
     }
 
-    /// Ouvre une session : jeton opaque associé au compte.
-    fn ouvrir_session(&self, email: &str) -> String {
+    /// Ouvre une session : jeton opaque associé au compte, expirant dans
+    /// [`DUREE_SESSION_S`]. Les sessions périmées sont purgées au passage.
+    fn ouvrir_session(&self, email: &str, maintenant: u64) -> String {
         let jeton = jeton_aleatoire();
-        self.etat
-            .lock()
-            .unwrap()
-            .sessions
-            .insert(jeton.clone(), email.to_string());
+        let mut etat = self.etat.lock().unwrap();
+        etat.sessions
+            .retain(|_, session| session.expire_a > maintenant);
+        etat.sessions.insert(
+            jeton.clone(),
+            SessionOuverte {
+                email: email.to_string(),
+                expire_a: maintenant.saturating_add(DUREE_SESSION_S),
+            },
+        );
         jeton
     }
 
-    /// Vérifie les identifiants et renvoie un jeton de session opaque.
+    /// Vérifie les identifiants et renvoie un jeton de session opaque
+    /// (valable [`DUREE_SESSION_S`]).
     ///
     /// # Errors
     /// `IdentifiantsInvalides` si l'e-mail est inconnu ou le mot de passe faux
     /// (indistincts pour ne pas révéler l'existence d'un compte) ;
+    /// `TropDeTentatives` après [`SEUIL_ECHECS_CONNEXION`] échecs consécutifs ;
     /// `DeuxFacteursRequis` si le compte a la 2FA activée (passer par
     /// [`Self::login_2fa`]).
     pub fn login(&self, email: &str, password: &str) -> Result<String, AccountError> {
-        self.verifier_identifiants_auditees(email, password)?;
+        self.login_a(email, password, unix_maintenant())
+    }
+
+    /// Cœur de [`Self::login`] à horloge explicite (tests déterministes).
+    fn login_a(
+        &self,
+        email: &str,
+        password: &str,
+        maintenant: u64,
+    ) -> Result<String, AccountError> {
+        self.verifier_identifiants_auditees(email, password, maintenant)?;
         // Un compte protégé par 2FA exige le second facteur : ce n'est pas un
-        // échec de connexion, rien n'est consigné.
+        // échec de connexion, rien n'est consigné (et le compteur d'échecs
+        // reste en l'état tant que l'authentification n'est pas complète).
         if self.etat.lock().unwrap().secrets_2fa.contains_key(email) {
             return Err(AccountError::DeuxFacteursRequis);
         }
-        let jeton = self.ouvrir_session(email);
+        self.effacer_echecs_connexion(email);
+        let jeton = self.ouvrir_session(email, maintenant);
         self.auditer(audit::AuditEvent::LoginSuccess {
             email: email.to_string(),
         });
         Ok(jeton)
     }
 
-    /// Comme [`Self::verifier_identifiants`], mais consigne un
-    /// `LoginFailure` si les identifiants sont invalides (pas pour une
-    /// erreur interne, qui ne dit rien sur la tentative).
+    /// Comme [`Self::verifier_identifiants`], mais applique le blocage
+    /// anti-force-brute et consigne un `LoginFailure` si les identifiants sont
+    /// invalides (pas pour une erreur interne, qui ne dit rien sur la
+    /// tentative). Le compteur d'échecs n'est **pas** remis à zéro ici : un
+    /// mot de passe correct ne suffit pas (le second facteur peut encore
+    /// échouer) — seul un [`Self::login_a`] / [`Self::login_2fa_a`] abouti
+    /// l'efface.
     fn verifier_identifiants_auditees(
         &self,
         email: &str,
         password: &str,
+        maintenant: u64,
     ) -> Result<(), AccountError> {
+        if self.connexion_bloquee(email, maintenant) {
+            // Tentative pendant un blocage : refusée sans vérifier le mot de
+            // passe (le coût Argon2 n'est même pas payé), mais consignée.
+            self.auditer(audit::AuditEvent::LoginFailure {
+                email: email.to_string(),
+            });
+            return Err(AccountError::TropDeTentatives);
+        }
         let resultat = self.verifier_identifiants(email, password);
         if resultat == Err(AccountError::IdentifiantsInvalides) {
+            self.consigner_echec_connexion(email, maintenant);
             self.auditer(audit::AuditEvent::LoginFailure {
                 email: email.to_string(),
             });
         }
         resultat
+    }
+
+    /// L'e-mail est-il actuellement bloqué (anti-force-brute) ? Un blocage
+    /// échu est levé au passage (le compteur repart de zéro).
+    fn connexion_bloquee(&self, email: &str, maintenant: u64) -> bool {
+        let mut etat = self.etat.lock().unwrap();
+        match etat.echecs_connexion.get(email) {
+            Some(echecs) if echecs.bloque_jusqu_a > maintenant => true,
+            Some(echecs) if echecs.bloque_jusqu_a != 0 => {
+                // Blocage échu : l'entrée est levée, les tentatives reprennent.
+                etat.echecs_connexion.remove(email);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Consigne un échec de connexion (mot de passe ou TOTP) ; au-delà de
+    /// [`SEUIL_ECHECS_CONNEXION`] échecs consécutifs, bloque l'e-mail pour
+    /// [`DUREE_BLOCAGE_CONNEXION_S`]. Les entrées dormantes sont purgées au
+    /// passage (pas de croissance sans borne sous un arrosage d'e-mails).
+    fn consigner_echec_connexion(&self, email: &str, maintenant: u64) {
+        let mut etat = self.etat.lock().unwrap();
+        etat.echecs_connexion.retain(|_, echecs| {
+            echecs.bloque_jusqu_a > maintenant
+                || maintenant.saturating_sub(echecs.dernier_echec) <= DUREE_BLOCAGE_CONNEXION_S
+        });
+        let echecs = etat
+            .echecs_connexion
+            .entry(email.to_string())
+            .or_insert(EchecsConnexion {
+                consecutifs: 0,
+                dernier_echec: maintenant,
+                bloque_jusqu_a: 0,
+            });
+        echecs.consecutifs = echecs.consecutifs.saturating_add(1);
+        echecs.dernier_echec = maintenant;
+        if echecs.consecutifs >= SEUIL_ECHECS_CONNEXION {
+            echecs.bloque_jusqu_a = maintenant.saturating_add(DUREE_BLOCAGE_CONNEXION_S);
+        }
+    }
+
+    /// Remet le compteur d'échecs à zéro (connexion réussie).
+    fn effacer_echecs_connexion(&self, email: &str) {
+        self.etat.lock().unwrap().echecs_connexion.remove(email);
     }
 
     /// Active la 2FA TOTP sur un compte : génère un secret de 20 octets, le
@@ -432,10 +571,11 @@ impl AccountStore {
     ///
     /// # Errors
     /// `IdentifiantsInvalides` (mot de passe, vérifié en premier),
+    /// `TropDeTentatives` pendant un blocage anti-force-brute,
     /// `DeuxFacteursDejaActives` si un secret existe déjà, puis les erreurs
     /// de [`Self::enable_2fa`].
     pub fn activer_2fa_reseau(&self, email: &str, password: &str) -> Result<Vec<u8>, AccountError> {
-        self.verifier_identifiants_auditees(email, password)?;
+        self.verifier_identifiants_auditees(email, password, unix_maintenant())?;
         if self.etat.lock().unwrap().secrets_2fa.contains_key(email) {
             return Err(AccountError::DeuxFacteursDejaActives);
         }
@@ -443,10 +583,13 @@ impl AccountStore {
     }
 
     /// Connexion avec second facteur : mot de passe **puis** code TOTP
-    /// (fenêtre de ±1 pas de 30 s autour de l'heure système).
+    /// (fenêtre de ±1 pas de 30 s autour de l'heure système). Un code TOTP
+    /// incorrect compte comme un échec de connexion pour le blocage
+    /// anti-force-brute — on ne peut pas énumérer le million de codes.
     ///
     /// # Errors
     /// `IdentifiantsInvalides` (mot de passe, vérifié en premier),
+    /// `TropDeTentatives` pendant un blocage anti-force-brute,
     /// `DeuxFacteursNonActives` si le compte n'a pas de 2FA,
     /// `CodeTotpInvalide` si le code est malformé ou hors fenêtre.
     pub fn login_2fa(
@@ -455,7 +598,18 @@ impl AccountStore {
         password: &str,
         code: &str,
     ) -> Result<String, AccountError> {
-        self.verifier_identifiants_auditees(email, password)?;
+        self.login_2fa_a(email, password, code, unix_maintenant())
+    }
+
+    /// Cœur de [`Self::login_2fa`] à horloge explicite (tests déterministes).
+    fn login_2fa_a(
+        &self,
+        email: &str,
+        password: &str,
+        code: &str,
+        maintenant: u64,
+    ) -> Result<String, AccountError> {
+        self.verifier_identifiants_auditees(email, password, maintenant)?;
         let secret = self
             .etat
             .lock()
@@ -464,24 +618,42 @@ impl AccountStore {
             .get(email)
             .cloned()
             .ok_or(AccountError::DeuxFacteursNonActives)?;
-        if !totp::verify_totp(&secret, code, unix_maintenant()) {
-            // Second facteur incorrect : c'est un échec de connexion.
+        if !totp::verify_totp(&secret, code, maintenant) {
+            // Second facteur incorrect : c'est un échec de connexion, compté
+            // comme tel par le blocage anti-force-brute.
+            self.consigner_echec_connexion(email, maintenant);
             self.auditer(audit::AuditEvent::LoginFailure {
                 email: email.to_string(),
             });
             return Err(AccountError::CodeTotpInvalide);
         }
-        let jeton = self.ouvrir_session(email);
+        self.effacer_echecs_connexion(email);
+        let jeton = self.ouvrir_session(email, maintenant);
         self.auditer(audit::AuditEvent::LoginSuccess {
             email: email.to_string(),
         });
         Ok(jeton)
     }
 
-    /// Résout un jeton de session en e-mail de compte (None si inconnu).
+    /// Résout un jeton de session en e-mail de compte (None si inconnu,
+    /// périmé — voir [`DUREE_SESSION_S`] — ou révoqué par déconnexion).
     #[must_use]
     pub fn verify_token(&self, jeton: &str) -> Option<String> {
-        self.etat.lock().unwrap().sessions.get(jeton).cloned()
+        self.verify_token_a(jeton, unix_maintenant())
+    }
+
+    /// Cœur de [`Self::verify_token`] à horloge explicite (tests).
+    fn verify_token_a(&self, jeton: &str, maintenant: u64) -> Option<String> {
+        self.etat
+            .lock()
+            .unwrap()
+            .email_de_session(jeton, maintenant)
+    }
+
+    /// Révoque une session (déconnexion). Renvoie `true` si le jeton
+    /// désignait une session encore ouverte, `false` sinon (idempotent).
+    pub fn deconnecter(&self, jeton: &str) -> bool {
+        self.etat.lock().unwrap().sessions.remove(jeton).is_some()
     }
 
     // -- Fédération OIDC (module [`oidc`]) ----------------------------------
@@ -544,7 +716,7 @@ impl AccountStore {
             .get(subject)
             .cloned()
             .ok_or(AccountError::CompteInconnu)?;
-        let jeton = self.ouvrir_session(&email);
+        let jeton = self.ouvrir_session(&email, unix_maintenant());
         self.auditer(audit::AuditEvent::LoginSuccess { email });
         Ok(jeton)
     }
@@ -593,14 +765,21 @@ impl AccountStore {
     /// [`Self::cle_publique_jetons`]. Voir le format dans la doc de [`jeton`].
     ///
     /// # Errors
-    /// `SessionInvalide` si le jeton de session est inconnu ou périmé.
+    /// `SessionInvalide` si le jeton de session est inconnu, périmé ou révoqué.
     pub fn emettre_jeton_applicatif(&self, jeton_session: &str) -> Result<String, AccountError> {
+        self.emettre_jeton_applicatif_a(jeton_session, unix_maintenant())
+    }
+
+    /// Cœur de [`Self::emettre_jeton_applicatif`] à horloge explicite (tests).
+    fn emettre_jeton_applicatif_a(
+        &self,
+        jeton_session: &str,
+        maintenant: u64,
+    ) -> Result<String, AccountError> {
         let (email, plan) = {
-            let etat = self.etat.lock().unwrap();
+            let mut etat = self.etat.lock().unwrap();
             let email = etat
-                .sessions
-                .get(jeton_session)
-                .cloned()
+                .email_de_session(jeton_session, maintenant)
                 .ok_or(AccountError::SessionInvalide)?;
             let plan = etat.licences.get(&email).copied().unwrap_or_default();
             (email, plan)
@@ -609,7 +788,7 @@ impl AccountStore {
             &email,
             &["utilisateur"],
             plan.nom(),
-            unix_maintenant(),
+            maintenant,
             jeton::DUREE_DEFAUT_S,
         ))
     }
@@ -684,9 +863,10 @@ fn jeton_aleatoire() -> String {
 /// [`Response::DeuxFacteursRequis`] → `LoginDeuxFacteurs`), **OIDC**
 /// (`DemarrerOidc` → URL d'autorisation ; `RappelOidc` avec le `state` et le
 /// code renvoyés par le fournisseur), **jetons applicatifs** (`EmettreJeton`,
-/// `ClePubliqueJetons` pour nd-api) et **licences** (`AttribuerPlan` — auto-
+/// `ClePubliqueJetons` pour nd-api), **licences** (`AttribuerPlan` — auto-
 /// service documenté, en attendant un rôle admin/facturation —,
-/// `ConsulterLicence`).
+/// `ConsulterLicence`) et **déconnexion** (`Deconnexion`, révocation de la
+/// session).
 enum Request {
     /// 1 — Création de compte.
     Register { email: String, password: String },
@@ -712,6 +892,9 @@ enum Request {
     AttribuerPlan { session: String, plan: String },
     /// 10 — Licence du compte de la session (plan + quota).
     ConsulterLicence { session: String },
+    /// 11 — Déconnexion : révoque le jeton de session (idempotent — répond
+    /// `Ok` même si la session était déjà close ou périmée).
+    Deconnexion { session: String },
 }
 
 /// Réponses du protocole (préfixées d'un octet d'étiquette).
@@ -813,6 +996,10 @@ impl Request {
                 out.push(10);
                 put_bytes(&mut out, session.as_bytes());
             }
+            Request::Deconnexion { session } => {
+                out.push(11);
+                put_bytes(&mut out, session.as_bytes());
+            }
         }
         out
     }
@@ -851,6 +1038,9 @@ impl Request {
                 plan: read_string(d, &mut p)?,
             },
             10 => Request::ConsulterLicence {
+                session: read_string(d, &mut p)?,
+            },
+            11 => Request::Deconnexion {
                 session: read_string(d, &mut p)?,
             },
             _ => return None,
@@ -1063,6 +1253,12 @@ impl Service {
                     max_sessions: plan.max_sessions().unwrap_or(0),
                 }))
             }
+            // Idempotente : révoquer une session déjà close reste un succès
+            // (et ne révèle pas si le jeton présenté était encore valide).
+            Request::Deconnexion { session } => {
+                self.store.deconnecter(&session);
+                Response::Ok
+            }
         }
     }
 
@@ -1135,6 +1331,8 @@ pub fn serve(listener: TcpListener, service: Service) -> std::io::Result<()> {
 }
 
 fn handle_conn(mut stream: TcpStream, service: &Service) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(DELAI_ECHANGE))?;
+    stream.set_write_timeout(Some(DELAI_ECHANGE))?;
     let req_bytes = read_frame(&mut stream)?;
     let resp = match Request::from_bytes(&req_bytes) {
         Some(requete) => service.traiter(requete),
@@ -1783,6 +1981,9 @@ mod tests {
             Request::ConsulterLicence {
                 session: "jeton".into(),
             },
+            Request::Deconnexion {
+                session: "jeton".into(),
+            },
         ];
         for r in &reqs {
             assert!(Request::from_bytes(&r.to_bytes()).is_some());
@@ -1892,6 +2093,182 @@ mod tests {
             store.emettre_jeton_applicatif("jeton-fantome"),
             Err(AccountError::SessionInvalide)
         );
+    }
+
+    // -- Sessions : expiration et déconnexion ---------------------------------
+
+    #[test]
+    fn session_expiree_refusee_et_purgee() {
+        let store = store_test();
+        store.register("tom@example.com", "mdp").expect("register");
+        let jeton = store.login("tom@example.com", "mdp").expect("login");
+        let maintenant = unix_maintenant();
+
+        // Encore valable juste avant l'échéance...
+        assert_eq!(
+            store
+                .verify_token_a(&jeton, maintenant + DUREE_SESSION_S - 1)
+                .as_deref(),
+            Some("tom@example.com")
+        );
+        // ... refusée à l'échéance (et l'entrée est purgée au passage).
+        assert_eq!(
+            store.verify_token_a(&jeton, maintenant + DUREE_SESSION_S),
+            None
+        );
+        assert!(store.etat.lock().unwrap().sessions.is_empty());
+        // L'émission de jeton applicatif refuse aussi une session périmée.
+        let jeton2 = store.login("tom@example.com", "mdp").expect("relogin");
+        assert_eq!(
+            store.emettre_jeton_applicatif_a(&jeton2, unix_maintenant() + DUREE_SESSION_S + 1),
+            Err(AccountError::SessionInvalide)
+        );
+    }
+
+    #[test]
+    fn ouverture_de_session_purge_les_sessions_perimees() {
+        let store = store_test();
+        store.register("ana@example.com", "mdp").expect("register");
+        // Session ouverte « à l'instant 0 » : expire à DUREE_SESSION_S.
+        let ancienne = store.ouvrir_session("ana@example.com", 0);
+        // Une ouverture bien après l'échéance balaie la session morte.
+        let recente = store.ouvrir_session("ana@example.com", DUREE_SESSION_S + 1);
+        let etat = store.etat.lock().unwrap();
+        assert!(
+            !etat.sessions.contains_key(&ancienne),
+            "session morte purgée"
+        );
+        assert!(etat.sessions.contains_key(&recente));
+        assert_eq!(etat.sessions.len(), 1);
+    }
+
+    #[test]
+    fn deconnexion_revoque_la_session() {
+        let store = store_test();
+        store.register("lou@example.com", "mdp").expect("register");
+        let jeton = store.login("lou@example.com", "mdp").expect("login");
+        assert!(store.verify_token(&jeton).is_some());
+
+        assert!(store.deconnecter(&jeton), "session révoquée");
+        assert_eq!(store.verify_token(&jeton), None);
+        assert_eq!(
+            store.emettre_jeton_applicatif(&jeton),
+            Err(AccountError::SessionInvalide)
+        );
+        // Idempotente : une seconde déconnexion ne trouve plus rien.
+        assert!(!store.deconnecter(&jeton));
+    }
+
+    // -- Anti-force-brute ------------------------------------------------------
+
+    #[test]
+    fn blocage_apres_echecs_repetes_puis_deblocage() {
+        let store = store_test();
+        store
+            .register("max@example.com", "bon-mdp")
+            .expect("register");
+        let maintenant = unix_maintenant();
+
+        // Les échecs sous le seuil renvoient l'erreur indistincte habituelle.
+        for _ in 0..SEUIL_ECHECS_CONNEXION {
+            assert_eq!(
+                store.login_a("max@example.com", "mauvais", maintenant),
+                Err(AccountError::IdentifiantsInvalides)
+            );
+        }
+        // Seuil atteint : même le BON mot de passe est refusé pendant le
+        // blocage (le coût Argon2 n'est plus payé).
+        assert_eq!(
+            store.login_a("max@example.com", "bon-mdp", maintenant),
+            Err(AccountError::TropDeTentatives)
+        );
+        // Le blocage est borné : une fois échu, la connexion repasse et le
+        // compteur repart de zéro.
+        assert!(store
+            .login_a(
+                "max@example.com",
+                "bon-mdp",
+                maintenant + DUREE_BLOCAGE_CONNEXION_S + 1
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn succes_remet_le_compteur_d_echecs_a_zero() {
+        let store = store_test();
+        store.register("pia@example.com", "mdp").expect("register");
+        let maintenant = unix_maintenant();
+        for _ in 0..SEUIL_ECHECS_CONNEXION - 1 {
+            let _ = store.login_a("pia@example.com", "mauvais", maintenant);
+        }
+        // Un succès efface l'ardoise...
+        assert!(store.login_a("pia@example.com", "mdp", maintenant).is_ok());
+        // ... si bien qu'une nouvelle rafale sous le seuil ne bloque pas.
+        for _ in 0..SEUIL_ECHECS_CONNEXION - 1 {
+            assert_eq!(
+                store.login_a("pia@example.com", "mauvais", maintenant),
+                Err(AccountError::IdentifiantsInvalides)
+            );
+        }
+        assert!(store.login_a("pia@example.com", "mdp", maintenant).is_ok());
+    }
+
+    #[test]
+    fn email_inconnu_freine_sans_reveler_l_existence() {
+        let store = store_test();
+        let maintenant = unix_maintenant();
+        // Même un e-mail jamais enregistré finit bloqué : l'erreur ne révèle
+        // pas si le compte existe.
+        for _ in 0..SEUIL_ECHECS_CONNEXION {
+            assert_eq!(
+                store.login_a("fantome@example.com", "x", maintenant),
+                Err(AccountError::IdentifiantsInvalides)
+            );
+        }
+        assert_eq!(
+            store.login_a("fantome@example.com", "x", maintenant),
+            Err(AccountError::TropDeTentatives)
+        );
+    }
+
+    #[test]
+    fn codes_totp_faux_comptent_dans_le_blocage() {
+        let store = store_test();
+        store.register("rey@example.com", "mdp").expect("register");
+        let secret = store.enable_2fa("rey@example.com").expect("enable_2fa");
+        let maintenant = unix_maintenant();
+
+        // Un code garanti faux au temps `maintenant` (hors fenêtre ±1 pas).
+        let valides: Vec<String> = (-1i64..=1)
+            .map(|k| {
+                let t = maintenant.saturating_add_signed(k * totp::PERIODE_S as i64);
+                totp::totp_at(&secret, t)
+            })
+            .collect();
+        let faux = (0..10u32)
+            .map(|n| format!("{n:06}"))
+            .find(|c| !valides.contains(c))
+            .expect("un candidat hors fenêtre");
+
+        // Le second facteur ne s'énumère pas : au seuil, tout est bloqué.
+        for _ in 0..SEUIL_ECHECS_CONNEXION {
+            assert_eq!(
+                store.login_2fa_a("rey@example.com", "mdp", &faux, maintenant),
+                Err(AccountError::CodeTotpInvalide)
+            );
+        }
+        let bon = totp::totp_at(&secret, maintenant);
+        assert_eq!(
+            store.login_2fa_a("rey@example.com", "mdp", &bon, maintenant),
+            Err(AccountError::TropDeTentatives)
+        );
+        // Après l'échéance du blocage, le bon code (recalculé pour l'instant
+        // considéré) ouvre une session.
+        let plus_tard = maintenant + DUREE_BLOCAGE_CONNEXION_S + 1;
+        let bon_plus_tard = totp::totp_at(&secret, plus_tard);
+        assert!(store
+            .login_2fa_a("rey@example.com", "mdp", &bon_plus_tard, plus_tard)
+            .is_ok());
     }
 
     #[test]
@@ -2096,6 +2473,40 @@ mod tests {
             jeton::verifier_jeton(&jws, &cle, unix_maintenant()).expect("jeton vérifiable");
         assert_eq!(claims.sujet, "api@example.com");
         assert_eq!(claims.plan, "pro");
+    }
+
+    #[test]
+    fn serveur_tcp_deconnexion_revoque_la_session() {
+        let store = store_test();
+        let addr = serveur(Service::nouveau(store.clone()));
+        store.register("exit@example.com", "mdp").expect("register");
+        let session = store.login("exit@example.com", "mdp").expect("login");
+
+        // La déconnexion répond Ok et la session ne sert plus à rien.
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::Deconnexion {
+                    session: session.clone(),
+                }
+            ),
+            Response::Ok
+        ));
+        assert_eq!(store.verify_token(&session), None);
+        assert!(matches!(
+            aller_retour(
+                addr,
+                &Request::EmettreJeton {
+                    session: session.clone()
+                }
+            ),
+            Response::Erreur { .. }
+        ));
+        // Idempotente : rejouer la déconnexion reste un succès.
+        assert!(matches!(
+            aller_retour(addr, &Request::Deconnexion { session }),
+            Response::Ok
+        ));
     }
 
     #[test]

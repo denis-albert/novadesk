@@ -11,6 +11,7 @@ use std::io::Cursor;
 use nd_capture::{CapturedFrame, FrameImage, PixelFormat};
 use nd_codec::{create_decoder, create_encoder, CodecKind, EncodedChunk, EncoderConfig};
 use nd_features::{ndr_to_mp4, IndexedRecorder, Mp4Muxer, Mp4Reader, RecordingMetadata};
+use nd_features::{EncodedSample, RecordingFormat, RecordingPlayer};
 use nd_features::{SessionReader, ValidationReport};
 use nd_proto::MonitorId;
 
@@ -174,6 +175,111 @@ fn ndr_puis_conversion_mp4_redecodable() {
     let (decodees, largeur, hauteur) = redecoder_tout(&mut lecteur);
     assert_eq!(decodees, IMAGES);
     assert_eq!((largeur, hauteur), (LARGEUR, HAUTEUR));
+}
+
+/// Re-décode une liste d'échantillons Annex B (extraits par le lecteur de
+/// relecture) avec un décodeur H.264 réel ; rend (nombre décodé, dims vues).
+fn redecoder_echantillons(echs: &[EncodedSample]) -> (u64, u32, u32) {
+    let mut decodeur = create_decoder(CodecKind::H264).expect("décodeur H.264 logiciel");
+    let (mut decodees, mut largeur, mut hauteur) = (0u64, 0u32, 0u32);
+    for echantillon in echs {
+        let unite = EncodedChunk {
+            data: echantillon.data.clone(),
+            is_keyframe: echantillon.is_keyframe,
+            monitor: MonitorId(0),
+            timestamp_us: echantillon.timestamp_us,
+        };
+        if let Some(image) = decodeur.decode(&unite).expect("décodage H.264") {
+            decodees += 1;
+            largeur = image.width;
+            hauteur = image.height;
+            assert_eq!(image.rgba.len(), (image.width * image.height * 4) as usize);
+        }
+    }
+    (decodees, largeur, hauteur)
+}
+
+#[test]
+fn player_mp4_extrait_les_samples_et_les_redecode() {
+    let unites = encoder_session();
+
+    // Enregistre un vrai MP4, puis rouvre-le avec le lecteur de relecture.
+    let mut muxeur = Mp4Muxer::new(Cursor::new(Vec::new()), metadonnees()).unwrap();
+    for unite in &unites {
+        muxeur.record_video_chunk(unite).unwrap();
+    }
+    let octets = muxeur.finish().unwrap().into_inner();
+
+    let mut player = RecordingPlayer::open(Cursor::new(octets)).unwrap();
+    assert_eq!(player.format(), RecordingFormat::Mp4);
+    assert_eq!((player.width(), player.height()), (LARGEUR, HAUTEUR));
+    assert_eq!(player.fps(), 25);
+    assert_eq!(player.frames(), IMAGES);
+    assert_eq!(player.duration_us(), IMAGES * PAS_US);
+
+    // Extraction → re-décodage réel : chaque échantillon ressort en image.
+    let echs = player.samples().unwrap();
+    assert_eq!(echs.len() as u64, IMAGES);
+    let (decodees, largeur, hauteur) = redecoder_echantillons(&echs);
+    assert_eq!(decodees, IMAGES, "toutes les images doivent se décoder");
+    assert_eq!((largeur, hauteur), (LARGEUR, HAUTEUR));
+}
+
+#[test]
+fn player_ndr_extrait_les_samples_et_les_redecode() {
+    let unites = encoder_session();
+
+    let mut archive = IndexedRecorder::new(Vec::new(), metadonnees(), true).unwrap();
+    for unite in &unites {
+        archive.record_video_chunk(unite).unwrap();
+    }
+    let ndr = archive.finish().unwrap();
+
+    let mut player = RecordingPlayer::open(Cursor::new(ndr)).unwrap();
+    assert_eq!(player.format(), RecordingFormat::Ndr);
+    assert_eq!((player.width(), player.height()), (LARGEUR, HAUTEUR));
+    assert_eq!(player.fps(), 25);
+    assert_eq!(player.frames(), IMAGES);
+
+    let echs = player.samples().unwrap();
+    assert_eq!(echs.len() as u64, IMAGES);
+    let (decodees, largeur, hauteur) = redecoder_echantillons(&echs);
+    assert_eq!(decodees, IMAGES);
+    assert_eq!((largeur, hauteur), (LARGEUR, HAUTEUR));
+}
+
+#[test]
+fn player_sample_at_retombe_sur_une_image_cle_redecodable() {
+    let unites = encoder_session();
+    let cles: Vec<u64> = unites
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.is_keyframe)
+        .map(|(i, _)| i as u64 * PAS_US)
+        .collect();
+    // Images-clés forcées toutes les 10 images → ts 0, 400 000, 800 000.
+    assert!(cles.contains(&400_000));
+
+    let mut muxeur = Mp4Muxer::new(Cursor::new(Vec::new()), metadonnees()).unwrap();
+    for unite in &unites {
+        muxeur.record_video_chunk(unite).unwrap();
+    }
+    let octets = muxeur.finish().unwrap().into_inner();
+    let mut player = RecordingPlayer::open(Cursor::new(octets)).unwrap();
+
+    // Seek entre la clé 400 000 et la clé 800 000 → retombe sur 400 000.
+    let s = player.sample_at(450_000).unwrap().unwrap();
+    assert!(s.is_keyframe);
+    assert_eq!(s.timestamp_us, 400_000);
+
+    // L'image-clé seule se re-décode en une image aux bonnes dimensions :
+    // preuve que le point de reprise du seek est bien décodable.
+    let (decodees, largeur, hauteur) = redecoder_echantillons(std::slice::from_ref(&s));
+    assert_eq!(decodees, 1);
+    assert_eq!((largeur, hauteur), (LARGEUR, HAUTEUR));
+
+    // Avant la première clé → première clé (ts 0).
+    assert_eq!(player.sample_at(0).unwrap().unwrap().timestamp_us, 0);
 }
 
 #[test]

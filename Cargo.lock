@@ -1883,6 +1883,7 @@ dependencies = [
  "blake3",
  "flutter_rust_bridge",
  "nd-audio",
+ "nd-capture",
  "nd-codec",
  "nd-core",
  "nd-crypto",

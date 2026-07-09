@@ -1,19 +1,37 @@
 /// Providers Riverpod partagés par les écrans.
 ///
-/// Conformément au plan 10 §10.2.3, ces providers ne portent **aucune logique
-/// métier** : ils exposent la façade [NativeApi] et lisent l'**état persistant**
-/// du cœur (identité locale, carnet, réglages, historique, enregistrements,
-/// accès non surveillé). Sous mock, cet état persiste en mémoire — le parcours
-/// reste entièrement démontrable sans le cœur natif.
+/// Conformément au plan 10 §10.2.3, ces providers exposent la façade
+/// [NativeApi] et lisent l'**état persistant** du cœur (identité locale,
+/// carnet, réglages, historique, enregistrements, accès non surveillé). Sous
+/// mock, cet état persiste en mémoire — le parcours reste entièrement
+/// démontrable sans le cœur natif.
+///
+/// Exception assumée : le **cycle de vie applicatif** de l'hôte non surveillé
+/// ([hoteNonSurveilleProvider]) vit ici et non dans un écran — la réception
+/// d'accès distants ne doit pas dépendre de l'onglet affiché (blocker B4).
 library;
 
+import 'dart:async';
 import 'dart:math';
 
-import 'package:flutter/material.dart' show ThemeMode;
+import 'package:flutter/material.dart'
+    show GlobalKey, NavigatorState, ThemeMode, debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../bridge/mock_api.dart';
 import '../bridge/native_api.dart';
+import '../screens/incoming_request_dialog.dart';
+
+/// Clé globale du navigateur racine, branchée sur `MaterialApp.navigatorKey`
+/// dans `main.dart`. Elle permet aux services de niveau application — l'hôte
+/// non surveillé en tête — d'ouvrir le dialogue d'acceptation **au-dessus de
+/// n'importe quel écran**, sans dépendre du contexte d'une vue particulière.
+final GlobalKey<NavigatorState> cleNavigateurGlobale =
+    GlobalKey<NavigatorState>();
+
+/// Message lisible d'une erreur venue de la façade : [NovaApiException.message]
+/// quand c'en est une, `toString()` sinon.
+String messageNova(Object e) => e is NovaApiException ? e.message : e.toString();
 
 /// Point d'accès unique à la façade `nd-ffi`.
 ///
@@ -172,6 +190,323 @@ final unattendedConfigProvider = FutureProvider<UnattendedConfigDto>((ref) {
 final accessLogProvider = FutureProvider<List<AccessLogEntryDto>>((ref) {
   return ref.watch(nativeApiProvider).accessLog();
 });
+
+// ---------------------------------------------------------------------------
+// Hôte « accès non surveillé » — cycle de vie de niveau APPLICATION
+// ---------------------------------------------------------------------------
+//
+// Historiquement, l'hôte était démarré/arrêté par `unattended_screen` et
+// stoppé par son `dispose()` : quitter l'onglet coupait la réception. Le
+// cycle de vie appartient désormais à ce notifier, qui vit aussi longtemps
+// que l'application ; l'écran n'en est plus qu'une vue.
+
+/// État observable de l'hôte non surveillé (voir [HoteNonSurveilleNotifier]).
+class EtatHoteNonSurveille {
+  /// Construit un état ; par défaut : hôte inactif, compteurs à zéro.
+  const EtatHoteNonSurveille({
+    this.actif = false,
+    this.bascule = false,
+    this.stats,
+    this.servies = 0,
+    this.refusees = 0,
+    this.derniereErreur,
+    this.erreurCompteur = 0,
+  });
+
+  /// L'hôte écoute les demandes de connexion entrantes.
+  final bool actif;
+
+  /// Transition (démarrage/arrêt) en cours — l'interrupteur est alors inhibé.
+  final bool bascule;
+
+  /// Dernier instantané des statistiques cumulées (`unattended_stats`),
+  /// rafraîchi toutes les 2 s tant que l'hôte est actif ; `null` sinon.
+  final SessionStatsDto? stats;
+
+  /// Demandes acceptées depuis l'activation en cours.
+  final int servies;
+
+  /// Demandes refusées depuis l'activation en cours.
+  final int refusees;
+
+  /// Dernière erreur de fond (flux des demandes interrompu…), à afficher en
+  /// toast global par la coquille.
+  final String? derniereErreur;
+
+  /// Compteur monotone d'erreurs : permet de re-signaler une erreur au
+  /// libellé identique.
+  final int erreurCompteur;
+
+  /// Sentinelle interne de [copier] pour distinguer « non fourni » de `null`.
+  static const Object _inchange = Object();
+
+  /// Copie de l'état avec les champs fournis remplacés ([stats] et
+  /// [derniereErreur] acceptent explicitement `null` pour être effacés).
+  EtatHoteNonSurveille copier({
+    bool? actif,
+    bool? bascule,
+    Object? stats = _inchange,
+    int? servies,
+    int? refusees,
+    Object? derniereErreur = _inchange,
+    int? erreurCompteur,
+  }) {
+    return EtatHoteNonSurveille(
+      actif: actif ?? this.actif,
+      bascule: bascule ?? this.bascule,
+      stats:
+          identical(stats, _inchange) ? this.stats : stats as SessionStatsDto?,
+      servies: servies ?? this.servies,
+      refusees: refusees ?? this.refusees,
+      derniereErreur: identical(derniereErreur, _inchange)
+          ? this.derniereErreur
+          : derniereErreur as String?,
+      erreurCompteur: erreurCompteur ?? this.erreurCompteur,
+    );
+  }
+}
+
+/// Hôte non surveillé au **niveau application** : possède l'identifiant
+/// d'hôte, l'abonnement aux demandes entrantes et le minuteur de statistiques.
+/// Il survit aux changements d'onglet — seuls [HoteNonSurveilleNotifier.desactiver]
+/// ou la fermeture de l'application (best-effort) arrêtent l'hôte. Démarré
+/// automatiquement au lancement si un mot de passe permanent est configuré
+/// (voir `main.dart`).
+final hoteNonSurveilleProvider =
+    NotifierProvider<HoteNonSurveilleNotifier, EtatHoteNonSurveille>(
+        HoteNonSurveilleNotifier.new);
+
+/// Notifier propriétaire de l'hôte non surveillé réel (façade `nd-ffi`) :
+/// démarre l'hôte (`start_unattended_host`), s'abonne aux demandes entrantes
+/// (`unattended_incoming_stream`) — le dialogue d'acceptation s'ouvre via
+/// [cleNavigateurGlobale], donc au-dessus de n'importe quelle section —,
+/// tranche via `approve_incoming`, journalise (`record_access`), suit les
+/// statistiques (`unattended_stats`) et arrête l'hôte (`stop_unattended_host`).
+class HoteNonSurveilleNotifier extends Notifier<EtatHoteNonSurveille> {
+  int? _hostId;
+  StreamSubscription<IncomingRequestDto>? _abonnementEntrantes;
+  Timer? _minuterieStats;
+  bool _dialogueEnCours = false;
+  bool _elimine = false;
+
+  NativeApi get _api => ref.read(nativeApiProvider);
+
+  @override
+  EtatHoteNonSurveille build() {
+    // Nettoyage best-effort à la destruction du conteneur Riverpod (fermeture
+    // de l'application) : flux, minuteur, puis hôte natif. La façade est
+    // capturée maintenant — `ref` n'est plus utilisable pendant le dispose.
+    final api = ref.read(nativeApiProvider);
+    ref.onDispose(() {
+      _elimine = true;
+      unawaited(_abonnementEntrantes?.cancel());
+      _abonnementEntrantes = null;
+      _minuterieStats?.cancel();
+      _minuterieStats = null;
+      final id = _hostId;
+      _hostId = null;
+      if (id != null) unawaited(api.stopUnattendedHost(id));
+    });
+    return const EtatHoteNonSurveille();
+  }
+
+  /// Démarre l'hôte — un seul à la fois : sans effet si déjà actif ou en
+  /// transition. Lève ([NovaApiException]…) en cas d'échec, à charge de
+  /// l'appelant d'afficher le message.
+  Future<void> activer() async {
+    if (_elimine || _hostId != null || state.bascule) return;
+    final api = _api;
+    state = state.copier(bascule: true);
+    try {
+      // Attend les prérequis persistants (identité locale, réglages) pour que
+      // l'hôte parte avec le vrai ID et le vrai serveur de rendez-vous —
+      // décisif au démarrage automatique, juste après le lancement.
+      try {
+        await ref.read(localIdentityProvider.future);
+      } catch (_) {
+        // Identité indisponible : repli du provider dérivé.
+      }
+      try {
+        await ref.read(settingsProvider.future);
+      } catch (_) {
+        // Réglages indisponibles : replis par défaut des providers dérivés.
+      }
+      if (_elimine) return;
+      final hostId = await api.startUnattendedHost(
+        localId: ref.read(idLocalProvider),
+        rendezvous: ref.read(rendezvousProvider),
+        stunServers: ref.read(stunServersProvider),
+        permissions: PermissionsDto.full(),
+      );
+      if (_elimine) {
+        unawaited(api.stopUnattendedHost(hostId));
+        return;
+      }
+      _hostId = hostId;
+      _abonnementEntrantes = api.unattendedIncomingStream(hostId).listen(
+        (demande) => unawaited(_surDemandeEntrante(demande)),
+        onError: (Object e) => _signalerErreur(
+            'Flux des demandes interrompu : ${messageNova(e)}'),
+      );
+      _demarrerStats();
+      state = state.copier(
+        actif: true,
+        bascule: false,
+        stats: null,
+        servies: 0,
+        refusees: 0,
+      );
+    } catch (e) {
+      if (!_elimine) state = state.copier(bascule: false);
+      rethrow;
+    }
+  }
+
+  /// Arrête l'hôte : coupe l'abonnement et le minuteur puis
+  /// `stop_unattended_host` (best-effort). Sans effet si inactif ou en
+  /// transition. La réactivation ultérieure repart d'un hôte neuf.
+  Future<void> desactiver() async {
+    final id = _hostId;
+    if (id == null || state.bascule) return;
+    final api = _api;
+    state = state.copier(bascule: true);
+    unawaited(_abonnementEntrantes?.cancel());
+    _abonnementEntrantes = null;
+    _minuterieStats?.cancel();
+    _minuterieStats = null;
+    _hostId = null;
+    try {
+      await api.stopUnattendedHost(id);
+    } catch (_) {
+      // Arrêt best-effort : l'identifiant est déjà invalidé côté UI.
+    }
+    if (!_elimine) {
+      state = state.copier(actif: false, bascule: false, stats: null);
+    }
+  }
+
+  /// Bascule selon [actif] — relais direct de l'interrupteur de l'écran.
+  Future<void> basculer(bool actif) => actif ? activer() : desactiver();
+
+  /// Démarrage **automatique** au lancement (parité AnyDesk « accès non
+  /// surveillé persistant ») : active l'hôte seulement si un mot de passe
+  /// permanent est configuré. Renvoie `true` si l'hôte vient d'être activé ;
+  /// n'échoue jamais (les erreurs sont tracées, pas propagées).
+  Future<bool> activerSiMotDePasse() async {
+    try {
+      final config = await ref.read(unattendedConfigProvider.future);
+      if (!config.aMotDePasse ||
+          _elimine ||
+          _hostId != null ||
+          state.bascule) {
+        return false;
+      }
+      await activer();
+      return state.actif;
+    } catch (e) {
+      debugPrint("Démarrage automatique de l'hôte non surveillé impossible : "
+          '${messageNova(e)}');
+      return false;
+    }
+  }
+
+  /// Reçoit une demande entrante : ouvre le dialogue d'acceptation au-dessus
+  /// de l'écran courant (via [cleNavigateurGlobale]), transmet la décision à
+  /// `approve_incoming`, journalise via `record_access` et met les compteurs
+  /// de session à jour. Une seule demande à la fois ; sans interface prête, la
+  /// demande n'est pas tranchée et expirera côté cœur (refus par défaut).
+  Future<void> _surDemandeEntrante(IncomingRequestDto demande) async {
+    if (_elimine || _hostId == null || _dialogueEnCours) return;
+    final contexte = cleNavigateurGlobale.currentContext;
+    if (contexte == null || !contexte.mounted) return;
+    _dialogueEnCours = true;
+    try {
+      final carnet =
+          ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+      final alias = carnet
+          .where((e) => e.id == demande.peerId)
+          .map((e) => e.alias)
+          .firstOrNull;
+      final reponse = await IncomingRequestDialog.montrer(
+        contexte,
+        alias: alias ?? 'Appareil non répertorié',
+        idFormate: demande.peerIdFormate,
+        empreinte: _empreinte(demande.peerId),
+      );
+      final accepter = reponse?.acceptee ?? false;
+      final id = _hostId;
+      if (id != null) {
+        try {
+          await _api.approveIncoming(
+            hostId: id,
+            peerId: demande.peerId,
+            accepter: accepter,
+          );
+        } catch (_) {
+          // Demande déjà tranchée/expirée : rien à faire.
+        }
+      }
+      // Journalise l'accès (accepté / refusé) dans l'état persistant.
+      try {
+        await _api.recordAccess(peerId: demande.peerId, accepte: accepter);
+        ref.invalidate(accessLogProvider);
+      } catch (_) {
+        // Journalisation best-effort.
+      }
+      if (!_elimine) {
+        state = state.copier(
+          servies: state.servies + (accepter ? 1 : 0),
+          refusees: state.refusees + (accepter ? 0 : 1),
+        );
+      }
+    } finally {
+      _dialogueEnCours = false;
+    }
+  }
+
+  /// (Re)lance le rafraîchissement périodique des statistiques (2 s).
+  void _demarrerStats() {
+    _minuterieStats?.cancel();
+    unawaited(_rafraichirStats());
+    _minuterieStats = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_rafraichirStats()),
+    );
+  }
+
+  Future<void> _rafraichirStats() async {
+    final id = _hostId;
+    if (id == null) return;
+    try {
+      final stats = await _api.unattendedStats(id);
+      // L'hôte peut avoir changé pendant l'appel (arrêt/réactivation).
+      if (_elimine || _hostId != id) return;
+      state = state.copier(stats: stats);
+    } catch (_) {
+      // Stats indisponibles : dernière valeur conservée.
+    }
+  }
+
+  /// Publie une erreur de fond dans l'état (toast global côté coquille).
+  void _signalerErreur(String message) {
+    if (_elimine) return;
+    state = state.copier(
+      derniereErreur: message,
+      erreurCompteur: state.erreurCompteur + 1,
+    );
+  }
+
+  /// Empreinte hexadécimale de l'ID du pair (affichage « à vérifier hors
+  /// bande » du dialogue d'acceptation).
+  static String _empreinte(int peerId) {
+    final hex = peerId.toRadixString(16).toUpperCase().padLeft(12, '0');
+    final paires = <String>[];
+    for (var i = 0; i + 2 <= hex.length; i += 2) {
+      paires.add(hex.substring(i, i + 2));
+    }
+    return paires.join(':');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Carnet d'adresses (persisté par le cœur : `list_contacts`, `add_contact`, …)

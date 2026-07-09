@@ -7,6 +7,7 @@ library;
 
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
@@ -32,6 +33,7 @@ import 'state/providers.dart';
 import 'theme/motion.dart';
 import 'theme/nova_theme.dart';
 import 'widgets/app_frame.dart';
+import 'widgets/nova_kit.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -121,6 +123,10 @@ class NovaDeskApp extends ConsumerWidget {
     final modeTheme = ref.watch(themeModeProvider);
     return MaterialApp(
       title: 'NovaDesk',
+      // Navigateur racine adressable globalement : les services applicatifs
+      // (hôte non surveillé) y ouvrent le dialogue d'acceptation au-dessus de
+      // n'importe quel écran, session comprise.
+      navigatorKey: cleNavigateurGlobale,
       debugShowCheckedModeBanner: false,
       theme: novaTheme(Brightness.light),
       darkTheme: novaTheme(Brightness.dark),
@@ -200,11 +206,70 @@ class NovaDeskApp extends ConsumerWidget {
 /// Habillage racine des sections principales. Le rail et l'onglet « Accueil »
 /// n'empilent plus de routes : ils modifient [sectionCouranteProvider], et le
 /// contenu bascule en place via [_ContenuSections].
-class NovaCoquille extends ConsumerWidget {
+///
+/// La coquille porte aussi les responsabilités **de niveau application** de
+/// l'hôte non surveillé : démarrage automatique au lancement quand un mot de
+/// passe permanent est configuré (parité AnyDesk), toasts des erreurs de fond
+/// et arrêt best-effort à la sortie — voir [hoteNonSurveilleProvider].
+class NovaCoquille extends ConsumerStatefulWidget {
   const NovaCoquille({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<NovaCoquille> createState() => _NovaCoquilleState();
+}
+
+class _NovaCoquilleState extends ConsumerState<NovaCoquille> {
+  /// Écouteur du cycle de vie : tente un arrêt propre de l'hôte quand la
+  /// sortie de l'application est demandée. Best-effort — l'hôte vit dans le
+  /// même processus et disparaît de toute façon avec lui.
+  late final AppLifecycleListener _cycleDeVie;
+
+  @override
+  void initState() {
+    super.initState();
+    _cycleDeVie = AppLifecycleListener(onExitRequested: _surDemandeDeSortie);
+    // Démarrage automatique de l'hôte non surveillé : dès le lancement si un
+    // mot de passe permanent est configuré — recevoir ne dépend plus de
+    // l'ouverture de l'onglet « Non surveillé ».
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_demarrageAutomatiqueHote());
+    });
+  }
+
+  @override
+  void dispose() {
+    _cycleDeVie.dispose();
+    super.dispose();
+  }
+
+  Future<AppExitResponse> _surDemandeDeSortie() async {
+    try {
+      await ref.read(hoteNonSurveilleProvider.notifier).desactiver();
+    } catch (_) {
+      // Ne bloque jamais la sortie.
+    }
+    return AppExitResponse.exit;
+  }
+
+  Future<void> _demarrageAutomatiqueHote() async {
+    final active =
+        await ref.read(hoteNonSurveilleProvider.notifier).activerSiMotDePasse();
+    if (active && mounted) {
+      NovaToast.montrer(context, 'Accès non surveillé activé automatiquement');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Erreurs de fond de l'hôte non surveillé (flux des demandes
+    // interrompu…) : toast global, visible quelle que soit la section.
+    ref.listen<EtatHoteNonSurveille>(hoteNonSurveilleProvider, (avant, apres) {
+      final message = apres.derniereErreur;
+      if (message != null &&
+          apres.erreurCompteur != (avant?.erreurCompteur ?? 0)) {
+        NovaToast.montrer(context, message, info: true);
+      }
+    });
     final vue = ref.watch(sectionCouranteProvider);
     return Scaffold(
       body: NovaAppFrame(

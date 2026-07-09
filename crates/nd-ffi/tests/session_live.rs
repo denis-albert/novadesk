@@ -32,6 +32,9 @@ fn conversion_frame_decodee_en_dto() {
 
 #[test]
 fn conversion_stats_moteur_en_dto() {
+    // `..Default::default()` : les champs non exercés ici (dont ceux que le
+    // moteur gagne au fil des lots, ex. `hotkeys_applied`) restent à zéro sans
+    // casser ce littéral à chaque enrichissement de `SessionStats`.
     let stats = nd_core::SessionStats {
         fps: 12.5_f32,
         rtt_us: 850,
@@ -39,11 +42,7 @@ fn conversion_stats_moteur_en_dto() {
         bytes_out: 2_048,
         frames_decoded: 42,
         inputs_applied: 6,
-        inputs_denied: 0,
-        target_bitrate_kbps: 0,
-        abr_level: 0,
-        frames_recorded: 0,
-        reconnects: 0,
+        ..Default::default()
     };
     let dto = SessionStatsDto::from(stats);
     // Le cœur mesure le fps en f32 ; le DTO l'expose en f64, sans perte.
@@ -105,6 +104,8 @@ fn session_inconnue_erreurs_lisibles() {
 
 #[test]
 fn conversion_stats_champs_enrichis() {
+    // Voir `conversion_stats_moteur_en_dto` : `..Default::default()` absorbe
+    // les champs ajoutés à `SessionStats` par les lots ultérieurs du moteur.
     let stats = nd_core::SessionStats {
         fps: 30.0_f32,
         rtt_us: 1_200,
@@ -117,6 +118,7 @@ fn conversion_stats_champs_enrichis() {
         abr_level: 2,
         frames_recorded: 90,
         reconnects: 1,
+        ..Default::default()
     };
     let dto = SessionStatsDto::from(stats);
     assert_eq!(dto.inputs_denied, 3);

@@ -17,6 +17,11 @@
 //!   (validé par [`Mp4Reader`]) ; l'archive interne `.ndr`
 //!   ([`IndexedRecorder`]) se convertit via [`ndr_to_mp4`]. Contrat en tête
 //!   de [`recording`].
+//! - **Relecture** : [`RecordingPlayer`] ouvre un `.mp4` **ou** un `.ndr`,
+//!   expose dimensions/cadence/durée et rend les échantillons **prêts à
+//!   décoder** ([`EncodedSample`], H.264 Annex B) via `samples()`, plus l'accès
+//!   par temps `sample_at(ts)` (image-clé la plus proche ≤ ts, pour le seek).
+//!   Contrat en tête de [`recording::player`].
 //! - **Reconnexion** : [`ReconnectController`] (`on_disconnect` /
 //!   `next_delay` / `reset`) pilote le backoff sans dormir. Contrat en tête
 //!   de [`reconnect`].
@@ -52,8 +57,9 @@ pub use permissions::{
 pub use privacy::{PrivacyAction, PrivacyState, ScreenCache};
 pub use reconnect::{ReconnectController, ReconnectPolicy, ReconnectState};
 pub use recording::mp4::{ndr_to_mp4, Mp4Muxer, Mp4Reader, Mp4Sample, Mp4ValidationReport};
+pub use recording::player::{RecordingFormat, RecordingPlayer};
 pub use recording::{
-    IndexedRecorder, KeyframeEntry, RecordedFrame, RecordingMetadata, SessionReader,
+    EncodedSample, IndexedRecorder, KeyframeEntry, RecordedFrame, RecordingMetadata, SessionReader,
     SessionRecorder, ValidationReport,
 };
 pub use settings::{QualityParams, QualityPreset, SessionSettings};

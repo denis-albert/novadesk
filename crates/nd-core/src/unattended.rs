@@ -247,6 +247,10 @@ impl Service {
                 stop: &self.stop,
                 etats: None,
                 pair,
+                // Raccourcis hôte par défaut ; `Disconnect` ne termine que la
+                // session en cours — le service retourne à l'attente.
+                raccourcis: crate::raccourcis_hote_defaut(),
+                deconnexion_globale: false,
             };
             if let Err(erreur) = vivre_epoque_hote(transport, &params) {
                 self.note_erreur(&format!("session avec {pair} : {erreur}"));

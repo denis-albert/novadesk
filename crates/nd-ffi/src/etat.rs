@@ -18,6 +18,12 @@
 //!
 //! # Emplacement
 //!
+//! * **Surcharge (multi-instance)** : si la variable d'environnement
+//!   `NOVADESK_DATA_DIR` est définie et non vide, son chemin **remplace** tout le
+//!   reste et sert de répertoire de données **tel quel** (aucun sous-dossier
+//!   « NovaDesk » ajouté). Deux instances lancées avec deux `NOVADESK_DATA_DIR`
+//!   distincts obtiennent ainsi deux identités — donc deux ID — séparées et
+//!   persistantes.
 //! * Windows : `%APPDATA%\NovaDesk` (via `std::env::var("APPDATA")`).
 //! * Repli Unix : `$XDG_DATA_HOME/NovaDesk` puis `$HOME/.local/share/NovaDesk`.
 //! * Dernier repli : `std::env::temp_dir()/NovaDesk`.
@@ -82,10 +88,19 @@ const CLE_DOSSIER_ENREGISTREMENT: &str = "dossier_enregistrement";
 
 /// Résout le répertoire de données de l'application (créé à la demande).
 ///
-/// Ordre : `%APPDATA%\NovaDesk` (Windows), puis `$XDG_DATA_HOME/NovaDesk` et
-/// `$HOME/.local/share/NovaDesk` (Unix), enfin `temp_dir()/NovaDesk`.
+/// La variable d'environnement **`NOVADESK_DATA_DIR`**, si elle est présente et
+/// non vide, **remplace** tout le reste : son chemin est utilisé **tel quel**
+/// (aucun sous-dossier « NovaDesk » ajouté). Cela permet de lancer plusieurs
+/// instances sur une même machine avec des répertoires — donc des identités et
+/// des ID — distincts. À défaut, ordre historique : `%APPDATA%\NovaDesk`
+/// (Windows), puis `$XDG_DATA_HOME/NovaDesk` et `$HOME/.local/share/NovaDesk`
+/// (Unix), enfin `temp_dir()/NovaDesk`.
 fn repertoire_donnees() -> PathBuf {
     let non_vide = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty());
+    // Surcharge explicite (multi-instance) : le chemin est pris tel quel.
+    if let Some(dir) = non_vide("NOVADESK_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     if let Some(appdata) = non_vide("APPDATA") {
         return PathBuf::from(appdata).join("NovaDesk");
     }
@@ -758,6 +773,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Sérialise les tests qui modifient l'environnement global du processus
+    /// (`std::env::set_var`), afin qu'ils ne se marchent pas dessus.
+    static VERROU_ENV: Mutex<()> = Mutex::new(());
+
     /// Magasin neuf enraciné dans un répertoire temporaire unique + sa poignée
     /// (le répertoire est supprimé quand la poignée est lâchée).
     fn magasin_temporaire() -> (Magasin, TempDir) {
@@ -1049,5 +1068,54 @@ mod tests {
         assert_eq!(decoder_hex("000fa5ff"), Some(octets.to_vec()));
         assert_eq!(decoder_hex("zz"), None);
         assert_eq!(decoder_hex("abc"), None);
+    }
+
+    #[test]
+    fn data_dir_surcharge_par_variable_environnement() {
+        // `std::env::set_var` est un état global du processus : on sérialise les
+        // tests qui y touchent (ici, le seul).
+        let _verrou = VERROU_ENV.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let dir_a = tempfile::tempdir().expect("répertoire A");
+        let dir_b = tempfile::tempdir().expect("répertoire B");
+
+        // Résout le répertoire de données avec NOVADESK_DATA_DIR positionnée puis
+        // efface aussitôt la variable (fenêtre d'exposition globale minimale).
+        let resoudre_avec = |valeur: &Path| -> PathBuf {
+            std::env::set_var("NOVADESK_DATA_DIR", valeur);
+            let racine = repertoire_donnees();
+            std::env::remove_var("NOVADESK_DATA_DIR");
+            racine
+        };
+
+        // La variable remplace tout : le chemin est pris tel quel.
+        let racine_a = resoudre_avec(dir_a.path());
+        assert_eq!(racine_a.as_path(), dir_a.path());
+        let racine_b = resoudre_avec(dir_b.path());
+        assert_eq!(racine_b.as_path(), dir_b.path());
+
+        // Chaque répertoire porte sa propre identité, stable et persistante
+        // (rechargée à l'identique par un second magasin sur la même racine).
+        let identite_a = Magasin::nouveau(racine_a.clone())
+            .identite_locale()
+            .expect("identité A");
+        let identite_a_relue = Magasin::nouveau(racine_a)
+            .identite_locale()
+            .expect("identité A relue");
+        assert_eq!(identite_a, identite_a_relue, "identité A persistante");
+
+        let identite_b = Magasin::nouveau(racine_b.clone())
+            .identite_locale()
+            .expect("identité B");
+        let identite_b_relue = Magasin::nouveau(racine_b)
+            .identite_locale()
+            .expect("identité B relue");
+        assert_eq!(identite_b, identite_b_relue, "identité B persistante");
+
+        // Deux NOVADESK_DATA_DIR distincts ⇒ deux ID distincts (identités séparées).
+        assert_ne!(
+            identite_a.id, identite_b.id,
+            "deux répertoires distincts doivent donner deux ID distincts"
+        );
     }
 }

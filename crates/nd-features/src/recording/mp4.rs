@@ -43,7 +43,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use nd_codec::EncodedChunk;
 use nd_proto::{NdError, Result};
 
-use super::{RecordedFrame, RecordingMetadata, SessionReader};
+use super::{EncodedSample, RecordedFrame, RecordingMetadata, SessionReader};
 
 /// Échelle de temps de la piste vidéo (90 kHz, standard broadcast : les
 /// horodatages microsecondes s'y convertissent sans dérive cumulée).
@@ -887,18 +887,97 @@ impl<R: Read + Seek> Mp4Reader<R> {
 
     /// Échantillon suivant (données AVCC), ou `None` en fin de piste.
     pub fn next_sample(&mut self) -> Result<Option<Mp4Sample>> {
-        let Some(info) = self.echantillons.get(self.prochain).copied() else {
+        if self.prochain >= self.echantillons.len() {
             return Ok(None);
-        };
+        }
+        let rang = self.prochain;
         self.prochain += 1;
+        self.lire_echantillon(rang).map(Some)
+    }
+
+    /// Lit l'échantillon de rang donné (données AVCC) en allant chercher ses
+    /// octets dans `mdat`, sans toucher au curseur de [`Mp4Reader::next_sample`].
+    fn lire_echantillon(&mut self, rang: usize) -> Result<Mp4Sample> {
+        let info = self.echantillons[rang];
         let mut data = vec![0u8; info.taille as usize];
         self.source.seek(SeekFrom::Start(info.offset))?;
         self.source.read_exact(&mut data)?;
-        Ok(Some(Mp4Sample {
+        Ok(Mp4Sample {
             timestamp_us: tics_vers_us(info.tics),
             keyframe: info.keyframe,
             data,
+        })
+    }
+
+    /// Cadence nominale, en images par seconde, dérivée de la durée média
+    /// (tics 90 kHz) et du nombre d'images. `0` pour une piste vide.
+    #[must_use]
+    pub fn fps(&self) -> u32 {
+        if self.duree_media == 0 || self.echantillons.is_empty() {
+            return 0;
+        }
+        let frames = self.echantillons.len() as u128;
+        ((frames * u128::from(MEDIA_TIMESCALE) + u128::from(self.duree_media) / 2)
+            / u128::from(self.duree_media)) as u32
+    }
+
+    /// Extrait **tous** les échantillons de la piste, dans l'ordre, données
+    /// converties en **H.264 Annex B** prêtes à décoder ([`EncodedSample`] :
+    /// codes de départ `00 00 00 01`, SPS/PPS réinjectés en tête de chaque
+    /// image-clé). Réutilise la table d'échantillons reconstruite à l'ouverture
+    /// (stsc/stco/stsz/stts/stss) ; ne perturbe pas le curseur de
+    /// [`Mp4Reader::next_sample`].
+    pub fn samples(&mut self) -> Result<Vec<EncodedSample>> {
+        let nombre = self.echantillons.len();
+        let mut sortie = Vec::with_capacity(nombre);
+        for rang in 0..nombre {
+            let echantillon = self.lire_echantillon(rang)?;
+            let data = self.sample_annexb(&echantillon)?;
+            sortie.push(EncodedSample {
+                timestamp_us: echantillon.timestamp_us,
+                is_keyframe: echantillon.keyframe,
+                data,
+            });
+        }
+        Ok(sortie)
+    }
+
+    /// Image-clé la plus proche **avant** (ou à) `timestamp_us`, prête à
+    /// décoder ([`EncodedSample`] Annex B) — point de départ correct d'un
+    /// « seek ». Si `timestamp_us` précède la première image-clé, rend
+    /// celle-ci ; `None` si la piste ne contient aucune image-clé.
+    pub fn sample_at(&mut self, timestamp_us: u64) -> Result<Option<EncodedSample>> {
+        let Some(rang) = self.rang_cle_pour(timestamp_us) else {
+            return Ok(None);
+        };
+        let echantillon = self.lire_echantillon(rang)?;
+        let data = self.sample_annexb(&echantillon)?;
+        Ok(Some(EncodedSample {
+            timestamp_us: echantillon.timestamp_us,
+            is_keyframe: echantillon.keyframe,
+            data,
         }))
+    }
+
+    /// Rang de l'image-clé à retenir pour un « seek » à `timestamp_us` : la
+    /// dernière image-clé d'horodatage ≤ cible, ou la première image-clé si la
+    /// cible les précède toutes. `None` s'il n'y a aucune image-clé. Les
+    /// horodatages étant croissants, on s'arrête à la première clé au-delà.
+    fn rang_cle_pour(&self, timestamp_us: u64) -> Option<usize> {
+        let mut choisi = None;
+        let mut premiere = None;
+        for (rang, echantillon) in self.echantillons.iter().enumerate() {
+            if !echantillon.keyframe {
+                continue;
+            }
+            premiere.get_or_insert(rang);
+            if tics_vers_us(echantillon.tics) <= timestamp_us {
+                choisi = Some(rang);
+            } else {
+                break;
+            }
+        }
+        choisi.or(premiere)
     }
 
     /// Rembobine la lecture des échantillons au début de la piste.
@@ -1564,6 +1643,55 @@ mod tests {
         assert!(lecteur.next_sample().unwrap().is_none());
         lecteur.rewind();
         assert_eq!(lecteur.next_sample().unwrap().unwrap().timestamp_us, 0);
+    }
+
+    #[test]
+    fn samples_rend_de_l_annexb_pret_a_decoder() {
+        let mut lecteur = Mp4Reader::new(Cursor::new(mp4_de_test())).unwrap();
+        let echs = lecteur.samples().unwrap();
+        assert_eq!(echs.len(), 6);
+        // Image-clé : Annex B avec SPS/PPS réinjectés (== unité d'origine).
+        assert!(echs[0].is_keyframe);
+        assert_eq!(echs[0].timestamp_us, 0);
+        assert_eq!(echs[0].data, unite_cle(0));
+        // Delta : juste la tranche, sans paramètres réinjectés.
+        assert!(!echs[1].is_keyframe);
+        assert_eq!(echs[1].timestamp_us, 40_000);
+        assert_eq!(echs[1].data, {
+            let mut unite = vec![0, 0, 0, 1];
+            unite.extend_from_slice(&[0x41, 1, 0x22]);
+            unite
+        });
+        // N'affecte pas le curseur de next_sample, et reste idempotent.
+        assert_eq!(lecteur.next_sample().unwrap().unwrap().timestamp_us, 0);
+        assert_eq!(lecteur.samples().unwrap(), echs);
+    }
+
+    #[test]
+    fn sample_at_choisit_l_image_cle_precedente() {
+        let mut lecteur = Mp4Reader::new(Cursor::new(mp4_de_test())).unwrap();
+        // Images-clés à ts 0 et 120 000.
+        let s = lecteur.sample_at(130_000).unwrap().unwrap();
+        assert!(s.is_keyframe);
+        assert_eq!(s.timestamp_us, 120_000);
+        assert_eq!(s.data, unite_cle(3));
+        // Exactement sur une clé, avant tout, entre deux, après tout.
+        assert_eq!(
+            lecteur.sample_at(120_000).unwrap().unwrap().timestamp_us,
+            120_000
+        );
+        assert_eq!(lecteur.sample_at(0).unwrap().unwrap().timestamp_us, 0);
+        assert_eq!(lecteur.sample_at(50_000).unwrap().unwrap().timestamp_us, 0);
+        assert_eq!(
+            lecteur.sample_at(u64::MAX).unwrap().unwrap().timestamp_us,
+            120_000
+        );
+    }
+
+    #[test]
+    fn fps_derive_des_durees_stts() {
+        let lecteur = Mp4Reader::new(Cursor::new(mp4_de_test())).unwrap();
+        assert_eq!(lecteur.fps(), 25);
     }
 
     #[test]

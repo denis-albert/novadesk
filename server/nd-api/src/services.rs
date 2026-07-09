@@ -320,6 +320,10 @@ fn ressource_groupe(id: u64) -> String {
 // Serveur
 // ---------------------------------------------------------------------------
 
+/// Délai d'E/S par connexion (une requête, une réponse) : un client muet ou
+/// au goutte-à-goutte ne retient ni thread ni socket indéfiniment.
+const DELAI_ECHANGE: Duration = Duration::from_secs(30);
+
 /// Boucle de service (bloquante, un thread par connexion, une requête par connexion).
 ///
 /// # Errors
@@ -336,6 +340,8 @@ pub fn serve(listener: TcpListener, services: Services) -> std::io::Result<()> {
 }
 
 fn handle_conn(mut stream: TcpStream, services: &Services) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(DELAI_ECHANGE))?;
+    stream.set_write_timeout(Some(DELAI_ECHANGE))?;
     let req_bytes = read_frame(&mut stream)?;
     let resp = match Request::from_bytes(&req_bytes) {
         Some(requete) => traiter_requete(services, requete),

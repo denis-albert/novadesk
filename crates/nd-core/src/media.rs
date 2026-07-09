@@ -39,7 +39,12 @@
 use std::path::PathBuf;
 
 use nd_audio::AudioPacket;
+use nd_capture::Rect;
+use nd_codec::ContentProfile;
+use nd_features::PermissionSet;
 use nd_proto::{ChannelKind, MonitorId};
+
+use crate::{PeerInfo, RemoteMonitor};
 
 /// Nombre de moniteurs distincts pré-cartographiés pour la réception vidéo
 /// (couvre la bascule multi-écran sans reconstruire la carte des canaux).
@@ -86,6 +91,9 @@ impl Categorie {
 
 /// Sous-type d'un message multiplexé sur le canal `Control` **après** le
 /// handshake (le handshake Noise, lui, a déjà libéré le canal).
+///
+/// Les valeurs sont sérialisées (octet de tête) : ne jamais les renuméroter,
+/// seulement en ajouter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SousTypeControle {
     /// Message de chat (payload = texte UTF-8).
@@ -94,6 +102,37 @@ pub(crate) enum SousTypeControle {
     PressePapiers = 2,
     /// Demande de bascule moniteur (payload = index u32 big-endian).
     BasculeMoniteur = 3,
+    /// **Demande** de mode confidentialité, contrôleur → hôte (payload = 1 octet
+    /// 0/1). L'hôte, s'il détient [`nd_features::Capability::PrivacyMode`], cesse
+    /// alors d'émettre l'écran réel et diffuse un cadre noir.
+    Confidentialite = 4,
+    /// **État** du mode confidentialité, hôte → contrôleur (payload = 1 octet
+    /// 0/1) : le drapeau que le contrôleur affiche (indicateur « rideau actif »).
+    ConfidentialiteEtat = 5,
+    /// Couche d'annotation / tableau blanc, dans les deux sens (payload =
+    /// [`nd_features::AnnotationLayer::to_bytes`]).
+    Annotation = 6,
+    /// **Demande** de région / cadre d'écran, contrôleur → hôte (payload vide =
+    /// plein écran, sinon `x`,`y`,`w`,`h` en u32 big-endian — voir
+    /// [`encoder_region`]).
+    Region = 7,
+    /// Trame d'un tunnel TCP de session, dans les deux sens (payload =
+    /// `[id u32 BE][genre u8][données]`, voir [`crate::tunnel`]).
+    Tunnel = 8,
+    /// **Renégociation des permissions à chaud**, contrôleur → hôte (payload =
+    /// bits `u16` big-endian d'un [`PermissionSet`], voir [`encoder_permissions`]).
+    /// L'hôte remplace son ensemble vivant, lu par le filtre d'injection.
+    MajPermissions = 9,
+    /// **Préréglage de qualité**, contrôleur → hôte (payload = `[profil u8]` +
+    /// `[plafond_kbps u32 BE]`, voir [`encoder_qualite`]). L'hôte reconfigure
+    /// l'encodeur et l'échelle ABR sous le plafond.
+    MajQualite = 10,
+    /// **Liste des moniteurs** de l'hôte, hôte → contrôleur (payload =
+    /// `[n u16 BE]` puis `n` entrées, voir [`encoder_moniteurs`]).
+    Moniteurs = 11,
+    /// **Infos système du pair** (nom d'hôte + OS), hôte → contrôleur (payload =
+    /// `[len_hote u16 BE][hôte utf8][os utf8]`, voir [`encoder_infos_pair`]).
+    InfosPair = 12,
 }
 
 impl SousTypeControle {
@@ -103,6 +142,15 @@ impl SousTypeControle {
             1 => Some(SousTypeControle::Chat),
             2 => Some(SousTypeControle::PressePapiers),
             3 => Some(SousTypeControle::BasculeMoniteur),
+            4 => Some(SousTypeControle::Confidentialite),
+            5 => Some(SousTypeControle::ConfidentialiteEtat),
+            6 => Some(SousTypeControle::Annotation),
+            7 => Some(SousTypeControle::Region),
+            8 => Some(SousTypeControle::Tunnel),
+            9 => Some(SousTypeControle::MajPermissions),
+            10 => Some(SousTypeControle::MajQualite),
+            11 => Some(SousTypeControle::Moniteurs),
+            12 => Some(SousTypeControle::InfosPair),
             _ => None,
         }
     }
@@ -141,7 +189,8 @@ pub(crate) fn decoder_audio(trame: &[u8]) -> Option<AudioPacket> {
 }
 
 /// Commande adressée aux threads média d'une session vivante via
-/// [`crate::SessionHandle`] (fichiers à envoyer, bascule moniteur, audio).
+/// [`crate::SessionHandle`] (fichiers à envoyer, bascule moniteur, audio,
+/// confidentialité, région d'écran).
 #[derive(Debug, Clone)]
 pub(crate) enum CommandeMedia {
     /// Démarrer l'envoi d'une file de fichiers vers le pair.
@@ -150,6 +199,177 @@ pub(crate) enum CommandeMedia {
     BasculerMoniteur(u32),
     /// Activer/désactiver l'émission (hôte) ou la lecture (contrôleur) audio.
     AudioActif(bool),
+    /// Activer/désactiver le mode confidentialité (contrôleur → demande à
+    /// l'hôte ; hôte → s'applique à lui-même).
+    Confidentialite(bool),
+    /// Restreindre (ou rétablir en plein écran avec `None`) la région d'écran
+    /// partagée — le « cadre d'écran ».
+    DefinirRegion(Option<Rect>),
+    /// Renégocier les permissions à chaud (contrôleur → demande à l'hôte ; hôte
+    /// → applique directement à son ensemble vivant).
+    MajPermissions(PermissionSet),
+    /// Appliquer un préréglage de qualité : profil ABR + plafond de débit
+    /// (kbit/s, `0` = aucun plafond). Contrôleur → demande à l'hôte ; hôte →
+    /// applique à sa boucle de diffusion.
+    MajQualite(ContentProfile, u32),
+    /// Démarrer (avec un chemin) ou arrêter (`None`) l'enregistrement local de
+    /// l'hôte **en cours de session**. Sans effet côté contrôleur (l'hôte seul
+    /// encode et muxe).
+    DefinirEnregistrement(Option<PathBuf>),
+}
+
+/// Encode une région / cadre d'écran pour le canal `Control` : payload **vide**
+/// pour le plein écran (`None`), sinon `x`,`y`,`w`,`h` en u32 big-endian.
+pub(crate) fn encoder_region(region: Option<Rect>) -> Vec<u8> {
+    match region {
+        None => Vec::new(),
+        Some(r) => {
+            let mut trame = Vec::with_capacity(16);
+            trame.extend_from_slice(&r.x.to_be_bytes());
+            trame.extend_from_slice(&r.y.to_be_bytes());
+            trame.extend_from_slice(&r.w.to_be_bytes());
+            trame.extend_from_slice(&r.h.to_be_bytes());
+            trame
+        }
+    }
+}
+
+/// Décode une région / cadre d'écran (inverse d'[`encoder_region`]). Payload
+/// vide **ou** malformé ⇒ `None` (plein écran) : jamais de panique sur entrée
+/// hostile.
+pub(crate) fn decoder_region(payload: &[u8]) -> Option<Rect> {
+    let octets: &[u8; 16] = payload.try_into().ok()?;
+    let lire = |debut: usize| {
+        u32::from_be_bytes(
+            octets[debut..debut + 4]
+                .try_into()
+                .expect("tranche de 4 octets"),
+        )
+    };
+    Some(Rect {
+        x: lire(0),
+        y: lire(4),
+        w: lire(8),
+        h: lire(12),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Plan de contrôle de session : permissions à chaud, qualité, moniteurs, pair
+// ---------------------------------------------------------------------------
+
+/// Encode un [`PermissionSet`] pour le canal `Control` : ses bits en `u16`
+/// big-endian (2 octets). Sous-type [`SousTypeControle::MajPermissions`].
+pub(crate) fn encoder_permissions(permissions: PermissionSet) -> Vec<u8> {
+    permissions.to_bits().to_be_bytes().to_vec()
+}
+
+/// Décode un [`PermissionSet`] (inverse d'[`encoder_permissions`]). Longueur
+/// invalide ⇒ `None` : jamais de panique sur entrée hostile.
+pub(crate) fn decoder_permissions(payload: &[u8]) -> Option<PermissionSet> {
+    let octets: [u8; 2] = payload.try_into().ok()?;
+    Some(PermissionSet::from_bits(u16::from_be_bytes(octets)))
+}
+
+/// Encode un préréglage de qualité pour le canal `Control` : `[profil u8]`
+/// (`0` = [`ContentProfile::Text`], `1` = [`ContentProfile::Video`]) suivi du
+/// `[plafond_kbps u32 BE]`. Sous-type [`SousTypeControle::MajQualite`].
+pub(crate) fn encoder_qualite(profil: ContentProfile, plafond_kbps: u32) -> Vec<u8> {
+    let mut trame = Vec::with_capacity(5);
+    trame.push(match profil {
+        ContentProfile::Text => 0,
+        ContentProfile::Video => 1,
+    });
+    trame.extend_from_slice(&plafond_kbps.to_be_bytes());
+    trame
+}
+
+/// Décode un préréglage de qualité (inverse d'[`encoder_qualite`]). Longueur ou
+/// octet de profil invalide ⇒ `None` (jamais de panique sur entrée hostile).
+pub(crate) fn decoder_qualite(payload: &[u8]) -> Option<(ContentProfile, u32)> {
+    let octets: [u8; 5] = payload.try_into().ok()?;
+    let profil = match octets[0] {
+        0 => ContentProfile::Text,
+        1 => ContentProfile::Video,
+        _ => return None,
+    };
+    let plafond = u32::from_be_bytes([octets[1], octets[2], octets[3], octets[4]]);
+    Some((profil, plafond))
+}
+
+/// Taille d'une entrée moniteur sérialisée : `index`,`w`,`h` (u32 BE) + `principal` (u8).
+const TAILLE_MONITEUR: usize = 13;
+
+/// Encode la liste des moniteurs de l'hôte pour le canal `Control` : `[n u16 BE]`
+/// puis, pour chacun, `[index u32 BE][largeur u32 BE][hauteur u32 BE][principal u8]`.
+/// Sous-type [`SousTypeControle::Moniteurs`].
+pub(crate) fn encoder_moniteurs(moniteurs: &[RemoteMonitor]) -> Vec<u8> {
+    let nombre = u16::try_from(moniteurs.len()).unwrap_or(u16::MAX);
+    let mut trame = Vec::with_capacity(2 + moniteurs.len() * TAILLE_MONITEUR);
+    trame.extend_from_slice(&nombre.to_be_bytes());
+    for m in moniteurs.iter().take(usize::from(nombre)) {
+        trame.extend_from_slice(&m.index.to_be_bytes());
+        trame.extend_from_slice(&m.width.to_be_bytes());
+        trame.extend_from_slice(&m.height.to_be_bytes());
+        trame.push(u8::from(m.primary));
+    }
+    trame
+}
+
+/// Décode la liste des moniteurs (inverse d'[`encoder_moniteurs`]). Tolérant :
+/// une trame tronquée rend les entrées **complètes** lues jusque-là (jamais de
+/// panique). Une trame trop courte pour l'en-tête rend une liste vide.
+pub(crate) fn decoder_moniteurs(payload: &[u8]) -> Vec<RemoteMonitor> {
+    let Some(entete) = payload.get(0..2) else {
+        return Vec::new();
+    };
+    let annonce = usize::from(u16::from_be_bytes([entete[0], entete[1]]));
+    let corps = &payload[2..];
+    let lire_u32 = |bloc: &[u8], debut: usize| {
+        u32::from_be_bytes([
+            bloc[debut],
+            bloc[debut + 1],
+            bloc[debut + 2],
+            bloc[debut + 3],
+        ])
+    };
+    let disponibles = corps.len() / TAILLE_MONITEUR;
+    let mut moniteurs = Vec::with_capacity(annonce.min(disponibles));
+    for i in 0..annonce.min(disponibles) {
+        let bloc = &corps[i * TAILLE_MONITEUR..(i + 1) * TAILLE_MONITEUR];
+        moniteurs.push(RemoteMonitor {
+            index: lire_u32(bloc, 0),
+            width: lire_u32(bloc, 4),
+            height: lire_u32(bloc, 8),
+            primary: bloc[12] != 0,
+        });
+    }
+    moniteurs
+}
+
+/// Encode les infos système du pair pour le canal `Control` :
+/// `[len_hote u16 BE][hôte utf8][os utf8]`. Sous-type [`SousTypeControle::InfosPair`].
+pub(crate) fn encoder_infos_pair(infos: &PeerInfo) -> Vec<u8> {
+    let hote = infos.host.as_bytes();
+    let len_hote = u16::try_from(hote.len()).unwrap_or(u16::MAX);
+    let mut trame = Vec::with_capacity(2 + hote.len() + infos.os.len());
+    trame.extend_from_slice(&len_hote.to_be_bytes());
+    trame.extend_from_slice(&hote[..usize::from(len_hote)]);
+    trame.extend_from_slice(infos.os.as_bytes());
+    trame
+}
+
+/// Décode les infos système du pair (inverse d'[`encoder_infos_pair`]). Trame
+/// tronquée ou non-UTF-8 ⇒ `None` (jamais de panique sur entrée hostile).
+pub(crate) fn decoder_infos_pair(payload: &[u8]) -> Option<PeerInfo> {
+    let entete = payload.get(0..2)?;
+    let len_hote = usize::from(u16::from_be_bytes([entete[0], entete[1]]));
+    let hote = payload.get(2..2 + len_hote)?;
+    let os = payload.get(2 + len_hote..)?;
+    Some(PeerInfo {
+        host: String::from_utf8(hote.to_vec()).ok()?,
+        os: String::from_utf8(os.to_vec()).ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -183,6 +403,103 @@ mod tests {
         assert_eq!(dec.timestamp_us, p.timestamp_us);
         assert_eq!(dec.data, p.data);
         assert!(decoder_audio(&[0, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn roundtrip_region() {
+        let region = Some(Rect {
+            x: 10,
+            y: 20,
+            w: 640,
+            h: 480,
+        });
+        assert_eq!(decoder_region(&encoder_region(region)), region);
+        // Plein écran : payload vide, aller-retour sur `None`.
+        assert!(encoder_region(None).is_empty());
+        assert_eq!(decoder_region(&encoder_region(None)), None);
+        // Entrée malformée (mauvaise longueur) ⇒ None sans panique.
+        assert_eq!(decoder_region(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn sous_types_avances_aller_retour() {
+        for st in [
+            SousTypeControle::Confidentialite,
+            SousTypeControle::ConfidentialiteEtat,
+            SousTypeControle::Annotation,
+            SousTypeControle::Region,
+            SousTypeControle::Tunnel,
+            SousTypeControle::MajPermissions,
+            SousTypeControle::MajQualite,
+            SousTypeControle::Moniteurs,
+            SousTypeControle::InfosPair,
+        ] {
+            assert_eq!(SousTypeControle::depuis_octet(st as u8), Some(st));
+        }
+    }
+
+    #[test]
+    fn roundtrip_permissions() {
+        let permissions: PermissionSet = [
+            nd_features::Capability::ViewScreen,
+            nd_features::Capability::ControlKeyboard,
+            nd_features::Capability::TcpTunnel,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            decoder_permissions(&encoder_permissions(permissions)),
+            Some(permissions)
+        );
+        // Longueur invalide ⇒ None sans panique.
+        assert_eq!(decoder_permissions(&[0x01]), None);
+    }
+
+    #[test]
+    fn roundtrip_qualite() {
+        for profil in [ContentProfile::Text, ContentProfile::Video] {
+            for plafond in [0u32, 4_000, u32::MAX] {
+                let trame = encoder_qualite(profil, plafond);
+                assert_eq!(decoder_qualite(&trame), Some((profil, plafond)));
+            }
+        }
+        // Longueur invalide ou octet de profil inconnu ⇒ None sans panique.
+        assert_eq!(decoder_qualite(&[9, 0, 0, 0, 0]), None);
+        assert_eq!(decoder_qualite(&[0, 0, 0]), None);
+    }
+
+    #[test]
+    fn roundtrip_moniteurs() {
+        let moniteurs = vec![
+            RemoteMonitor {
+                index: 0,
+                width: 1920,
+                height: 1080,
+                primary: true,
+            },
+            RemoteMonitor {
+                index: 1,
+                width: 2560,
+                height: 1440,
+                primary: false,
+            },
+        ];
+        assert_eq!(decoder_moniteurs(&encoder_moniteurs(&moniteurs)), moniteurs);
+        // Liste vide : aller-retour sur un vecteur vide, en-tête tronqué ⇒ vide.
+        assert!(decoder_moniteurs(&encoder_moniteurs(&[])).is_empty());
+        assert!(decoder_moniteurs(&[0x00]).is_empty());
+    }
+
+    #[test]
+    fn roundtrip_infos_pair() {
+        let infos = PeerInfo {
+            host: "poste-été".to_owned(),
+            os: "windows (x86_64)".to_owned(),
+        };
+        assert_eq!(decoder_infos_pair(&encoder_infos_pair(&infos)), Some(infos));
+        // Trame tronquée ⇒ None sans panique.
+        assert_eq!(decoder_infos_pair(&[0x00]), None);
+        assert_eq!(decoder_infos_pair(&[0xFF, 0xFF, 0x41]), None);
     }
 
     #[test]

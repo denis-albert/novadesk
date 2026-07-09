@@ -251,6 +251,27 @@ impl PermissionSet {
             bits: self.bits & autre.bits,
         }
     }
+
+    /// Bits bruts de l'ensemble : sérialisation compacte (2 octets) et **partage
+    /// atomique** pour la renégociation à chaud des permissions en cours de
+    /// session (voir `nd_core`). Inverse de [`Self::from_bits`].
+    #[must_use]
+    pub fn to_bits(self) -> u16 {
+        self.bits
+    }
+
+    /// Reconstruit un ensemble depuis ses bits bruts ([`Self::to_bits`]). Les
+    /// bits ne correspondant à **aucune** capacité connue sont ignorés (jamais
+    /// de droit fantôme accordé par une trame hostile).
+    #[must_use]
+    pub fn from_bits(bits: u16) -> Self {
+        let connus = Capability::ALL
+            .into_iter()
+            .fold(0u16, |masque, cap| masque | cap.bit());
+        PermissionSet {
+            bits: bits & connus,
+        }
+    }
 }
 
 impl FromIterator<Capability> for PermissionSet {
@@ -479,6 +500,18 @@ impl PermissionBroker {
         demande.decision = PermissionDecision::Denied;
         self.journaliser(decideur, AuditEvent::RequestDenied { id });
         Ok(())
+    }
+
+    /// Remplace en bloc l'ensemble des capacités accordées — **renégociation à
+    /// chaud** des permissions en cours de session (le contrôleur retire ou
+    /// rend un droit, l'hôte l'applique au vol). Volontairement **non
+    /// journalisée** : le filtre d'injection l'appelle sur le chemin chaud (à
+    /// chaque changement de l'ensemble vivant), une trace par appel noierait le
+    /// journal d'audit ; l'ensemble effectif reste lisible via
+    /// [`Self::permissions`]. Les demandes en cours et l'historique ne sont pas
+    /// touchés.
+    pub fn set_permissions(&mut self, permissions: PermissionSet) {
+        self.accordees = permissions;
     }
 
     /// Révoque immédiatement une capacité en cours de session ; rend vrai si
@@ -831,6 +864,35 @@ mod tests {
                 cap: Capability::ControlKeyboard
             }
         );
+    }
+
+    #[test]
+    fn bits_aller_retour_et_filtre_les_bits_inconnus() {
+        let ensemble: PermissionSet = [
+            Capability::ViewScreen,
+            Capability::ControlKeyboard,
+            Capability::TcpTunnel,
+        ]
+        .into_iter()
+        .collect();
+        // Aller-retour sans perte par les bits bruts.
+        assert_eq!(PermissionSet::from_bits(ensemble.to_bits()), ensemble);
+        // Les bits hauts sans capacité définie (12 capacités → bits 0..=11) sont
+        // ignorés : jamais de droit fantôme depuis une trame hostile.
+        assert_eq!(PermissionSet::from_bits(0xFFFF), PermissionSet::full());
+    }
+
+    #[test]
+    fn set_permissions_remplace_l_ensemble_sans_journaliser() {
+        let mut guichet = PermissionBroker::with_permissions(PermissionSet::view_only());
+        let neuf: PermissionSet = [Capability::ViewScreen, Capability::ControlMouse]
+            .into_iter()
+            .collect();
+        guichet.set_permissions(neuf);
+        assert_eq!(guichet.permissions(), neuf);
+        assert!(guichet.is_allowed(Capability::ControlMouse));
+        // Chemin chaud : aucune trace ajoutée au journal d'audit.
+        assert!(guichet.journal().is_empty());
     }
 
     #[test]

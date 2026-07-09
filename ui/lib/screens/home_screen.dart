@@ -8,6 +8,8 @@
 /// Câblage moteur **préservé** : la connexion par ID valide la saisie via la
 /// façade (`parse_nova_id` + `new_session_config`) puis ouvre la session en
 /// **mise en relation par rendez-vous** ([SessionEndpointByRendezvous]).
+/// « Wake-on-LAN » demande l'adresse MAC (le carnet n'en stocke pas) puis émet
+/// le paquet magique **réel** via la façade (`send_wol`).
 library;
 
 import 'dart:async';
@@ -84,6 +86,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _chargement = true;
   Timer? _minuteurChargement;
 
+  /// Adresses MAC saisies pour le Wake-on-LAN pendant la session, par ID de
+  /// contact : le carnet ne stocke pas de MAC, on pré-remplit donc le dialogue
+  /// avec la dernière saisie (mémoire d'écran, best-effort).
+  final Map<int, String> _macWolMemorisees = <int, String>{};
+
   @override
   void initState() {
     super.initState();
@@ -109,12 +116,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // ---------------------------------------------------------------------------
 
   /// Valide la saisie via la façade puis ouvre la fenêtre de session en mise en
-  /// relation **par ID** ([SessionEndpointByRendezvous]).
-  Future<void> _seConnecter([String? saisieExplicite]) async {
+  /// relation **par ID** ([SessionEndpointByRendezvous]). [modeForce] impose un
+  /// mode (menu contextuel « Observer » / « Transfert de fichiers ») ; sinon le
+  /// mode choisi sous le champ d'adresse s'applique.
+  Future<void> _seConnecter(
+      [String? saisieExplicite, ModeConnexion? modeForce]) async {
     final api = ref.read(nativeApiProvider);
     final idLocal = ref.read(idLocalProvider);
     final saisie = (saisieExplicite ?? _adresseController.text).trim();
     final carnet = ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
+    final mode = modeForce ?? _mode;
 
     setState(() => _connexionEnCours = true);
     try {
@@ -126,7 +137,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         role: SessionRoleDto.controller,
         localId: idLocal,
         peerId: idPair,
-        permissions: _mode.permissions,
+        permissions: mode.permissions,
       );
       final idFormate = await api.formatNovaId(id: idPair);
       final alias = correspondance?.alias ??
@@ -138,7 +149,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         stunServers: ref.read(stunServersProvider),
         relay: ref.read(relayProvider),
       );
-      final options = SessionOptionsDto(permissions: _mode.permissions);
+      final options = SessionOptionsDto(permissions: mode.permissions);
       // Journalise la session au démarrage (historique + dernière connexion du
       // contact) puis rafraîchit les vues concernées.
       await api.recordSession(id: idPair, alias: alias ?? idFormate);
@@ -161,11 +172,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
-  Future<void> _connecterEntree(EntreeCarnet entree) async {
+  Future<void> _connecterEntree(EntreeCarnet entree,
+      {ModeConnexion? mode}) async {
     final idFormate =
         await ref.read(nativeApiProvider).formatNovaId(id: entree.id);
     _adresseController.text = idFormate;
-    await _seConnecter(idFormate);
+    await _seConnecter(idFormate, mode);
   }
 
   // ---------------------------------------------------------------------------
@@ -214,21 +226,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (!mounted || choix == null) return;
     switch (choix) {
       case 'conn':
-      case 'obs':
         unawaited(_connecterEntree(entree));
+      case 'obs':
+        // Session réelle en observation seule, quel que soit le mode choisi.
+        unawaited(
+            _connecterEntree(entree, mode: ModeConnexion.observation));
+      case 'ft':
+        // Session réelle limitée au transfert de fichiers.
+        unawaited(_connecterEntree(entree, mode: ModeConnexion.fichiers));
       case 'fav':
         unawaited(_basculerFavori(entree));
       case 'ren':
         unawaited(_renommer(entree));
       case 'wol':
-        NovaToast.montrer(
-            context, 'Paquet Wake-on-LAN envoyé à ${entree.alias}',
-            info: true);
+        unawaited(_wakeOnLan(entree));
       case 'del':
         unawaited(_supprimer(entree));
-      case 'ft':
-        NovaToast.montrer(context, 'Transfert de fichiers — ${entree.alias}',
-            info: true);
     }
   }
 
@@ -271,6 +284,106 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     } on NovaApiException catch (e) {
       if (mounted) NovaToast.montrer(context, e.message, info: true);
     }
+  }
+
+  /// Réveille [entree] par **Wake-on-LAN** : demande l'adresse MAC via un
+  /// dialogue (le carnet n'en stocke pas) puis émet le paquet magique via la
+  /// façade (`send_wol`). Diffusion vide → globale (`255.255.255.255:9`).
+  Future<void> _wakeOnLan(EntreeCarnet entree) async {
+    final parametres = await _demanderParametresWol(entree);
+    if (parametres == null || !mounted) return;
+    // Mémorise la MAC (normalisée) pour pré-remplir le prochain réveil.
+    _macWolMemorisees[entree.id] = parametres.mac;
+    try {
+      await ref
+          .read(nativeApiProvider)
+          .sendWol(parametres.mac, broadcast: parametres.broadcast);
+      if (!mounted) return;
+      NovaToast.montrer(context, 'Paquet de réveil envoyé à ${entree.alias}');
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
+  }
+
+  /// Dialogue « Réveiller {alias} » : champ **Adresse MAC** obligatoire
+  /// (formats `AA:BB:CC:DD:EE:FF`, `AA-BB-…` ou `AABB…` tolérés, pré-rempli si
+  /// déjà saisie pendant la session) et champ **Broadcast** facultatif
+  /// (« ip:port », vide → diffusion globale). Renvoie la MAC normalisée et la
+  /// diffusion (`null` si vide), ou `null` si l'utilisateur annule.
+  Future<({String mac, String? broadcast})?> _demanderParametresWol(
+      EntreeCarnet entree) async {
+    final macController =
+        TextEditingController(text: _macWolMemorisees[entree.id] ?? '');
+    final broadcastController = TextEditingController();
+    String? erreurMac;
+    final parametres =
+        await montrerDialogueNova<({String mac, String? broadcast})>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setEtat) {
+          // Valide la MAC ; en cas d'échec, affiche l'erreur sans fermer.
+          void valider() {
+            final mac = _normaliserMac(macController.text);
+            if (mac == null) {
+              setEtat(() => erreurMac =
+                  'Adresse MAC invalide — attendu AA:BB:CC:DD:EE:FF.');
+              return;
+            }
+            final broadcast = broadcastController.text.trim();
+            Navigator.of(context).pop(
+                (mac: mac, broadcast: broadcast.isEmpty ? null : broadcast));
+          }
+
+          return AlertDialog(
+            title: Text('Réveiller ${entree.alias}'),
+            content: SizedBox(
+              width: 360,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: macController,
+                    autofocus: true,
+                    decoration: InputDecoration(
+                      labelText: 'Adresse MAC',
+                      hintText: 'AA:BB:CC:DD:EE:FF',
+                      errorText: erreurMac,
+                      errorMaxLines: 2,
+                    ),
+                    onChanged: (_) {
+                      if (erreurMac != null) setEtat(() => erreurMac = null);
+                    },
+                    onSubmitted: (_) => valider(),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: broadcastController,
+                    decoration: const InputDecoration(
+                      labelText: 'Broadcast (facultatif)',
+                      hintText: '255.255.255.255:9',
+                    ),
+                    onSubmitted: (_) => valider(),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Annuler'),
+              ),
+              FilledButton(
+                onPressed: valider,
+                child: const Text('Réveiller'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    macController.dispose();
+    broadcastController.dispose();
+    return parametres;
   }
 
   // ---------------------------------------------------------------------------
@@ -364,6 +477,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         borderRadius: BorderRadius.circular(kNovaRayon),
         border: Border.all(
             color: _adresseEnFocus ? kNovaRouge : t.champBordure),
+        // Halo doux au focus (maquette `.inp:focus-within` :
+        // `box-shadow:0 0 0 3px rgba(47,111,224,.13)`).
+        boxShadow: _adresseEnFocus
+            ? [
+                BoxShadow(
+                  color: t.bleu.withValues(alpha: 0.13),
+                  spreadRadius: 3,
+                ),
+              ]
+            : null,
       ),
       child: Row(
         children: [
@@ -398,30 +521,28 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _puceMode(NovaTokens t, ModeConnexion mode) {
     final actif = _mode == mode;
-    return GestureDetector(
+    return NovaActivable(
       onTap: () => setState(() => _mode = mode),
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
-          decoration: BoxDecoration(
-            color: actif ? t.selection : Colors.transparent,
-            border: Border.all(color: actif ? t.bleu : t.champBordure),
-            borderRadius: BorderRadius.circular(kNovaRayon),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              NovaIcone(mode.icone,
-                  taille: 13, couleur: actif ? t.bleu : t.texte2),
-              const SizedBox(width: 6),
-              Text(
-                mode.libelle,
-                style: TextStyle(
-                    fontSize: 11.5, color: actif ? t.bleu : t.texte2),
-              ),
-            ],
-          ),
+      label: mode.libelle,
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+        decoration: BoxDecoration(
+          color: actif ? t.selection : Colors.transparent,
+          border: Border.all(color: actif ? t.bleu : t.champBordure),
+          borderRadius: BorderRadius.circular(kNovaRayon),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            NovaIcone(mode.icone,
+                taille: 13, couleur: actif ? t.bleu : t.texte2),
+            const SizedBox(width: 6),
+            Text(
+              mode.libelle,
+              style: TextStyle(
+                  fontSize: 11.5, color: actif ? t.bleu : t.texte2),
+            ),
+          ],
         ),
       ),
     );
@@ -520,20 +641,23 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         const SizedBox(width: 6),
         Text('Mot de passe : ',
             style: TextStyle(fontSize: 12, color: t.texte2)),
-        motDePasse.when(
-          data: (mdp) => SelectableText(
-            mdp,
-            style: TextStyle(
-              fontSize: 12.5,
-              color: t.texte,
-              letterSpacing: 0.5,
-              fontFamily: 'Cascadia Code',
-              fontFamilyFallback: const ['Consolas', 'monospace'],
+        Flexible(
+          child: motDePasse.when(
+            data: (mdp) => SelectableText(
+              mdp,
+              maxLines: 1,
+              style: TextStyle(
+                fontSize: 12.5,
+                color: t.texte,
+                letterSpacing: 0.5,
+                fontFamily: 'Cascadia Code',
+                fontFamilyFallback: const ['Consolas', 'monospace'],
+              ),
             ),
+            loading: () => const NovaSkeleton(largeur: 84, hauteur: 12),
+            error: (e, _) => Text('—',
+                style: TextStyle(fontSize: 12, color: t.texte3)),
           ),
-          loading: () => const NovaSkeleton(largeur: 84, hauteur: 12),
-          error: (e, _) => Text('—',
-              style: TextStyle(fontSize: 12, color: t.texte3)),
         ),
         const SizedBox(width: 6),
         NovaBoutonAction(
@@ -592,46 +716,45 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Widget _onglets(NovaTokens t, _OngletAccueil onglet, String libelle, int? n) {
     final actif = _onglet == onglet;
-    return GestureDetector(
+    return NovaActivable(
       onTap: () => setState(() => _onglet = onglet),
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(13, 8, 13, 8),
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(
-                width: 2,
-                color: actif ? kNovaRouge : Colors.transparent,
-              ),
+      rayonFocus: 3,
+      label: libelle,
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.fromLTRB(13, 8, 13, 8),
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(
+              width: 2,
+              color: actif ? kNovaRouge : Colors.transparent,
             ),
           ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                libelle,
-                style: TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: actif ? FontWeight.w600 : FontWeight.w400,
-                  color: actif ? t.texte : t.texte2,
-                ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              libelle,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: actif ? FontWeight.w600 : FontWeight.w400,
+                color: actif || survole ? t.texte : t.texte2,
               ),
-              if (n != null && n > 0) ...[
-                const SizedBox(width: 7),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                  decoration: BoxDecoration(
-                    color: t.survol,
-                    borderRadius: BorderRadius.circular(9),
-                  ),
-                  child: Text('$n',
-                      style: TextStyle(fontSize: 11, color: t.texte3)),
+            ),
+            if (n != null && n > 0) ...[
+              const SizedBox(width: 7),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                decoration: BoxDecoration(
+                  color: t.survol,
+                  borderRadius: BorderRadius.circular(9),
                 ),
-              ],
+                child: Text('$n',
+                    style: TextStyle(fontSize: 11, color: t.texte3)),
+              ),
             ],
-          ),
+          ],
         ),
       ),
     );
@@ -712,12 +835,24 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 }
 
+/// Normalise une adresse MAC saisie librement — séparateurs `:` ou `-` ou
+/// aucun, casse indifférente — vers la forme canonique « AA:BB:CC:DD:EE:FF ».
+/// Renvoie `null` si la saisie ne compte pas exactement 12 chiffres
+/// hexadécimaux.
+String? _normaliserMac(String saisie) {
+  final hex = saisie.trim().replaceAll(RegExp(r'[:-]'), '').toUpperCase();
+  if (!RegExp(r'^[0-9A-F]{12}$').hasMatch(hex)) return null;
+  return [
+    for (var i = 0; i < hex.length; i += 2) hex.substring(i, i + 2),
+  ].join(':');
+}
+
 // ===========================================================================
 // Composants privés
 // ===========================================================================
 
 /// Lien bleu avec icône (maquette `.lnk`), souligné au survol.
-class _LienBleu extends StatefulWidget {
+class _LienBleu extends StatelessWidget {
   const _LienBleu(
       {required this.icone, required this.libelle, required this.onTap});
 
@@ -726,38 +861,28 @@ class _LienBleu extends StatefulWidget {
   final VoidCallback onTap;
 
   @override
-  State<_LienBleu> createState() => _LienBleuState();
-}
-
-class _LienBleuState extends State<_LienBleu> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            NovaIcone(widget.icone, taille: 13, couleur: t.bleu),
-            const SizedBox(width: 6),
-            Text(
-              widget.libelle,
-              style: TextStyle(
-                fontSize: 12,
-                color: t.bleu,
-                decoration:
-                    _survole ? TextDecoration.underline : TextDecoration.none,
-                decorationColor: t.bleu,
-              ),
+    return NovaActivable(
+      onTap: onTap,
+      rayonFocus: 3,
+      label: libelle,
+      builder: (context, survole, focus) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          NovaIcone(icone, taille: 13, couleur: t.bleu),
+          const SizedBox(width: 6),
+          Text(
+            libelle,
+            style: TextStyle(
+              fontSize: 12,
+              color: t.bleu,
+              decoration:
+                  survole ? TextDecoration.underline : TextDecoration.none,
+              decorationColor: t.bleu,
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -913,16 +1038,21 @@ class _LigneAppareilState extends ConsumerState<_LigneAppareil> {
 
   Widget _etoile(NovaTokens t, EntreeCarnet e) {
     final visible = e.favori || _survole;
-    return Opacity(
-      opacity: visible ? (e.favori ? 1 : 0.6) : 0,
-      child: IgnorePointer(
-        ignoring: !visible,
-        child: NovaBoutonAction(
-          icone: NovaIcones.etoile,
-          tailleIcone: 15,
-          taille: 24,
-          couleurActive: e.favori ? t.ambre : null,
-          onTap: widget.onFavori,
+    // Invisible : exclue du parcours clavier ET des interactions souris.
+    return ExcludeFocus(
+      excluding: !visible,
+      child: Opacity(
+        opacity: visible ? (e.favori ? 1 : 0.6) : 0,
+        child: IgnorePointer(
+          ignoring: !visible,
+          child: NovaBoutonAction(
+            icone: NovaIcones.etoile,
+            tailleIcone: 15,
+            taille: 24,
+            infobulle: e.favori ? 'Retirer des favoris' : 'Ajouter aux favoris',
+            couleurActive: e.favori ? t.ambre : null,
+            onTap: widget.onFavori,
+          ),
         ),
       ),
     );
@@ -1079,12 +1209,17 @@ class _InviteDialog extends StatelessWidget {
             Divider(height: 1, color: t.filet),
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
-              child: Center(
-                child: NovaBoutonSecondaire(
-                  libelle: 'Fermer',
-                  hauteur: 38,
-                  onPressed: () => Navigator.of(context).pop(),
-                ),
+              // Pied de modale : bouton pleine largeur (maquette `.foot .btn`).
+              child: Row(
+                children: [
+                  Expanded(
+                    child: NovaBoutonSecondaire(
+                      libelle: 'Fermer',
+                      hauteur: 38,
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                  ),
+                ],
               ),
             ),
           ],

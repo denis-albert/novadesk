@@ -520,7 +520,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 // Élément d'onglet du rail (`.stab`) — survol + état sélectionné
 // ===========================================================================
 
-class _StabItem extends StatefulWidget {
+class _StabItem extends StatelessWidget {
   const _StabItem({
     required this.icone,
     required this.libelle,
@@ -534,49 +534,36 @@ class _StabItem extends StatefulWidget {
   final VoidCallback onTap;
 
   @override
-  State<_StabItem> createState() => _StabItemState();
-}
-
-class _StabItemState extends State<_StabItem> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final couleur = widget.actif ? t.texte : t.texte2;
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-          decoration: BoxDecoration(
-            color: widget.actif
-                ? t.selection
-                : (_survole ? t.survol : Colors.transparent),
-            borderRadius: BorderRadius.circular(kNovaRayon),
-          ),
-          child: Row(
-            children: [
-              NovaIcone(widget.icone, taille: 15, couleur: couleur),
-              const SizedBox(width: 9),
-              Expanded(
-                child: Text(
-                  widget.libelle,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12.5,
-                    fontWeight:
-                        widget.actif ? FontWeight.w500 : FontWeight.w400,
-                    color: couleur,
-                  ),
+    final couleur = actif ? t.texte : t.texte2;
+    return NovaActivable(
+      onTap: onTap,
+      label: libelle,
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+        decoration: BoxDecoration(
+          color: actif
+              ? t.selection
+              : (survole ? t.survol : Colors.transparent),
+          borderRadius: BorderRadius.circular(kNovaRayon),
+        ),
+        child: Row(
+          children: [
+            NovaIcone(icone, taille: 15, couleur: couleur),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(
+                libelle,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: actif ? FontWeight.w500 : FontWeight.w400,
+                  color: couleur,
                 ),
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );

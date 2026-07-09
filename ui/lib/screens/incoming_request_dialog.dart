@@ -227,25 +227,25 @@ class _IncomingRequestDialogState extends State<IncomingRequestDialog> {
               ),
             ),
             Divider(height: 1, color: t.filet),
-            // Décision.
+            // Décision : deux boutons pleine largeur (maquette `.foot .btn{flex:1}`).
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
               child: Row(
                 children: [
                   Expanded(
-                    child: Text('Session chiffrée de bout en bout.',
-                        style: TextStyle(fontSize: 11, color: t.texte3)),
-                  ),
-                  NovaBoutonSecondaire(
-                    libelle: 'Refuser',
-                    hauteur: 38,
-                    onPressed: () => Navigator.of(context)
-                        .pop(ReponseEntrante(acceptee: false, profil: _profil)),
+                    child: NovaBoutonSecondaire(
+                      libelle: 'Refuser',
+                      hauteur: 38,
+                      onPressed: () => Navigator.of(context).pop(
+                          ReponseEntrante(acceptee: false, profil: _profil)),
+                    ),
                   ),
                   const SizedBox(width: 10),
-                  _BoutonAccepter(
-                    onTap: () => Navigator.of(context)
-                        .pop(ReponseEntrante(acceptee: true, profil: _profil)),
+                  Expanded(
+                    child: _BoutonAccepter(
+                      onTap: () => Navigator.of(context).pop(
+                          ReponseEntrante(acceptee: true, profil: _profil)),
+                    ),
                   ),
                 ],
               ),
@@ -289,44 +289,34 @@ class _IncomingRequestDialogState extends State<IncomingRequestDialog> {
   }
 }
 
-/// Bouton « Accepter » vert (le rouge de marque reste réservé).
-class _BoutonAccepter extends StatefulWidget {
+/// Bouton « Accepter » vert (le rouge de marque reste réservé), focusable au
+/// clavier comme les boutons du kit.
+class _BoutonAccepter extends StatelessWidget {
   const _BoutonAccepter({required this.onTap});
 
   final VoidCallback onTap;
 
   @override
-  State<_BoutonAccepter> createState() => _BoutonAccepterState();
-}
-
-class _BoutonAccepterState extends State<_BoutonAccepter> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: Container(
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: _survole
-                ? Color.alphaBlend(Colors.black.withValues(alpha: 0.12), t.vert)
-                : t.vert,
-            borderRadius: BorderRadius.circular(kNovaRayon),
-          ),
-          child: const Text('Accepter',
-              style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.white)),
+    return NovaActivable(
+      onTap: onTap,
+      label: 'Accepter',
+      builder: (context, survole, focus) => Container(
+        height: 38,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: survole
+              ? Color.alphaBlend(Colors.black.withValues(alpha: 0.12), t.vert)
+              : t.vert,
+          borderRadius: BorderRadius.circular(kNovaRayon),
         ),
+        child: const Text('Accepter',
+            style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: Colors.white)),
       ),
     );
   }

@@ -19,8 +19,8 @@
 //!
 //! ```text
 //! # 1. Retirer l'échafaudage de compilation pré-régénération :
-//! #    supprimer crates/nd-ffi/src/pont_provisoire3.rs
-//! #    et la ligne `mod pont_provisoire3;` de lib.rs.
+//! #    supprimer crates/nd-ffi/src/pont_provisoire5.rs
+//! #    et la ligne `mod pont_provisoire5;` de lib.rs.
 //! #    (Oubli = conflit d'impl E0119 à la compilation, impossible à rater.)
 //! # 2. Depuis novadesk/ui (lit flutter_rust_bridge.yaml : rust_input crate::api) :
 //! flutter_rust_bridge_codegen generate
@@ -69,6 +69,67 @@
 //! `impl SseEncode` écrit à la main, donc **aucun `pont_provisoire4.rs` n'est
 //! nécessaire** pour ce lot (le codegen produira leurs `SseEncode`/`SseDecode`
 //! à la régénération, à l'identique).
+//!
+//! **Lot « multi-instance & Wake-on-LAN » (nouvelle)** : `send_wol(mac,
+//! broadcast)` émet le paquet magique Wake-on-LAN (`nd_features::send_wol`),
+//! **synchrone** à DTO plats (`String`, `Option<String>`) — donc aucun
+//! échafaudage de pont requis, le codegen produira son `SseEncode`/`SseDecode` à
+//! la régénération. Par ailleurs, le répertoire de données du module [`etat`]
+//! est désormais **surchargé** par la variable d'environnement
+//! `NOVADESK_DATA_DIR` si elle est définie (plusieurs instances = plusieurs
+//! identités/ID persistants) ; à défaut, comportement inchangé.
+//!
+//! **Lot « capacités moteur exposées » (nouvelles)** — met à portée du Dart des
+//! capacités déjà implémentées dans le moteur mais jusqu'ici inatteignables :
+//! confidentialité (`set_privacy`, `privacy_active`), cadre d'écran
+//! (`set_session_region`, `session_requested_region` ; DTO `RegionDto`), tunnel
+//! TCP (`open_tunnel`, `close_tunnels` ; DTO `TunnelOuvertDto`), annotations /
+//! tableau blanc (`send_annotation`, `session_annotation_stream` →
+//! `Stream<AnnotationDto>` ; DTO `AnnotationDto`) et **relecture
+//! d'enregistrement** (`open_recording`, `recording_next_frame`,
+//! `recording_seek`, `close_recording` ; DTO `RecordingInfoDto`, réutilise
+//! `VideoFrameDto`). La relecture vit dans le module privé [`lecture`].
+//!
+//! **Lot « extras session & relecture » (nouvelles)** — contrôles de session
+//! sous les noms `session_*` attendus par l'UI (mêmes chemins `flux` que le lot
+//! précédent, qui reste intact) et relecture en **flux poussé** :
+//! `session_set_privacy`, `session_set_region`, `session_send_annotation`,
+//! `session_open_tunnel` (hôte et port distants séparés), `recording_info`
+//! (métadonnées seules, sans lecteur à fermer) et `recording_frame_stream`
+//! (→ `Stream<VideoFrameDto>` : `RecordingPlayer` de `nd-features` + décodeur
+//! H.264 de `nd-codec`, une image RGBA poussée par échantillon). **Aucun DTO ni
+//! `StreamSink` neuf** : les quatre contrôles sont synchrones à DTO plats déjà
+//! bridgés (`RegionDto`, `AnnotationDto`), `recording_info` réutilise
+//! `RecordingInfoDto` et `recording_frame_stream` réutilise le
+//! `StreamSink<VideoFrameDto>` de `session_video_stream` (`SseEncode` déjà
+//! généré) — donc **aucun `pont_provisoire` n'est requis** pour ce lot ; la
+//! régénération ne fera qu'ajouter le câblage des nouvelles fonctions.
+//!
+//! **Lot « plan de contrôle de session » (nouvelles)** — cinq capacités que l'UI
+//! ne pouvait pas encore piloter, chacune additive sur le canal `Control`
+//! existant (ou locale à l'hôte pour l'enregistrement), gardées par les
+//! permissions le cas échéant :
+//! 1. `session_set_permission(session_id, capacite, autorise)` — **permissions à
+//!    chaud** (le contrôleur renégocie ; l'hôte l'applique au filtre d'injection
+//!    au vol) ;
+//! 2. `session_set_quality(session_id, preset)` — **préréglage de qualité**
+//!    (`auto`/`fluide`/`equilibre`/`netteté` → profil ABR + plafond de débit
+//!    appliqués à l'encodeur hôte ; l'ABR continue sous le plafond) ;
+//! 3. `session_set_recording(session_id, chemin)` — **enregistrement à chaud**
+//!    (démarre une nouvelle époque MP4 / arrête proprement, côté hôte) ;
+//! 4. `session_monitors(session_id) -> Vec<MonitorInfoDto>` — **liste des
+//!    moniteurs** réels publiée par l'hôte (remplace l'« Écran 1/2 » codé en
+//!    dur ; l'index alimente `switch_monitor`) ;
+//! 5. `session_peer_info(session_id) -> PeerInfoDto` — **infos système du pair**
+//!    (nom d'hôte + OS).
+//!
+//! DTO **neufs** (que la régénération ajoutera) : `MonitorInfoDto`
+//! (`index`, `largeur`, `hauteur`, `principal`) et `PeerInfoDto` (`hote`, `os`).
+//! Les permissions passent par une clé plate (`capacite: String` +
+//! `autorise: bool`) : **aucun DTO de permissions neuf**. Toutes ces fonctions
+//! sont **synchrones à DTO plats** (aucun `StreamSink`) — donc **aucun
+//! `pont_provisoire` n'est requis** ; le codegen produira leurs
+//! `SseEncode`/`SseDecode` à la régénération.
 
 // Binding généré par `flutter_rust_bridge_codegen generate` (config dans
 // `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit
@@ -88,6 +149,14 @@ mod flux;
 /// sous le répertoire de données de l'application. Hors du périmètre scanné par
 /// le codegen ; la façade [`api`] l'enveloppe en fonctions plates.
 mod etat;
+
+/// Relecture d'enregistrement (`.mp4`/`.ndr`) par identifiant opaque : table
+/// statique de lecteurs (`nd_features::RecordingPlayer` + décodeur `nd_codec`),
+/// décodage RGBA image par image, recherche par horodatage — plus deux accès
+/// sans identifiant : métadonnées seules et relecture en flux poussé. Hors du
+/// périmètre scanné par le codegen ; la façade [`api`] l'enveloppe en fonctions
+/// plates.
+mod lecture;
 
 pub use api::*;
 

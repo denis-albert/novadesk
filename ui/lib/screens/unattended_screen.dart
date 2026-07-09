@@ -2,11 +2,10 @@
 /// façon réglages — activation, mot de passe permanent + jauge de force,
 /// profils de permissions, appareils de confiance, journal des accès.
 ///
-/// Câblage moteur **préservé** : l'activation démarre un vrai hôte
-/// (`start_unattended_host`), s'abonne aux demandes entrantes
-/// (`unattended_incoming_stream`) qui ouvrent le dialogue d'acceptation, tranche
-/// via `approve_incoming`, suit les statistiques (`unattended_stats`) et arrête
-/// l'hôte (`stop_unattended_host`).
+/// L'écran est une **vue** : le cycle de vie de l'hôte réel (démarrage,
+/// demandes entrantes et leur dialogue d'acceptation, statistiques, arrêt)
+/// appartient au provider applicatif [hoteNonSurveilleProvider] — quitter
+/// l'onglet ne coupe plus la réception, qui survit tant que l'application vit.
 library;
 
 import 'dart:async';
@@ -22,7 +21,6 @@ import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_id_field.dart';
 import '../widgets/nova_kit.dart';
-import 'incoming_request_dialog.dart';
 
 class UnattendedScreen extends ConsumerStatefulWidget {
   const UnattendedScreen({super.key});
@@ -35,181 +33,41 @@ class UnattendedScreen extends ConsumerStatefulWidget {
 
 class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
   final TextEditingController _motDePasseController = TextEditingController();
-  bool _actif = false;
   bool _profilControle = true;
   bool _profilObservation = false;
-
-  // --- Hôte « accès non surveillé » réel (façade `nd-ffi`) ------------------
-
-  int? _hostId;
-  StreamSubscription<IncomingRequestDto>? _abonnementEntrantes;
-  Timer? _minuterieStats;
-  SessionStatsDto? _stats;
-  int _servies = 0;
-  int _refusees = 0;
-  bool _bascule = false;
-  bool _dialogueEnCours = false;
 
   NativeApi get _api => ref.read(nativeApiProvider);
 
   @override
   void dispose() {
-    unawaited(_abonnementEntrantes?.cancel());
-    _minuterieStats?.cancel();
-    final id = _hostId;
-    if (id != null) {
-      unawaited(_api.stopUnattendedHost(id));
-    }
+    // L'hôte non surveillé n'est PLUS arrêté ici : son cycle de vie appartient
+    // à [hoteNonSurveilleProvider], au niveau application — la réception
+    // continue quand on quitte l'onglet.
     _motDePasseController.dispose();
     super.dispose();
   }
 
   // ---------------------------------------------------------------------------
-  // Cycle de vie de l'hôte non surveillé (inchangé)
+  // Hôte non surveillé : simple relais vers le provider applicatif
   // ---------------------------------------------------------------------------
 
-  Future<void> _basculerHote(bool activer) =>
-      activer ? _activerHote() : _desactiverHote();
-
-  Future<void> _activerHote() async {
-    if (_hostId != null) return;
-    setState(() => _bascule = true);
+  /// Bascule l'hôte via [hoteNonSurveilleProvider] ; l'écran ne fait
+  /// qu'afficher le résultat (toast de confirmation ou d'erreur).
+  Future<void> _basculerHote(bool activer) async {
+    final hote = ref.read(hoteNonSurveilleProvider.notifier);
     try {
-      final hostId = await _api.startUnattendedHost(
-        localId: ref.read(idLocalProvider),
-        rendezvous: ref.read(rendezvousProvider),
-        stunServers: ref.read(stunServersProvider),
-        permissions: PermissionsDto.full(),
-      );
-      if (!mounted) {
-        unawaited(_api.stopUnattendedHost(hostId));
-        return;
-      }
-      _hostId = hostId;
-      _abonnementEntrantes = _api.unattendedIncomingStream(hostId).listen(
-        (demande) => unawaited(_surDemandeEntrante(demande)),
-        onError: (Object e) {
-          if (mounted) {
-            NovaToast.montrer(
-                context, 'Flux des demandes interrompu : ${_message(e)}',
-                info: true);
-          }
-        },
-      );
-      _demarrerStats();
-      setState(() {
-        _actif = true;
-        _servies = 0;
-        _refusees = 0;
-      });
-      if (mounted) {
+      await hote.basculer(activer);
+      if (activer && mounted && ref.read(hoteNonSurveilleProvider).actif) {
         NovaToast.montrer(context, 'Accès non surveillé activé');
       }
-    } on NovaApiException catch (e) {
-      if (mounted) NovaToast.montrer(context, e.message, info: true);
     } catch (e) {
-      if (mounted) NovaToast.montrer(context, _message(e), info: true);
-    } finally {
-      if (mounted) setState(() => _bascule = false);
+      if (mounted) NovaToast.montrer(context, messageNova(e), info: true);
     }
   }
-
-  Future<void> _desactiverHote() async {
-    final id = _hostId;
-    if (id == null) return;
-    setState(() => _bascule = true);
-    unawaited(_abonnementEntrantes?.cancel());
-    _abonnementEntrantes = null;
-    _minuterieStats?.cancel();
-    _minuterieStats = null;
-    try {
-      await _api.stopUnattendedHost(id);
-    } catch (_) {
-      // Arrêt best-effort.
-    }
-    _hostId = null;
-    if (mounted) {
-      setState(() {
-        _actif = false;
-        _bascule = false;
-        _stats = null;
-      });
-    }
-  }
-
-  Future<void> _surDemandeEntrante(IncomingRequestDto demande) async {
-    if (!mounted || _hostId == null || _dialogueEnCours) return;
-    _dialogueEnCours = true;
-    final carnet =
-        ref.read(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
-    final alias = carnet
-        .where((e) => e.id == demande.peerId)
-        .map((e) => e.alias)
-        .firstOrNull;
-    final reponse = await IncomingRequestDialog.montrer(
-      context,
-      alias: alias ?? 'Appareil non répertorié',
-      idFormate: demande.peerIdFormate,
-      empreinte: _empreinte(demande.peerId),
-    );
-    final accepter = reponse?.acceptee ?? false;
-    final id = _hostId;
-    if (id != null) {
-      try {
-        await _api.approveIncoming(
-          hostId: id,
-          peerId: demande.peerId,
-          accepter: accepter,
-        );
-      } catch (_) {
-        // Demande déjà tranchée/expirée : rien à faire.
-      }
-    }
-    // Journalise l'accès (accepté / refusé) dans l'état persistant.
-    try {
-      await _api.recordAccess(peerId: demande.peerId, accepte: accepter);
-      ref.invalidate(accessLogProvider);
-    } catch (_) {
-      // Journalisation best-effort.
-    }
-    if (mounted) {
-      setState(() {
-        if (accepter) {
-          _servies++;
-        } else {
-          _refusees++;
-        }
-      });
-    }
-    _dialogueEnCours = false;
-  }
-
-  void _demarrerStats() {
-    _minuterieStats?.cancel();
-    unawaited(_rafraichirStats());
-    _minuterieStats = Timer.periodic(
-      const Duration(seconds: 2),
-      (_) => unawaited(_rafraichirStats()),
-    );
-  }
-
-  Future<void> _rafraichirStats() async {
-    final id = _hostId;
-    if (id == null) return;
-    try {
-      final stats = await _api.unattendedStats(id);
-      if (mounted) setState(() => _stats = stats);
-    } catch (_) {
-      // Stats indisponibles : dernière valeur conservée.
-    }
-  }
-
-  String _message(Object e) =>
-      e is NovaApiException ? e.message : e.toString();
 
   /// Sous-titre du journal : compteurs réels de l'`access_log` persistant, plus,
   /// en session, le résumé des statistiques cumulées de l'hôte
-  /// (`unattended_stats`) quand elles existent.
+  /// (`unattended_stats`) tenues par [hoteNonSurveilleProvider].
   String _sousTitreJournal() {
     final journal =
         ref.watch(accessLogProvider).valueOrNull ?? const <AccessLogEntryDto>[];
@@ -217,10 +75,12 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     final refuses = journal.length - acceptes;
     final base = '${journal.length} accès journalisé(s) — '
         '$acceptes acceptée(s), $refuses refusée(s)';
-    if (!_actif) return '$base.';
-    final s = _stats;
+    final hote = ref.watch(hoteNonSurveilleProvider);
+    if (!hote.actif) return '$base.';
+    final s = hote.stats;
     if (s == null) {
-      return '$base · session : $_servies servie(s), $_refusees refusée(s).';
+      return '$base · session : ${hote.servies} servie(s), '
+          '${hote.refusees} refusée(s).';
     }
     final mo =
         (s.bytesOut / (1024 * 1024)).toStringAsFixed(1).replaceAll('.', ',');
@@ -270,15 +130,6 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           'sans mot de passe.';
     }
     return '${ids.map(_aliasPour).join(' · ')} — connexion sans mot de passe.';
-  }
-
-  String _empreinte(int peerId) {
-    final hex = peerId.toRadixString(16).toUpperCase().padLeft(12, '0');
-    final paires = <String>[];
-    for (var i = 0; i + 2 <= hex.length; i += 2) {
-      paires.add(hex.substring(i, i + 2));
-    }
-    return paires.join(':');
   }
 
   double _force(String motDePasse) {
@@ -539,6 +390,8 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     ref.watch(unattendedConfigProvider);
     ref.watch(carnetProvider);
     ref.watch(accessLogProvider);
+    // État applicatif de l'hôte : interrupteur, stats et compteurs de session.
+    final hote = ref.watch(hoteNonSurveilleProvider);
     return ListView(
       padding: const EdgeInsets.fromLTRB(26, 22, 26, 22),
       children: [
@@ -557,8 +410,9 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           sousTitre: 'Ce poste peut être contrôlé à distance avec le mot de '
               'passe ci-dessous.',
           controle: NovaSwitch(
-            actif: _actif,
-            onChanged: _bascule ? null : (v) => unawaited(_basculerHote(v)),
+            actif: hote.actif,
+            onChanged:
+                hote.bascule ? null : (v) => unawaited(_basculerHote(v)),
           ),
         ),
         _lignePassword(t),

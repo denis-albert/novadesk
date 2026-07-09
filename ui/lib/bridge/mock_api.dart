@@ -355,6 +355,10 @@ class MockNativeApi implements NativeApi {
     _debutSession.remove(id);
     unawaited(_chatControleurs.remove(id)?.close());
     unawaited(_transfertControleurs.remove(id)?.close());
+    unawaited(_annotationControleurs.remove(id)?.close());
+    _confidentialite.remove(id);
+    _regions.remove(id);
+    _enregistrementsAChaud.remove(id);
   }
 
   // -------------------------------------------------------------------------
@@ -962,6 +966,249 @@ class MockNativeApi implements NativeApi {
   Future<List<AccessLogEntryDto>> accessLog() async =>
       List.unmodifiable(_journalAcces);
 
+  // -------------------------------------------------------------------------
+  // Capacités avancées de session — confidentialité, cadre d'écran, tunnels,
+  // annotations (état/flux en mémoire : parcours démontrable SANS le cœur natif)
+  // -------------------------------------------------------------------------
+
+  /// Mode confidentialité mémorisé par session (rideau actif).
+  final Map<int, bool> _confidentialite = {};
+
+  /// Cadre d'écran demandé par session (absent = plein écran).
+  final Map<int, RegionDto> _regions = {};
+
+  /// Un contrôleur d'annotations par session (créé à la première écoute ou au
+  /// premier envoi).
+  final Map<int, StreamController<AnnotationDto>> _annotationControleurs = {};
+
+  StreamController<AnnotationDto> _annotationControleur(int id) =>
+      _annotationControleurs.putIfAbsent(
+        id,
+        () => StreamController<AnnotationDto>.broadcast(),
+      );
+
+  @override
+  Future<void> setPrivacy(int sessionId, bool actif) async {
+    _confidentialite[sessionId] = actif;
+    debugPrint('MockNativeApi.setPrivacy(session $sessionId) = '
+        '${actif ? 'rideau' : 'écran'}');
+  }
+
+  @override
+  Future<bool> privacyActive(int sessionId) async =>
+      _confidentialite[sessionId] ?? false;
+
+  @override
+  Future<void> setSessionRegion(int sessionId, RegionDto? region) async {
+    if (region == null) {
+      _regions.remove(sessionId);
+    } else {
+      _regions[sessionId] = region;
+    }
+  }
+
+  @override
+  Future<RegionDto?> sessionRequestedRegion(int sessionId) async =>
+      _regions[sessionId];
+
+  @override
+  Future<TunnelOuvertDto> openTunnel(
+    int sessionId,
+    int portLocal,
+    String cible,
+  ) async {
+    // Port éphémère plausible si 0 (comme le cœur réel qui résout un port libre).
+    final port = portLocal == 0 ? 49152 + _alea.nextInt(16384) : portLocal;
+    return TunnelOuvertDto(adresseLocale: '127.0.0.1:$port', portLocal: port);
+  }
+
+  @override
+  Future<void> closeTunnels(int sessionId) async {
+    // Aucun tunnel réel : no-op.
+  }
+
+  @override
+  Stream<AnnotationDto> sessionAnnotationStream(int sessionId) =>
+      _annotationControleur(sessionId).stream;
+
+  /// Réémet l'annotation sur le flux (écho local immédiat) : le trait dessiné
+  /// s'affiche en démo comme s'il revenait du pair.
+  @override
+  Future<void> sendAnnotation(int sessionId, AnnotationDto annotation) async {
+    final controleur = _annotationControleur(sessionId);
+    if (!controleur.isClosed) controleur.add(annotation);
+  }
+
+  // -------------------------------------------------------------------------
+  // Plan de contrôle de session (lot « contrôles de session ») — état en
+  // mémoire : permissions à chaud, qualité, enregistrement à chaud, moniteurs
+  // factices et infos système du pair, mêmes validations et messages français
+  // que `crate::flux` (`capacite_depuis_cle`, `qualite_depuis_preset`).
+  // -------------------------------------------------------------------------
+
+  /// Clés de capacité acceptées par [sessionSetPermission] (contrat UI stable,
+  /// aligné sur `nd_ffi::flux::capacite_depuis_cle`).
+  static const List<String> _capacitesConnues = [
+    'voir_ecran',
+    'souris',
+    'clavier',
+    'presse_papiers_lecture',
+    'presse_papiers_ecriture',
+    'fichiers_envoi',
+    'fichiers_reception',
+    'audio',
+    'redemarrage',
+    'enregistrement',
+    'confidentialite',
+    'tunnel',
+  ];
+
+  /// Préréglages de qualité acceptés (avec et sans accent, comme le cœur).
+  static const List<String> _presetsQualite = [
+    'auto',
+    'fluide',
+    'equilibre',
+    'nettete',
+    'netteté',
+  ];
+
+  /// Journal **observable par les tests** des permissions renégociées à chaud
+  /// (le cœur réel, lui, pousse le nouvel ensemble au filtre d'injection).
+  final List<({int id, String capacite, bool autorise})> permissionsRenegociees =
+      <({int id, String capacite, bool autorise})>[];
+
+  /// Journal **observable par les tests** des préréglages de qualité appliqués.
+  final List<({int id, String preset})> presetsQualiteAppliques =
+      <({int id, String preset})>[];
+
+  /// Chemin du MP4 en cours d'écriture par session (absent = pas
+  /// d'enregistrement à chaud).
+  final Map<int, String> _enregistrementsAChaud = {};
+
+  @override
+  Future<void> sessionSetPermission(
+    int sessionId,
+    String capacite,
+    bool autorise,
+  ) async {
+    // L'analyse de la clé précède tout accès à la session (comme le cœur).
+    if (!_capacitesConnues.contains(capacite)) {
+      throw NovaApiException(
+          'capacité inconnue : « $capacite » (attendu : '
+          '${_capacitesConnues.join(', ')})');
+    }
+    permissionsRenegociees
+        .add((id: sessionId, capacite: capacite, autorise: autorise));
+    debugPrint('MockNativeApi.sessionSetPermission(session $sessionId) : '
+        '$capacite = ${autorise ? 'accordée' : 'retirée'}');
+  }
+
+  @override
+  Future<void> sessionSetQuality(int sessionId, String preset) async {
+    if (!_presetsQualite.contains(preset)) {
+      throw NovaApiException('préréglage de qualité inconnu : « $preset » '
+          '(attendu : auto, fluide, equilibre, netteté)');
+    }
+    presetsQualiteAppliques.add((id: sessionId, preset: preset));
+    debugPrint('MockNativeApi.sessionSetQuality(session $sessionId) → $preset');
+  }
+
+  @override
+  Future<void> sessionSetRecording(int sessionId, String? chemin) async {
+    if (chemin == null) {
+      _enregistrementsAChaud.remove(sessionId);
+    } else {
+      _enregistrementsAChaud[sessionId] = chemin;
+    }
+    debugPrint('MockNativeApi.sessionSetRecording(session $sessionId) → '
+        '${chemin ?? 'arrêt (fichier clos)'}');
+  }
+
+  /// Chemin d'enregistrement à chaud actif d'une session (**observable par les
+  /// tests**) ; `null` si aucun enregistrement n'est en cours.
+  String? enregistrementActif(int sessionId) => _enregistrementsAChaud[sessionId];
+
+  /// Deux écrans factices (dont le principal), à l'image d'un poste de bureau
+  /// classique : remplace l'« Écran 1/2 » codé en dur du sous-menu moniteurs.
+  @override
+  Future<List<MonitorInfoDto>> sessionMonitors(int sessionId) async => const [
+        MonitorInfoDto(index: 0, largeur: 1920, hauteur: 1080, principal: true),
+        MonitorInfoDto(
+            index: 1, largeur: 1280, hauteur: 1024, principal: false),
+      ];
+
+  @override
+  Future<PeerInfoDto> sessionPeerInfo(int sessionId) async =>
+      const PeerInfoDto(hote: 'MOCK-PC', os: 'Windows 11 Pro (mock)');
+
+  // -------------------------------------------------------------------------
+  // Relecture d'enregistrements — lecteur en mémoire (images de synthèse)
+  // -------------------------------------------------------------------------
+
+  static const int _largeurEnregistrementMock = 1280;
+  static const int _hauteurEnregistrementMock = 720;
+  static const int _fpsEnregistrementMock = 30;
+  static const int _nbImagesEnregistrementMock = 60; // ~2 s à 30 fps
+
+  int _prochainIdEnregistrement = 1;
+
+  /// Index de la prochaine image à lire, par enregistrement ouvert.
+  final Map<int, int> _positionLecture = {};
+
+  @override
+  Future<RecordingInfoDto> openRecording(String chemin) async {
+    final id = _prochainIdEnregistrement++;
+    _positionLecture[id] = 0;
+    return RecordingInfoDto(
+      id: id,
+      largeur: _largeurEnregistrementMock,
+      hauteur: _hauteurEnregistrementMock,
+      fps: _fpsEnregistrementMock,
+      dureeUs: (_nbImagesEnregistrementMock * 1000000 / _fpsEnregistrementMock)
+          .round(),
+      nbImages: _nbImagesEnregistrementMock,
+    );
+  }
+
+  @override
+  Future<VideoFrameDto?> recordingNextFrame(int id) async {
+    final pos = _positionLecture[id];
+    if (pos == null || pos >= _nbImagesEnregistrementMock) return null;
+    _positionLecture[id] = pos + 1;
+    return _genererFrameEnregistrement(pos);
+  }
+
+  @override
+  Future<void> recordingSeek(int id, int timestampUs) async {
+    if (!_positionLecture.containsKey(id)) return;
+    // Convertit le timestamp (µs) en index d'image (30 fps), borné.
+    final index = (timestampUs * _fpsEnregistrementMock / 1000000).round();
+    _positionLecture[id] = index.clamp(0, _nbImagesEnregistrementMock);
+  }
+
+  @override
+  Future<void> closeRecording(int id) async {
+    _positionLecture.remove(id);
+  }
+
+  // -------------------------------------------------------------------------
+  // Wake-on-LAN
+  // -------------------------------------------------------------------------
+
+  /// Journal **observable par les tests** des réveils Wake-on-LAN demandés (le
+  /// cœur réel, lui, émet le paquet magique en UDP).
+  final List<({String mac, String? broadcast})> reveilsWol =
+      <({String mac, String? broadcast})>[];
+
+  @override
+  Future<void> sendWol(String mac, {String? broadcast}) async {
+    reveilsWol.add((mac: mac, broadcast: broadcast));
+    final cible = (broadcast == null || broadcast.isEmpty)
+        ? '255.255.255.255:9'
+        : broadcast;
+    debugPrint('MockNativeApi.sendWol(mac $mac) → $cible');
+  }
+
   // Barres facon mire télé : blanc, jaune, cyan, vert, magenta, rouge, bleu, noir.
   static const List<List<int>> _barresMire = [
     [236, 239, 244],
@@ -1003,6 +1250,27 @@ class MockNativeApi implements NativeApi {
         rgba[i++] = g < 0 ? 0 : (g > 255 ? 255 : g);
         rgba[i++] = b < 0 ? 0 : (b > 255 ? 255 : b);
         rgba[i++] = 255;
+      }
+    }
+    return VideoFrameDto(width: w, height: h, rgba: rgba);
+  }
+
+  /// Génère une image de relecture (dimensions de l'enregistrement mock) : un
+  /// dégradé diagonal qui se décale selon [index] (mouvement visible à la
+  /// lecture), distinct de la mire live.
+  VideoFrameDto _genererFrameEnregistrement(int index) {
+    const int w = _largeurEnregistrementMock;
+    const int h = _hauteurEnregistrementMock;
+    final rgba = Uint8List(w * h * 4);
+    final int defile = index * 6;
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        rgba[i++] = ((x + defile) * 255 ~/ w) & 0xFF; // R : défile avec le temps
+        rgba[i++] = y * 255 ~/ h; // V : dégradé vertical
+        final int b = 200 - ((x + y + defile) & 127) ~/ 2;
+        rgba[i++] = b < 0 ? 0 : b; // B
+        rgba[i++] = 255; // A
       }
     }
     return VideoFrameDto(width: w, height: h, rgba: rgba);

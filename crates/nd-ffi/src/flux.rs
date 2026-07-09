@@ -29,20 +29,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nd_audio::AudioSession;
-use nd_codec::DecodedFrame;
+use nd_codec::{ContentProfile, DecodedFrame};
 use nd_core::{
     ChatMessage, SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions,
-    SessionState, UnattendedHost, UnattendedHostHandle,
+    SessionState, TunnelHandle, UnattendedHost, UnattendedHostHandle,
 };
-use nd_features::{PermissionSet, Permissions};
+use nd_features::{AnnotationLayer, Capability, PermissionSet, Permissions};
 use nd_files::{ClipboardSync, TransferEvent};
 use nd_proto::{InputEvent, NovaId};
 use nd_transport::ServerIdentity;
 
 use crate::api::{
-    ChatMessageDto, IncomingRequestDto, ListenInfoDto, PermissionsDto, SessionConfigDto,
-    SessionEndpointDto, SessionOptionsDto, SessionStateDto, SessionStatsDto, TransferEventDto,
-    VideoFrameDto,
+    AnnotationDto, ChatMessageDto, IncomingRequestDto, ListenInfoDto, MonitorInfoDto, PeerInfoDto,
+    PermissionsDto, SessionConfigDto, SessionEndpointDto, SessionOptionsDto, SessionStateDto,
+    SessionStatsDto, TransferEventDto, TunnelOuvertDto, VideoFrameDto,
 };
 use crate::frb_generated::{SseEncode, StreamSink};
 
@@ -68,6 +68,9 @@ struct EntreeSession {
     chat: Option<Receiver<ChatMessage>>,
     /// Progression des transferts de fichiers (mode étendu), idem.
     transfert: Option<Receiver<TransferEvent>>,
+    /// Couches d'annotation / tableau blanc reçues du pair (mode étendu), tant
+    /// qu'aucun consommateur ne les a prises.
+    annotations: Option<Receiver<AnnotationLayer>>,
     /// Adresse/certificat d'écoute (sessions hôtes `Loopback` uniquement).
     ecoute: Option<ListenInfoDto>,
 }
@@ -156,6 +159,10 @@ fn demarrer_session_interne(
         &mut poignee.transfer_rx,
         mpsc::channel().1,
     ));
+    let annotations = Some(std::mem::replace(
+        &mut poignee.annotation_rx,
+        mpsc::channel().1,
+    ));
 
     let id = PROCHAIN_ID.fetch_add(1, Ordering::Relaxed);
     verrou().insert(
@@ -166,6 +173,7 @@ fn demarrer_session_interne(
             frames,
             chat,
             transfert,
+            annotations,
             ecoute,
         },
     );
@@ -280,6 +288,9 @@ pub(crate) fn arreter_session(id: u64) -> Result<(), String> {
     let entree = verrou()
         .remove(&id)
         .ok_or_else(|| format!("session {id} inconnue (jamais démarrée ou déjà arrêtée)"))?;
+    // Ferme d'abord les tunnels TCP de la session (cesse d'accepter, joint les
+    // fils d'acceptation), puis arrête le moteur.
+    fermer_tunnels_interne(id);
     entree.poignee.stop();
     Ok(())
 }
@@ -340,6 +351,214 @@ pub(crate) fn basculer_moniteur(id: u64, moniteur: u32) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Capacités moteur avancées : confidentialité, cadre d'écran, tunnel, annotation
+// ---------------------------------------------------------------------------
+//
+// Comme les commandes média étendues, ces fonctions délèguent aux méthodes de
+// [`SessionHandle`] déjà livrées. Confidentialité / région / annotation postent
+// sur un canal interne (inertes hors mode étendu ou permission absente, mais
+// toujours `Ok` tant que la session existe) ; le tunnel lie en revanche
+// **immédiatement** un écouteur TCP local et peut donc échouer.
+
+/// Active (ou lève) le mode confidentialité de la session.
+pub(crate) fn definir_confidentialite(id: u64, actif: bool) -> Result<(), String> {
+    avec_entree(id, |entree| entree.poignee.set_privacy(actif))
+}
+
+/// État du mode confidentialité connu localement (indicateur à afficher).
+pub(crate) fn confidentialite_active(id: u64) -> Result<bool, String> {
+    avec_entree(id, |entree| entree.poignee.privacy_active())
+}
+
+/// Restreint la zone d'écran partagée (« cadre d'écran ») ou rétablit le plein
+/// écran avec `None`.
+pub(crate) fn definir_region(id: u64, region: Option<(u32, u32, u32, u32)>) -> Result<(), String> {
+    avec_entree(id, |entree| entree.poignee.set_region(region))
+}
+
+/// Cadre d'écran actuellement demandé (`None` = plein écran).
+pub(crate) fn region_demandee(id: u64) -> Result<Option<(u32, u32, u32, u32)>, String> {
+    avec_entree(id, |entree| entree.poignee.requested_region())
+}
+
+/// Ouvre un tunnel TCP de session : écoute sur `127.0.0.1:port_local` et relaie
+/// vers `cible` (« ip:port ») à travers la session. Stocke la poignée du tunnel
+/// dans la table dédiée (fermée par [`fermer_tunnels`] ou à l'arrêt de la
+/// session) et renvoie l'adresse locale réellement écoutée.
+pub(crate) fn ouvrir_tunnel(
+    id: u64,
+    port_local: u16,
+    cible: String,
+) -> Result<TunnelOuvertDto, String> {
+    // L'analyse de la cible précède la recherche de session : une saisie
+    // invalide échoue avec un message français clair, sans toucher à la session.
+    let cible_addr = parser_adresse("de la cible du tunnel", &cible)?;
+    ouvrir_tunnel_vers(id, port_local, cible_addr)
+}
+
+/// Cœur de l'ouverture de tunnel, la cible étant déjà résolue en [`SocketAddr`]
+/// (voir [`ouvrir_tunnel`] pour la variante à cible texte « ip:port », et
+/// [`crate::api::session_open_tunnel`] pour la variante à hôte et port séparés).
+pub(crate) fn ouvrir_tunnel_vers(
+    id: u64,
+    port_local: u16,
+    cible: SocketAddr,
+) -> Result<TunnelOuvertDto, String> {
+    let tunnel = avec_entree(id, |entree| entree.poignee.open_tunnel(port_local, cible))?
+        .map_err(|e| format!("ouverture du tunnel impossible : {e}"))?;
+    let adresse_locale = tunnel.local_addr();
+    let dto = TunnelOuvertDto {
+        adresse_locale: adresse_locale.to_string(),
+        port_local: adresse_locale.port(),
+    };
+    verrou_tunnels().entry(id).or_default().push(tunnel);
+    Ok(dto)
+}
+
+/// Ferme tous les tunnels TCP ouverts pour la session `id` (idempotent : aucune
+/// erreur si la session n'a aucun tunnel).
+pub(crate) fn fermer_tunnels(id: u64) -> Result<(), String> {
+    fermer_tunnels_interne(id);
+    Ok(())
+}
+
+/// Envoie une couche d'annotation au pair (un seul trait, bâti depuis le DTO
+/// plat). Sans effet hors mode étendu.
+pub(crate) fn envoyer_annotation(id: u64, annotation: AnnotationDto) -> Result<(), String> {
+    // La conversion (validation du genre / des points) peut échouer avant tout
+    // accès à la session.
+    let couche = crate::api::couche_depuis_annotation(&annotation)?;
+    avec_entree(id, |entree| entree.poignee.send_annotation(couche))
+}
+
+// ---------------------------------------------------------------------------
+// Plan de contrôle de session : permissions à chaud, qualité, enregistrement,
+// moniteurs, infos du pair
+// ---------------------------------------------------------------------------
+
+/// Traduit une **clé de capacité** (contrat UI stable) en [`Capability`]. Une
+/// clé inconnue renvoie une erreur française listant les valeurs acceptées
+/// (l'analyse précède tout accès à la session).
+fn capacite_depuis_cle(cle: &str) -> Result<Capability, String> {
+    let capacite = match cle {
+        "voir_ecran" => Capability::ViewScreen,
+        "souris" => Capability::ControlMouse,
+        "clavier" => Capability::ControlKeyboard,
+        "presse_papiers_lecture" => Capability::ClipboardRead,
+        "presse_papiers_ecriture" => Capability::ClipboardWrite,
+        "fichiers_envoi" => Capability::FileUpload,
+        "fichiers_reception" => Capability::FileDownload,
+        "audio" => Capability::Audio,
+        "redemarrage" => Capability::RestartRemote,
+        "enregistrement" => Capability::SessionRecording,
+        "confidentialite" => Capability::PrivacyMode,
+        "tunnel" => Capability::TcpTunnel,
+        autre => {
+            return Err(format!(
+                "capacité inconnue : « {autre} » (attendu : voir_ecran, souris, clavier, \
+                 presse_papiers_lecture, presse_papiers_ecriture, fichiers_envoi, \
+                 fichiers_reception, audio, redemarrage, enregistrement, confidentialite, tunnel)"
+            ))
+        }
+    };
+    Ok(capacite)
+}
+
+/// Traduit un **préréglage de qualité** (contrat UI) en `(profil ABR, plafond
+/// kbit/s)`. `0` = aucun plafond. Un préréglage inconnu renvoie une erreur.
+fn qualite_depuis_preset(preset: &str) -> Result<(ContentProfile, u32), String> {
+    let cible = match preset {
+        "auto" => (ContentProfile::Text, 0),
+        "fluide" => (ContentProfile::Video, 0),
+        "equilibre" => (ContentProfile::Video, 5_000),
+        // Tolère la saisie avec ou sans accent.
+        "nettete" | "netteté" => (ContentProfile::Text, 0),
+        autre => {
+            return Err(format!(
+                "préréglage de qualité inconnu : « {autre} » \
+                 (attendu : auto, fluide, equilibre, netteté)"
+            ))
+        }
+    };
+    Ok(cible)
+}
+
+/// Renégocie une permission à chaud : lit l'ensemble vivant de la session,
+/// accorde/retire la capacité, puis pousse le nouvel ensemble à l'hôte.
+pub(crate) fn definir_permission(id: u64, capacite: &str, autorise: bool) -> Result<(), String> {
+    // L'analyse de la clé précède l'accès à la session (erreur claire, sans
+    // toucher à la session pour une clé fautive).
+    let cap = capacite_depuis_cle(capacite)?;
+    avec_entree(id, |entree| {
+        let mut permissions = entree.poignee.current_permissions();
+        if autorise {
+            permissions.grant(cap);
+        } else {
+            permissions.revoke(cap);
+        }
+        entree.poignee.set_permissions(permissions);
+    })
+}
+
+/// Applique un préréglage de qualité (profil ABR + plafond de débit).
+pub(crate) fn definir_qualite(id: u64, preset: &str) -> Result<(), String> {
+    let (profil, plafond) = qualite_depuis_preset(preset)?;
+    avec_entree(id, |entree| entree.poignee.set_quality(profil, plafond))
+}
+
+/// Démarre (chemin) ou arrête (`None`) l'enregistrement local de l'hôte à chaud.
+pub(crate) fn definir_enregistrement(id: u64, chemin: Option<PathBuf>) -> Result<(), String> {
+    avec_entree(id, |entree| entree.poignee.set_recording(chemin))
+}
+
+/// Liste des moniteurs publiée par l'hôte (vide tant qu'elle n'est pas arrivée).
+pub(crate) fn moniteurs(id: u64) -> Result<Vec<MonitorInfoDto>, String> {
+    let liste = avec_entree(id, |entree| entree.poignee.monitors())?;
+    Ok(liste
+        .unwrap_or_default()
+        .into_iter()
+        .map(MonitorInfoDto::from)
+        .collect())
+}
+
+/// Infos système du pair (erreur tant que l'annonce n'est pas arrivée).
+pub(crate) fn infos_pair(id: u64) -> Result<PeerInfoDto, String> {
+    let infos = avec_entree(id, |entree| entree.poignee.peer_info())?;
+    infos.map(PeerInfoDto::from).ok_or_else(|| {
+        format!("infos système du pair non encore reçues pour la session {id} (annonce en attente)")
+    })
+}
+
+// --- Table des tunnels TCP par session --------------------------------------
+
+/// Tunnels TCP ouverts par session : la [`TunnelHandle`] doit vivre aussi
+/// longtemps que le tunnel (son `Drop`/`close` cesse d'accepter les connexions
+/// locales). Table distincte de [`SESSIONS`] pour qu'un `close` bloquant (join
+/// du fil d'acceptation) ne retienne pas le verrou des sessions.
+type TableTunnels = Mutex<HashMap<u64, Vec<TunnelHandle>>>;
+
+/// Table statique des tunnels, indexée par identifiant de session.
+static TUNNELS: OnceLock<TableTunnels> = OnceLock::new();
+
+/// Verrouille la table des tunnels (empoisonnement absorbé, cf. [`verrou`]).
+fn verrou_tunnels() -> MutexGuard<'static, HashMap<u64, Vec<TunnelHandle>>> {
+    TUNNELS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Retire et ferme les tunnels de la session `id`. Le verrou est relâché avant
+/// les `close` (qui joignent les fils d'acceptation), pour ne pas bloquer les
+/// autres opérations de tunnel pendant l'attente.
+fn fermer_tunnels_interne(id: u64) {
+    let tunnels = verrou_tunnels().remove(&id).unwrap_or_default();
+    for tunnel in tunnels {
+        tunnel.close();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Flux vers Dart (StreamSink) et lectures synchrones de repli
 // ---------------------------------------------------------------------------
 
@@ -396,6 +615,34 @@ pub(crate) fn flux_transfert(id: u64, sink: StreamSink<TransferEventDto>) -> Res
         sink,
         TransferEventDto::from,
     )
+}
+
+/// Branche le flux d'annotations (mode étendu) : prend définitivement le
+/// récepteur d'annotations et lance un thread qui, pour **chaque couche reçue**,
+/// pousse **un [`AnnotationDto`] par trait** vers `sink` (une couche peut porter
+/// plusieurs traits ; le DTO plat en représente un seul). Même motif que les
+/// autres drains, mais un-vers-plusieurs : d'où un thread dédié plutôt que
+/// [`demarrer_drain`] (conversion un-vers-un). S'arrête à la fin de la session
+/// (canal déconnecté) ou à l'annulation du `Stream` côté Dart (`add` en échec).
+pub(crate) fn flux_annotations(id: u64, sink: StreamSink<AnnotationDto>) -> Result<(), String> {
+    let annotations = avec_entree(id, |entree| entree.annotations.take())?.ok_or_else(|| {
+        format!("les annotations de la session {id} sont déjà consommées (flux en cours)")
+    })?;
+    let nom = format!("nd-ffi-annotations-{id}");
+    thread::Builder::new()
+        .name(nom.clone())
+        .spawn(move || {
+            'boucle: while let Ok(couche) = annotations.recv() {
+                for dto in crate::api::annotations_depuis_couche(&couche) {
+                    if sink.add(dto).is_err() {
+                        // Flux annulé côté Dart : on cesse de drainer.
+                        break 'boucle;
+                    }
+                }
+            }
+        })
+        .map(|_poignee| ())
+        .map_err(|e| format!("création du thread « {nom} » impossible : {e}"))
 }
 
 /// Lance le thread dédié qui draine `rx` vers `sink` (conversion à la volée).
@@ -765,6 +1012,20 @@ mod tests {
         // Le message situe l'entrée fautive par son rang (ici la 2e).
         let err = parser_adresses_stun(&["1.2.3.4:5".to_owned(), "oups".to_owned()]).unwrap_err();
         assert!(err.contains("n°2"), "rang manquant : {err}");
+    }
+
+    // -- Tunnel : analyse de la cible --------------------------------------
+
+    #[test]
+    fn ouvrir_tunnel_refuse_une_cible_invalide() {
+        // L'analyse de la cible précède la recherche de session : une adresse
+        // illisible échoue proprement, sans session vivante ni écouteur lié.
+        let err = ouvrir_tunnel(999_999, 0, "pas-une-adresse".to_owned()).unwrap_err();
+        assert!(err.contains("invalide"), "message peu utile : {err}");
+        assert!(
+            err.contains("tunnel"),
+            "l'étiquette de la cible manque : {err}"
+        );
     }
 
     // -- Mappage de l'endpoint par rendez-vous -----------------------------

@@ -12,8 +12,104 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../theme/motion.dart';
 import '../theme/nova_theme.dart';
 import 'nova_icons.dart';
+
+// ===========================================================================
+// Socle interactif : survol + focus clavier visible + activation Entrée/Espace
+// ===========================================================================
+
+/// Enveloppe interactive commune des contrôles NovaDesk : survol, **focus
+/// clavier visible** (liseré bleu fin, maquette `:focus-visible{outline:2px
+/// solid var(--blue)}`) et activation par Entrée/Espace. Fournit au [builder]
+/// les états `survole`/`focus` sans dupliquer MouseRegion/Focus partout.
+class NovaActivable extends StatefulWidget {
+  const NovaActivable({
+    super.key,
+    required this.builder,
+    this.onTap,
+    this.rayonFocus = kNovaRayon,
+    this.semantiqueBouton = true,
+    this.label,
+  });
+
+  /// Construit le visuel du contrôle selon les états survol / focus clavier.
+  final Widget Function(BuildContext context, bool survole, bool focus) builder;
+
+  /// Action (clic, Entrée, Espace). `null` = contrôle désactivé (curseur
+  /// normal, non focusable, aucun état de survol).
+  final VoidCallback? onTap;
+
+  /// Rayon de l'anneau de focus (aligné sur le rayon du contrôle).
+  final double rayonFocus;
+
+  /// Expose une sémantique de bouton (désactivable quand un parent porte déjà
+  /// la sémantique, ex. interrupteur).
+  final bool semantiqueBouton;
+
+  /// Libellé d'accessibilité.
+  final String? label;
+
+  @override
+  State<NovaActivable> createState() => _NovaActivableState();
+}
+
+class _NovaActivableState extends State<NovaActivable> {
+  bool _survole = false;
+  bool _focus = false;
+
+  void _activer() => widget.onTap?.call();
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    final actif = widget.onTap != null;
+    final Widget interieur = widget.builder(
+        context, _survole && actif, _focus && actif);
+    Widget resultat = FocusableActionDetector(
+      enabled: actif,
+      mouseCursor: actif ? SystemMouseCursors.click : MouseCursor.defer,
+      onShowHoverHighlight: (v) => setState(() => _survole = v),
+      onShowFocusHighlight: (v) => setState(() => _focus = v),
+      actions: {
+        ActivateIntent: CallbackAction<ActivateIntent>(
+            onInvoke: (_) {
+          _activer();
+          return null;
+        }),
+        ButtonActivateIntent: CallbackAction<ButtonActivateIntent>(
+            onInvoke: (_) {
+          _activer();
+          return null;
+        }),
+      },
+      child: GestureDetector(
+        onTap: widget.onTap,
+        behavior: HitTestBehavior.opaque,
+        child: DecoratedBox(
+          position: DecorationPosition.foreground,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(widget.rayonFocus),
+            border: _focus && actif
+                ? Border.all(color: t.bleu, width: 1.5)
+                : null,
+          ),
+          child: interieur,
+        ),
+      ),
+    );
+    if (widget.semantiqueBouton || widget.label != null) {
+      resultat = Semantics(
+        button: widget.semantiqueBouton,
+        enabled: actif,
+        label: widget.label,
+        child: resultat,
+      );
+    }
+    return resultat;
+  }
+}
 
 // ===========================================================================
 // Étiquettes et en-têtes
@@ -71,7 +167,7 @@ class NovaPanelHeader extends StatelessWidget {
 // ===========================================================================
 
 /// Bouton primaire rouge (maquette `.btn.pri` / `.go`) — usage réservé.
-class NovaBoutonPrimaire extends StatefulWidget {
+class NovaBoutonPrimaire extends StatelessWidget {
   const NovaBoutonPrimaire({
     super.key,
     required this.libelle,
@@ -88,28 +184,19 @@ class NovaBoutonPrimaire extends StatefulWidget {
   final bool enCours;
 
   @override
-  State<NovaBoutonPrimaire> createState() => _NovaBoutonPrimaireState();
-}
-
-class _NovaBoutonPrimaireState extends State<NovaBoutonPrimaire> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final desactive = widget.onPressed == null && !widget.enCours;
-    final fond = desactive
-        ? t.champBordure
-        : (_survole ? kNovaRougePresse : kNovaRouge);
-    return MouseRegion(
-      cursor: desactive ? MouseCursor.defer : SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.enCours ? null : widget.onPressed,
-        child: AnimatedContainer(
+    final desactive = onPressed == null && !enCours;
+    return NovaActivable(
+      onTap: enCours ? null : onPressed,
+      label: libelle,
+      builder: (context, survole, focus) {
+        final fond = desactive
+            ? t.champBordure
+            : (survole ? kNovaRougePresse : kNovaRouge);
+        return AnimatedContainer(
           duration: const Duration(milliseconds: 120),
-          height: widget.hauteur,
+          height: hauteur,
           padding: const EdgeInsets.symmetric(horizontal: 16),
           decoration: BoxDecoration(
             color: fond,
@@ -117,16 +204,18 @@ class _NovaBoutonPrimaireState extends State<NovaBoutonPrimaire> {
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
+            // Centré si le bouton est étiré (pied de modale pleine largeur).
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text(
-                widget.libelle,
+                libelle,
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
                   color: Colors.white,
                 ),
               ),
-              if (widget.enCours) ...[
+              if (enCours) ...[
                 const SizedBox(width: 8),
                 const SizedBox(
                   width: 15,
@@ -134,21 +223,21 @@ class _NovaBoutonPrimaireState extends State<NovaBoutonPrimaire> {
                   child: CircularProgressIndicator(
                       strokeWidth: 2, color: Colors.white),
                 ),
-              ] else if (widget.icone != null) ...[
+              ] else if (icone != null) ...[
                 const SizedBox(width: 8),
-                NovaIcone(widget.icone!, taille: 15, couleur: Colors.white),
+                NovaIcone(icone!, taille: 15, couleur: Colors.white),
               ],
             ],
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
 
 /// Bouton fantôme / secondaire (maquette `.btn`) : fond fenêtre, bordure filet,
 /// texte primaire, icône optionnelle.
-class NovaBoutonSecondaire extends StatefulWidget {
+class NovaBoutonSecondaire extends StatelessWidget {
   const NovaBoutonSecondaire({
     super.key,
     required this.libelle,
@@ -165,46 +254,35 @@ class NovaBoutonSecondaire extends StatefulWidget {
   final bool danger;
 
   @override
-  State<NovaBoutonSecondaire> createState() => _NovaBoutonSecondaireState();
-}
-
-class _NovaBoutonSecondaireState extends State<NovaBoutonSecondaire> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final couleur = widget.danger ? kNovaRouge : t.texte;
-    return MouseRegion(
-      cursor: widget.onPressed == null
-          ? MouseCursor.defer
-          : SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onPressed,
-        child: Container(
-          height: widget.hauteur,
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          decoration: BoxDecoration(
-            color: _survole ? t.survol : t.fenetre,
-            border: Border.all(color: t.filetFort),
-            borderRadius: BorderRadius.circular(kNovaRayon),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (widget.icone != null) ...[
-                NovaIcone(widget.icone!, taille: 14, couleur: couleur),
-                const SizedBox(width: 7),
-              ],
-              Text(
-                widget.libelle,
-                style: TextStyle(
-                    fontSize: 12.5, fontWeight: FontWeight.w500, color: couleur),
-              ),
+    final couleur = danger ? kNovaRouge : t.texte;
+    return NovaActivable(
+      onTap: onPressed,
+      label: libelle,
+      builder: (context, survole, focus) => Container(
+        height: hauteur,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: survole ? t.survol : t.fenetre,
+          border: Border.all(color: t.filetFort),
+          borderRadius: BorderRadius.circular(kNovaRayon),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          // Centré si le bouton est étiré (pied de modale pleine largeur).
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (icone != null) ...[
+              NovaIcone(icone!, taille: 14, couleur: couleur),
+              const SizedBox(width: 7),
             ],
-          ),
+            Text(
+              libelle,
+              style: TextStyle(
+                  fontSize: 12.5, fontWeight: FontWeight.w500, color: couleur),
+            ),
+          ],
         ),
       ),
     );
@@ -213,7 +291,7 @@ class _NovaBoutonSecondaireState extends State<NovaBoutonSecondaire> {
 
 /// Bouton d'action carré révélé au survol d'une ligne (maquette `.ra`).
 /// [accent] passe l'icône au rouge au survol (flèche « se connecter »).
-class NovaBoutonAction extends StatefulWidget {
+class NovaBoutonAction extends StatelessWidget {
   const NovaBoutonAction({
     super.key,
     required this.icone,
@@ -237,38 +315,28 @@ class NovaBoutonAction extends StatefulWidget {
   final Color? couleurActive;
 
   @override
-  State<NovaBoutonAction> createState() => _NovaBoutonActionState();
-}
-
-class _NovaBoutonActionState extends State<NovaBoutonAction> {
-  bool _survole = false;
-
-  @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
-    final couleur = widget.couleurActive ??
-        (_survole ? (widget.accent ? kNovaRouge : t.texte) : t.texte2);
-    Widget bouton = MouseRegion(
-      cursor: SystemMouseCursors.click,
-      onEnter: (_) => setState(() => _survole = true),
-      onExit: (_) => setState(() => _survole = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        behavior: HitTestBehavior.opaque,
-        child: Container(
-          width: widget.taille,
-          height: widget.taille,
+    Widget bouton = NovaActivable(
+      onTap: onTap,
+      label: infobulle,
+      builder: (context, survole, focus) {
+        final couleur = couleurActive ??
+            (survole ? (accent ? kNovaRouge : t.texte) : t.texte2);
+        return Container(
+          width: taille,
+          height: taille,
           alignment: Alignment.center,
           decoration: BoxDecoration(
-            color: _survole ? t.survol : Colors.transparent,
+            color: survole ? t.survol : Colors.transparent,
             borderRadius: BorderRadius.circular(kNovaRayon),
           ),
-          child: NovaIcone(widget.icone, taille: widget.tailleIcone, couleur: couleur),
-        ),
-      ),
+          child: NovaIcone(icone, taille: tailleIcone, couleur: couleur),
+        );
+      },
     );
-    if (widget.infobulle != null) {
-      bouton = Tooltip(message: widget.infobulle!, child: bouton);
+    if (infobulle != null) {
+      bouton = Tooltip(message: infobulle!, child: bouton);
     }
     return bouton;
   }
@@ -294,36 +362,35 @@ class NovaSwitch extends StatelessWidget {
       toggled: actif,
       button: true,
       label: label,
-      child: MouseRegion(
-        cursor: desactive ? MouseCursor.defer : SystemMouseCursors.click,
-        child: GestureDetector(
-          onTap: desactive ? null : () => onChanged!(!actif),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            width: 36,
-            height: 20,
-            padding: const EdgeInsets.all(2),
-            alignment: actif ? Alignment.centerRight : Alignment.centerLeft,
+      child: NovaActivable(
+        onTap: desactive ? null : () => onChanged!(!actif),
+        semantiqueBouton: false,
+        rayonFocus: 10,
+        builder: (context, survole, focus) => AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          width: 36,
+          height: 20,
+          padding: const EdgeInsets.all(2),
+          alignment: actif ? Alignment.centerRight : Alignment.centerLeft,
+          decoration: BoxDecoration(
+            color: actif
+                ? (desactive ? t.vert.withValues(alpha: 0.5) : t.vert)
+                : t.filetFort,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Container(
+            width: 16,
+            height: 16,
             decoration: BoxDecoration(
-              color: actif
-                  ? (desactive ? t.vert.withValues(alpha: 0.5) : t.vert)
-                  : t.filetFort,
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Container(
-              width: 16,
-              height: 16,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.3),
-                    blurRadius: 2,
-                    offset: const Offset(0, 1),
-                  ),
-                ],
-              ),
+              color: Colors.white,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.3),
+                  blurRadius: 2,
+                  offset: const Offset(0, 1),
+                ),
+              ],
             ),
           ),
         ),
@@ -373,24 +440,23 @@ class NovaSegmented<T> extends StatelessWidget {
   Widget _segment(BuildContext context, NovaTokens t, T valeur, String libelle,
       {required bool dernier}) {
     final actif = valeur == selection;
-    return GestureDetector(
+    return NovaActivable(
       onTap: () => onChanged(valeur),
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
-          decoration: BoxDecoration(
-            color: actif ? kNovaRouge : Colors.transparent,
-            border: dernier
-                ? null
-                : Border(right: BorderSide(color: t.filetFort)),
-          ),
-          child: Text(
-            libelle,
-            style: TextStyle(
-              fontSize: 12,
-              color: actif ? Colors.white : t.texte2,
-            ),
+      rayonFocus: 0,
+      label: libelle,
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+        decoration: BoxDecoration(
+          color: actif ? kNovaRouge : Colors.transparent,
+          border: dernier
+              ? null
+              : Border(right: BorderSide(color: t.filetFort)),
+        ),
+        child: Text(
+          libelle,
+          style: TextStyle(
+            fontSize: 12,
+            color: actif ? Colors.white : t.texte2,
           ),
         ),
       ),
@@ -493,6 +559,20 @@ class _NovaSkeletonState extends State<NovaSkeleton>
   @override
   Widget build(BuildContext context) {
     final t = NovaTokens.of(context);
+    // Accessibilité : sous « animations réduites », bloc statique (le shimmer
+    // perpétuel est arrêté).
+    if (NovaMotion.animationsReduites(context)) {
+      _controller.stop();
+      return Container(
+        width: widget.largeur,
+        height: widget.hauteur,
+        decoration: BoxDecoration(
+          color: t.panneau2,
+          borderRadius: BorderRadius.circular(widget.rayon),
+        ),
+      );
+    }
+    if (!_controller.isAnimating) _controller.repeat();
     return SizedBox(
       width: widget.largeur,
       height: widget.hauteur,
@@ -568,7 +648,9 @@ class NovaEmptyState extends StatelessWidget {
 // ===========================================================================
 
 /// Toast NovaDesk : notification bas-droite auto-résorbée (~3 s), filet gauche
-/// vert (succès) ou bleu (info).
+/// vert (succès) ou bleu (info), entrée/sortie en fondu + léger glissement
+/// (maquette `.toast{transition:opacity .2s,transform .2s}`) — supprimés sous
+/// « animations réduites ».
 class NovaToast {
   NovaToast._();
 
@@ -587,6 +669,20 @@ class NovaToast {
     } else {
       _hote!.markNeedsBuild();
     }
+    // Entrée animée au frame suivant (opacité 0 → 1, léger glissement).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_actifs.contains(item)) {
+        item.visible = true;
+        _hote?.markNeedsBuild();
+      }
+    });
+    // Sortie animée ~220 ms avant le retrait effectif.
+    Timer(const Duration(milliseconds: 2780), () {
+      if (_actifs.contains(item)) {
+        item.visible = false;
+        _hote?.markNeedsBuild();
+      }
+    });
     Timer(const Duration(seconds: 3), () {
       _actifs.remove(item);
       if (_actifs.isEmpty) {
@@ -621,6 +717,9 @@ class _ToastItem {
   _ToastItem({required this.message, required this.info});
   final String message;
   final bool info;
+
+  /// Pilote l'entrée/sortie animée (faux à l'insertion et avant le retrait).
+  bool visible = false;
 }
 
 class _NovaToastCarte extends StatelessWidget {
@@ -630,6 +729,23 @@ class _NovaToastCarte extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final duree = NovaMotion.animationsReduites(context)
+        ? Duration.zero
+        : const Duration(milliseconds: 200);
+    return AnimatedOpacity(
+      opacity: item.visible ? 1 : 0,
+      duration: duree,
+      curve: Curves.easeOut,
+      child: AnimatedSlide(
+        offset: item.visible ? Offset.zero : const Offset(0, 0.12),
+        duration: duree,
+        curve: Curves.easeOut,
+        child: _corps(context),
+      ),
+    );
+  }
+
+  Widget _corps(BuildContext context) {
     final t = NovaTokens.of(context);
     final accent = item.info ? t.bleu : t.vert;
     return Material(
