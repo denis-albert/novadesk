@@ -35,7 +35,7 @@
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Icône ARP (Programmes et fonctionnalités) : celle de l'exécutable. -->
-    <Icon Id="novadesk.exe" SourceFile="$(var.StageDir)\novadesk.exe" />
+    <Icon Id="novadesk.exe" SourceFile="$(var.StageDir)\novadesk_ui.exe" />
     <Property Id="ARPPRODUCTICON" Value="novadesk.exe" />
     <Property Id="ARPHELPLINK" Value="https://novadesk.example" />
 
@@ -53,21 +53,22 @@
 
     <!-- Fonctionnalité unique : exécutable + service + raccourcis + ressources. -->
     <Feature Id="Complete" Title="NovaDesk" Level="1" AllowAbsent="no">
-      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="ServiceExecutable" />
       <ComponentRef Id="ApplicationShortcuts" />
       <ComponentGroupRef Id="RuntimeFiles" />
     </Feature>
 
-    <!-- Exécutable principal + service Windows d'accès non surveillé. -->
-    <Component Id="MainExecutable" Directory="INSTALLFOLDER" Bitness="always64"
-               Guid="5DE3A869-3B9C-4EA3-ABDE-268CF518F2EC">
-      <File Id="novadesk.exe" Source="$(var.StageDir)\novadesk.exe" KeyPath="yes" />
+    <!-- L'exécutable client novadesk_ui.exe et tout le runtime Flutter sont
+         moissonnés par le groupe RuntimeFiles ci-dessous. Le service a son
+         propre composant (binaire dédié, hors du dossier de stage). -->
 
-      <!-- Service « accès non surveillé » : LocalSystem (capture bureau
-           sécurisé/UAC, plan 07), démarrage MANUEL (dormant) — activé quand
-           l'utilisateur configure l'accès non surveillé (parité AnyDesk).
-           L'exécutable doit honorer son argument de service, passé ci-dessous
-           (câblage côté client, non encore livré : voir ../README.md). -->
+    <!-- Service Windows d'accès non surveillé : binaire dédié novadesk-svc.exe,
+         LocalSystem (capture bureau sécurisé/UAC), démarrage MANUEL (dormant) —
+         activé quand l'utilisateur configure l'accès non surveillé (parité
+         AnyDesk). Argument « run » = mode service piloté par le SCM. -->
+    <Component Id="ServiceExecutable" Directory="INSTALLFOLDER" Bitness="always64"
+               Guid="7C4B1E9A-2D6F-4A83-9E12-3F5A7B8C0D14">
+      <File Id="novadesk_svc.exe" Source="$(var.SvcExe)" KeyPath="yes" />
       <ServiceInstall Id="NovaDeskService"
                       Name="[SERVICENAME]"
                       DisplayName="NovaDesk (accès non surveillé)"
@@ -76,7 +77,7 @@
                       Start="demand"
                       ErrorControl="normal"
                       Account="LocalSystem"
-                      Arguments="--service"
+                      Arguments="run"
                       Vital="no" />
       <ServiceControl Id="NovaDeskServiceControl"
                       Name="[SERVICENAME]"
@@ -89,9 +90,9 @@
     <Component Id="ApplicationShortcuts" Directory="AppShortcutFolder"
                Guid="34CC1E55-989D-4D7B-9C5C-5598CCF7D2E2">
       <Shortcut Id="StartMenuShortcut" Name="NovaDesk"
-                Target="[INSTALLFOLDER]novadesk.exe" WorkingDirectory="INSTALLFOLDER" />
+                Target="[INSTALLFOLDER]novadesk_ui.exe" WorkingDirectory="INSTALLFOLDER" />
       <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="NovaDesk"
-                Target="[INSTALLFOLDER]novadesk.exe" WorkingDirectory="INSTALLFOLDER" />
+                Target="[INSTALLFOLDER]novadesk_ui.exe" WorkingDirectory="INSTALLFOLDER" />
       <RemoveFolder Id="RemoveAppShortcutFolder" Directory="AppShortcutFolder" On="uninstall" />
       <RegistryValue Root="HKMU" Key="Software\NovaDesk" Name="shortcuts"
                      Type="integer" Value="1" KeyPath="yes" />
@@ -101,7 +102,7 @@
          moisson automatique du dossier de sortie Flutter, sauf l'exécutable
          (déjà porté par MainExecutable). -->
     <ComponentGroup Id="RuntimeFiles" Directory="INSTALLFOLDER">
-      <Files Include="$(var.StageDir)\**" Exclude="$(var.StageDir)\novadesk.exe" />
+      <Files Include="$(var.StageDir)\**" />
     </ComponentGroup>
 
     <!-- Interface d'installation (dossier cible + EULA). Nécessite l'extension

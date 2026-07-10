@@ -2,3 +2,8 @@
 **/*.rs.bk
 *.pdb
 # Cargo.lock est versionné (workspace avec binaires).
+
+# Artefacts de packaging (installeurs)
+dist/
+*.wixpdb
+*.msi
