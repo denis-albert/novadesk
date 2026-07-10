@@ -1083,6 +1083,68 @@ pub fn generate_ephemeral_password() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// 1bis. Identité réseau (« Internet par ID »)
+// ---------------------------------------------------------------------------
+//
+// L'application acquiert au premier lancement un NovaId **routable sur
+// Internet** auprès de `nd-api`, avec un jeton d'enregistrement signé lié à une
+// clé de signature Ed25519 générée localement. Les trois éléments sont persistés
+// (clé + jeton chiffrés au repos, voir [`crate::etat`]) et permettent à l'hôte
+// « accès non surveillé » de s'enregistrer de façon **authentifiée** au
+// rendez-vous de production (voir [`start_unattended_host`]).
+
+/// Identité réseau (« Internet par ID »), prête à afficher : le NovaId alloué
+/// par `nd-api`. Le jeton d'enregistrement et la clé de signature restent
+/// **internes** (persistés chiffrés) et ne sont jamais exposés à l'UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkIdentityDto {
+    /// `NovaId` brut à 9 chiffres, alloué par `nd-api` et stable.
+    pub id: u64,
+    /// ID au format groupé (« 123 456 789 »), prêt à afficher.
+    pub id_formate: String,
+}
+
+/// Acquiert (ou **réutilise**) l'identité réseau auprès du serveur `nd-api`
+/// `api_addr` (« ip:port »), en présentant le jeton applicatif `jeton_compte`
+/// du compte agissant.
+///
+/// Au premier appel : génère une clé de signature Ed25519, demande un NovaId +
+/// son jeton d'enregistrement signé ([`nd_api::ApiClient::allocate_id`]), puis
+/// **persiste** `(id, jeton, clé)` — jeton et clé chiffrés au repos. Les appels
+/// suivants renvoient l'identité déjà acquise (idempotent), sans réallocation.
+///
+/// `api_addr` vide se replie sur le réglage `serveur_api` (voir [`set_setting`]).
+///
+/// # Errors
+/// Adresse `nd-api` absente (argument vide et réglage `serveur_api` non défini),
+/// jeton de compte vide, serveur injoignable, ou allocation refusée (jeton
+/// invalide/expiré, clé statique invalide…) — message français affichable.
+pub fn acquire_network_id(
+    api_addr: String,
+    jeton_compte: String,
+) -> Result<NetworkIdentityDto, String> {
+    crate::etat::magasin().acquerir_identite_reseau(&api_addr, &jeton_compte)
+}
+
+/// Identité réseau déjà acquise, ou `None` tant qu'aucune ne l'a été
+/// (premier lancement, ou après [`clear_network_id`]).
+///
+/// # Errors
+/// Lecture disque impossible, ou identité illisible (JSON/hex/déchiffrement).
+pub fn network_identity() -> Result<Option<NetworkIdentityDto>, String> {
+    crate::etat::magasin().identite_reseau()
+}
+
+/// Efface l'identité réseau persistée (id + jeton + clé de signature). Le
+/// prochain [`acquire_network_id`] en réacquerra une neuve. Idempotent.
+///
+/// # Errors
+/// Suppression du fichier impossible (droits, disque…).
+pub fn clear_network_id() -> Result<(), String> {
+    crate::etat::magasin().effacer_identite_reseau()
+}
+
+// ---------------------------------------------------------------------------
 // 2. Carnet d'adresses persistant
 // ---------------------------------------------------------------------------
 
@@ -1164,7 +1226,7 @@ pub fn add_group(nom: String) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingDto {
     /// Clé du réglage (ex. `theme`, `langue`, `dossier_enregistrement`,
-    /// `serveur_rendezvous`, `serveur_relais`, `serveurs_stun`,
+    /// `serveur_rendezvous`, `serveur_relais`, `serveur_api`, `serveurs_stun`,
     /// `prereglage_qualite`, `demarrer_avec_systeme`).
     pub cle: String,
     /// Valeur textuelle courante (surcharge persistée ou défaut).

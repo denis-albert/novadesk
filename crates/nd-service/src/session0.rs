@@ -46,12 +46,15 @@ use std::path::Path;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{
-    DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_QUERY,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// Valeur renvoyée par `WTSGetActiveConsoleSessionId` quand aucune session
@@ -136,6 +139,81 @@ pub fn lancer_dans_session_active(exe: &Path, args: &[String]) -> Result<u32, St
         let _ = CloseHandle(jeton_utilisateur);
     }
     resultat
+}
+
+/// Lance `exe` (avec `args`) **en SYSTEM dans la session active** : duplique le
+/// jeton du service (SYSTEM) en jeton primaire, fixe son `TokenSessionId` sur la
+/// session console active, puis crée le processus. **Requis pour le bureau
+/// sécurisé** : seul un processus SYSTEM peut `OpenInputDesktop` sur `Winlogon`
+/// (UAC / verrouillage) — un assistant lancé sous le jeton utilisateur, lui, ne
+/// couvre que le bureau `Default`. Renvoie le PID créé.
+///
+/// # Errors
+/// Erreur s'il n'y a pas de session active, si l'ouverture/duplication du jeton du
+/// service échoue, si la fixation de la session échoue, ou si la création du
+/// processus échoue.
+pub fn lancer_systeme_dans_session_active(exe: &Path, args: &[String]) -> Result<u32, String> {
+    let session = id_session_active().ok_or_else(|| "aucune session console active".to_owned())?;
+    let jeton = jeton_systeme_pour_session(session)?;
+    let resultat = lancer_avec_jeton(jeton, exe, args);
+    // SAFETY : jeton primaire dupliqué localement, refermé une seule fois.
+    unsafe {
+        let _ = CloseHandle(jeton);
+    }
+    resultat
+}
+
+/// Construit un jeton **primaire SYSTEM** rattaché à `session` : copie du jeton du
+/// processus service avec `TokenSessionId` fixé sur la session console active.
+fn jeton_systeme_pour_session(session: u32) -> Result<HANDLE, String> {
+    let acces = TOKEN_DUPLICATE
+        | TOKEN_ASSIGN_PRIMARY
+        | TOKEN_QUERY
+        | TOKEN_ADJUST_DEFAULT
+        | TOKEN_ADJUST_SESSIONID;
+    let mut jeton_service = HANDLE::default();
+    // SAFETY : ouvre le jeton du processus service (SYSTEM) ; `jeton_service` reçoit
+    // la poignée, refermée plus bas.
+    unsafe { OpenProcessToken(GetCurrentProcess(), acces, &mut jeton_service) }
+        .map_err(|e| format!("ouverture du jeton du service impossible : {e}"))?;
+
+    let mut primaire = HANDLE::default();
+    // SAFETY : duplication en jeton primaire assignable ; `primaire` refermé par
+    // l'appelant ([`lancer_systeme_dans_session_active`]) ou ci-dessous en cas d'échec.
+    let dup = unsafe {
+        DuplicateTokenEx(
+            jeton_service,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primaire,
+        )
+    };
+    // SAFETY : jeton du service refermé une seule fois.
+    unsafe {
+        let _ = CloseHandle(jeton_service);
+    }
+    dup.map_err(|e| format!("duplication du jeton SYSTEM impossible : {e}"))?;
+
+    let sid = session;
+    // SAFETY : `sid` (u32) vit jusqu'après l'appel ; taille exacte (4 octets) passée.
+    let maj = unsafe {
+        SetTokenInformation(
+            primaire,
+            TokenSessionId,
+            core::ptr::addr_of!(sid).cast(),
+            u32::try_from(core::mem::size_of::<u32>()).unwrap_or(4),
+        )
+    };
+    if let Err(e) = maj {
+        // SAFETY : jeton primaire refermé une seule fois en cas d'échec.
+        unsafe {
+            let _ = CloseHandle(primaire);
+        }
+        return Err(format!("fixation de la session du jeton impossible : {e}"));
+    }
+    Ok(primaire)
 }
 
 /// Cœur du lancement : duplique le jeton en jeton **primaire**, monte le bloc

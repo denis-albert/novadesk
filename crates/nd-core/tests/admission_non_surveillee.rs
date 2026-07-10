@@ -31,17 +31,23 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nd_capture::{
+    CaptureConfig, CaptureEvent, CapturedFrame, FrameImage, PixelFormat, ScreenCapturer,
+};
 use nd_core::{
-    DemandeAdmissionManuelle, SecretAdmission, SessionConfig, SessionEndpoint, SessionEngine,
-    SessionHandle, SessionOptions, SessionRole, UnattendedHost, UnattendedHostHandle,
+    DemandeAdmissionManuelle, FabriqueCapteur, FabriqueInjecteur, SecretAdmission, SessionConfig,
+    SessionEndpoint, SessionEngine, SessionHandle, SessionOptions, SessionRole, UnattendedHost,
+    UnattendedHostHandle,
 };
 use nd_features::invite::{unix_now, InviteStore, RedeemResult, SessionInvite};
 use nd_features::{Capability, PermissionSet, Permissions};
-use nd_proto::NovaId;
+use nd_input::{InputInjector, MouseButton};
+use nd_proto::{MonitorId, NovaId};
 use nd_signaling::{serve, Registry};
 use nd_transport::ServerIdentity;
 
@@ -411,6 +417,7 @@ fn invitation_valide_admet_avec_profil_et_consomme() {
         |_mdp| false,
         |_pair| false,
         valideur,
+        None,
     )
     .expect("start_with_admission_enrichie");
 
@@ -482,6 +489,7 @@ fn invitation_expiree_refusee() {
         |_mdp| false,
         |_pair| false,
         valideur,
+        None,
     )
     .expect("start_with_admission_enrichie");
 
@@ -535,6 +543,7 @@ fn demande_enrichie_remonte_nom_et_profil_au_crochet() {
         |_mdp| false,
         |_pair| false,
         sans_invitation,
+        None,
     )
     .expect("start_with_admission_enrichie");
 
@@ -557,6 +566,156 @@ fn demande_enrichie_remonte_nom_et_profil_au_crochet() {
     assert_eq!(demande.nom_affichage.as_deref(), Some("Alice — support"));
     assert_eq!(demande.permissions_demandees, Some(profil_demande));
     assert_eq!(hote.peers_refused(), 0, "aucun refus attendu");
+    session.stop();
+    hote.stop();
+}
+
+// ---------------------------------------------------------------------------
+// (8) Point d'injection : la fabrique de capteur injectée remplace le capteur
+// système dans la boucle hôte (raccord du service accès non surveillé).
+// ---------------------------------------------------------------------------
+
+/// Capteur **factice** : rend des trames 64×64 synthétiques et **compte** ses
+/// `next_frame` — la preuve que la boucle hôte l'a bien utilisé (et non
+/// `create_capturer`). Chaque instance partage le compteur de sa fabrique.
+struct CapteurFactice {
+    trames: Arc<AtomicU64>,
+}
+
+impl ScreenCapturer for CapteurFactice {
+    fn start(&mut self, _cfg: CaptureConfig) -> nd_proto::Result<()> {
+        Ok(())
+    }
+
+    fn next_frame(&mut self) -> nd_proto::Result<CapturedFrame> {
+        let seq = self.trames.fetch_add(1, Ordering::Relaxed);
+        // Cadence modérée : la boucle hôte ne tourne pas en boucle serrée.
+        thread::sleep(Duration::from_millis(10));
+        Ok(frame_factice(seq))
+    }
+
+    fn poll_event(&mut self) -> Option<CaptureEvent> {
+        None
+    }
+
+    fn stop(&mut self) {}
+}
+
+/// Frame BGRA 64×64 dont le motif dépend de `seq` (contenu non trivial pour
+/// l'encodeur), sans capture d'écran réelle.
+fn frame_factice(seq: u64) -> CapturedFrame {
+    const COTE: u32 = 64;
+    let mut data = vec![0u8; (COTE * COTE * 4) as usize];
+    for (i, pixel) in data.chunks_exact_mut(4).enumerate() {
+        let i = i as u64;
+        pixel[0] = ((i + seq * 31) % 256) as u8;
+        pixel[1] = ((i / 3 + seq * 7) % 256) as u8;
+        pixel[2] = ((seq * 11) % 256) as u8;
+        pixel[3] = 255;
+    }
+    CapturedFrame {
+        width: COTE,
+        height: COTE,
+        monitor: MonitorId(0),
+        format: PixelFormat::Bgra8,
+        dirty: vec![],
+        cursor: None,
+        timestamp_us: seq * 16_000,
+        image: Some(FrameImage::Cpu {
+            data,
+            stride: (COTE * 4) as usize,
+        }),
+    }
+}
+
+/// Injecteur **factice** inoffensif : n'atteint aucun périphérique réel (le test
+/// n'injecte rien dans l'OS hôte).
+struct InjecteurFactice;
+
+impl InputInjector for InjecteurFactice {
+    fn mouse_move_abs(&self, _x: f64, _y: f64, _monitor: MonitorId) -> nd_proto::Result<()> {
+        Ok(())
+    }
+    fn mouse_move_rel(&self, _dx: f64, _dy: f64) -> nd_proto::Result<()> {
+        Ok(())
+    }
+    fn mouse_button(&self, _btn: MouseButton, _down: bool) -> nd_proto::Result<()> {
+        Ok(())
+    }
+    fn scroll(&self, _dx: f64, _dy: f64) -> nd_proto::Result<()> {
+        Ok(())
+    }
+    fn key(&self, _scancode: u32, _down: bool) -> nd_proto::Result<()> {
+        Ok(())
+    }
+    fn unicode(&self, _ch: char) -> nd_proto::Result<()> {
+        Ok(())
+    }
+    fn release_all(&self) {}
+}
+
+/// (8) La **fabrique de capteur injectée** (via
+/// [`UnattendedHost::start_with_admission_enrichie_fabriques`]) est bien appelée
+/// par la boucle hôte : un vrai contrôleur (appareil de confiance) est admis, le
+/// pipeline hôte démarre et **tire ses trames du capteur factice** — dont le
+/// compteur croît. Si `create_capturer` (le défaut système) était utilisé à sa
+/// place, ce compteur resterait à zéro.
+#[test]
+fn fabrique_capteur_injectee_est_utilisee_par_la_boucle_hote() {
+    let _cas = UN_SEUL_CAS.lock().unwrap_or_else(PoisonError::into_inner);
+    let rv = rendezvous_ephemere();
+    let hote_id = NovaId(700_000_081);
+    let controleur_id = NovaId(700_000_082);
+
+    // Fabrique de capteur : instance neuve par époque, compteur de trames partagé.
+    let trames = Arc::new(AtomicU64::new(0));
+    let trames_fabrique = Arc::clone(&trames);
+    let fabrique_capteur: FabriqueCapteur = Arc::new(move || {
+        Ok(Box::new(CapteurFactice {
+            trames: Arc::clone(&trames_fabrique),
+        }) as Box<dyn ScreenCapturer>)
+    });
+    // Injecteur factice (le contrôleur n'émet aucune entrée ; inoffensif).
+    let fabrique_injecteur: FabriqueInjecteur =
+        Arc::new(|| Ok(Box::new(InjecteurFactice) as Box<dyn InputInjector>));
+
+    // Le crochet manuel refuserait : c'est la **confiance** qui admet la session.
+    let (vus, crochet) = crochet_espion_enrichi(false);
+    let hote = UnattendedHost::start_with_admission_enrichie_fabriques(
+        hote_id,
+        rv,
+        vec![],
+        ServerIdentity::generate().expect("identité"),
+        PermissionSet::full(),
+        crochet,
+        |_mdp| false,
+        // Le contrôleur est un appareil de confiance → admis sans preuve.
+        move |pair| pair == controleur_id,
+        |_pair, _code| None,
+        None,
+        Some(fabrique_capteur),
+        Some(fabrique_injecteur),
+    )
+    .expect("start_with_admission_enrichie_fabriques");
+
+    // Vrai contrôleur (sans mot de passe : admis par confiance).
+    let session = demarrer_controleur(rv, controleur_id, hote_id, None);
+
+    // La fabrique injectée alimente la boucle hôte : preuve qu'elle remplace bien
+    // `create_capturer`.
+    assert!(
+        attendre_compteur(|| trames.load(Ordering::Relaxed), 1),
+        "la fabrique de capteur injectée doit alimenter la boucle hôte ({})",
+        contexte(&hote)
+    );
+    // Admission par confiance : le dialogue manuel n'a pas été sollicité.
+    assert!(
+        vus.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty(),
+        "l'appareil de confiance admet sans solliciter le crochet manuel"
+    );
+
     session.stop();
     hote.stop();
 }

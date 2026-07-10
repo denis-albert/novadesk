@@ -792,6 +792,32 @@ class LocalIdentityDto {
       'LocalIdentityDto(id: $id, idFormate: $idFormate, empreinte: $empreinte)';
 }
 
+/// Identité **réseau** (« Internet par ID ») : le NovaId alloué par le serveur
+/// `nd-api`, prêt à afficher (miroir de `nd_ffi::NetworkIdentityDto`). Le
+/// jeton d'enregistrement et la clé de signature restent **internes**
+/// (persistés chiffrés côté cœur) et ne sont jamais exposés à l'UI.
+class NetworkIdentityDto {
+  const NetworkIdentityDto({required this.id, required this.idFormate});
+
+  /// `NovaId` brut à 9 chiffres, alloué par `nd-api` et stable.
+  final int id;
+
+  /// ID au format groupé (« 123 456 789 »), prêt à afficher.
+  final String idFormate;
+
+  @override
+  bool operator ==(Object other) =>
+      other is NetworkIdentityDto &&
+      other.id == id &&
+      other.idFormate == idFormate;
+
+  @override
+  int get hashCode => Object.hash(id, idFormate);
+
+  @override
+  String toString() => 'NetworkIdentityDto(id: $id, idFormate: $idFormate)';
+}
+
 /// Entrée du carnet d'adresses / contact enregistré (miroir de
 /// `nd_ffi::AddressBookEntryDto`).
 class AddressBookEntryDto {
@@ -1624,6 +1650,35 @@ abstract interface class NativeApi {
   /// Génère un mot de passe éphémère **lisible** (session ponctuelle),
   /// non persisté. Miroir de `nd_ffi::generate_ephemeral_password`.
   Future<String> generateEphemeralPassword();
+
+  // -------------------------------------------------------------------------
+  // Compte réseau (« Internet par ID ») : acquisition d'identité auprès de
+  // `nd-api` (lot « acquisition d'ID réseau »)
+  // -------------------------------------------------------------------------
+
+  /// Acquiert (ou **réutilise**) l'identité réseau auprès du serveur `nd-api`
+  /// [apiAddr] (« ip:port »), en présentant le jeton applicatif [jetonCompte]
+  /// du compte agissant. **Idempotent** : au premier appel, un NovaId est
+  /// alloué puis persisté (jeton et clé de signature chiffrés au repos) ; les
+  /// appels suivants renvoient l'identité déjà acquise, sans réallocation.
+  /// [apiAddr] vide se replie sur le réglage `serveur_api` ([setSetting]).
+  /// Lève [NovaApiException] (adresse `nd-api` absente, jeton de compte vide,
+  /// serveur injoignable, allocation refusée) — message français affichable.
+  /// Miroir de `nd_ffi::acquire_network_id`.
+  Future<NetworkIdentityDto> acquireNetworkId({
+    required String apiAddr,
+    required String jetonCompte,
+  });
+
+  /// Identité réseau déjà acquise, ou `null` tant qu'aucune ne l'a été
+  /// (premier lancement, ou après [clearNetworkId]). Miroir de
+  /// `nd_ffi::network_identity`.
+  Future<NetworkIdentityDto?> networkIdentity();
+
+  /// Efface l'identité réseau persistée (id + jeton + clé de signature) : le
+  /// prochain [acquireNetworkId] en réacquerra une neuve. Idempotent. Miroir
+  /// de `nd_ffi::clear_network_id`.
+  Future<void> clearNetworkId();
 
   /// Liste tous les contacts du carnet. Miroir de `nd_ffi::list_contacts`.
   Future<List<AddressBookEntryDto>> listContacts();

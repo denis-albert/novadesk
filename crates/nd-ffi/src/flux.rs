@@ -1061,10 +1061,25 @@ pub(crate) fn demarrer_hote_non_surveille(
         .map_err(|e| format!("génération de l'identité TLS de l'hôte impossible : {e}"))?;
     let permissions_moteur = PermissionSet::from(Permissions::from(permissions));
 
+    // Identité réseau (« Internet par ID ») : si elle est configurée, l'hôte
+    // s'enregistre de façon **authentifiée** (jeton + signature) et publie SON
+    // id réseau (celui que le jeton lie) plutôt que le `local_id` fourni — sinon
+    // enregistrement **nu** avec `local_id` (registre de dev / LAN, repli).
+    let (id_effectif, identite_reseau) = match crate::etat::magasin().identite_reseau_complete()? {
+        Some((id, jeton, cle_signature)) => (
+            id,
+            Some(nd_core::IdentiteReseau {
+                jeton,
+                cle_signature,
+            }),
+        ),
+        None => (local_id, None),
+    };
+
     let approbation = Arc::new(ApprobationHote::new());
     let approbation_accept = Arc::clone(&approbation);
     let poignee = UnattendedHost::start_with_admission_enrichie(
-        NovaId(local_id),
+        NovaId(id_effectif),
         serveur,
         stun,
         identite,
@@ -1103,6 +1118,9 @@ pub(crate) fn demarrer_hote_non_surveille(
                 .flatten()
                 .map(PermissionSet::from_bits)
         },
+        // Identité réseau (« Internet par ID ») : `Some(..)` → `register`
+        // authentifié ; `None` → enregistrement nu (registre de dev / LAN).
+        identite_reseau,
     )
     .map_err(|e| format!("démarrage de l'hôte non surveillé impossible : {e}"))?;
 

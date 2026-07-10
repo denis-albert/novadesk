@@ -51,7 +51,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nd_audio::{AudioSession, SourceEmission};
-use nd_capture::{create_capturer, enumerate_monitors, Rect};
+use nd_capture::{create_capturer, enumerate_monitors, Rect, ScreenCapturer};
 use nd_codec::{
     create_decoder, create_encoder, create_hardware_encoder, CodecKind, ContentProfile,
     DecodedFrame, EncodedChunk, VideoDecoder, VideoEncoder,
@@ -2046,6 +2046,9 @@ fn derouler_hote_rendezvous(
         stun_servers,
         relay,
         admission: &admission,
+        // Session par ID via `start_session` : enregistrement nu (le chemin
+        // authentifié « Internet par ID » passe par l'hôte non surveillé).
+        identite_reseau: None,
     };
     let (mut transport, mut pair) = match p2p::accepter_par_rendezvous(&attente, None, &ctx.stop) {
         Ok(entrant) => entrant,
@@ -2071,6 +2074,7 @@ fn derouler_hote_rendezvous(
             stun_servers,
             relay,
             admission: &meme_pair,
+            identite_reseau: None,
         };
         let Some((nouveau, revenant)) = se_reconnecter(ctx, || {
             p2p::accepter_par_rendezvous(&reprise, Some(DELAI_TENTATIVE_RECONNEXION), &ctx.stop)
@@ -2303,6 +2307,10 @@ fn vivre_epoque_avec_pair(
                 pair,
                 raccourcis: resoudre_raccourcis(&ctx.options),
                 deconnexion_globale: true,
+                // Le moteur de session (contrôleur ↔ contrôlé pair à pair) capture
+                // le bureau local : capteur/injecteur système par défaut.
+                capturer_factory: None,
+                injector_factory: None,
             };
             if ctx.options.extended_features {
                 vivre_epoque_hote_ext(transport, &params, &ctx.media)
@@ -2496,6 +2504,17 @@ pub(crate) struct ParamsEpoqueHote<'a> {
     /// (moteur de session : toute la session se clôt) ; faux pour l'hôte non
     /// surveillé, qui survit à ses sessions (seule l'époque se termine).
     pub deconnexion_globale: bool,
+    /// **Fabrique de capteur d'écran** (additif, défaut `None`) : quand elle est
+    /// présente, la boucle hôte l'appelle pour obtenir le [`ScreenCapturer`] de
+    /// l'époque **au lieu** de [`create_capturer`]. C'est le raccord de l'accès
+    /// non surveillé en service (`CapteurAssistant` de `nd-service`). Voir
+    /// [`crate::FabriqueCapteur`].
+    pub capturer_factory: Option<crate::FabriqueCapteur>,
+    /// **Fabrique d'injecteur d'entrées** (additif, défaut `None`) : symétrique
+    /// de [`Self::capturer_factory`] — remplace [`create_injector`] quand elle
+    /// est présente (`InjecteurAssistant` de `nd-service`). Voir
+    /// [`crate::FabriqueInjecteur`].
+    pub injector_factory: Option<crate::FabriqueInjecteur>,
 }
 
 /// Époque complète de l'hôte : garde + Noise (répondeur) + média piloté.
@@ -2819,6 +2838,27 @@ pub(crate) fn vivre_epoque_hote_avec_admission(
     garde.conclure(resultat, params.stop).map(|_fin| ())
 }
 
+/// Capteur d'écran de l'époque hôte : la **fabrique injectée** si présente
+/// ([`ParamsEpoqueHote::capturer_factory`], le raccord `nd-service`), sinon le
+/// capteur système par défaut ([`create_capturer`]) — comportement historique
+/// strictement inchangé quand rien n'est injecté.
+fn creer_capteur_hote(params: &ParamsEpoqueHote<'_>) -> Result<Box<dyn ScreenCapturer>> {
+    match &params.capturer_factory {
+        Some(fabrique) => fabrique(),
+        None => create_capturer(),
+    }
+}
+
+/// Injecteur d'entrées de l'époque hôte : la **fabrique injectée** si présente
+/// ([`ParamsEpoqueHote::injector_factory`]), sinon l'injecteur système par
+/// défaut ([`create_injector`]).
+fn creer_injecteur_hote(params: &ParamsEpoqueHote<'_>) -> Result<Box<dyn InputInjector>> {
+    match &params.injector_factory {
+        Some(fabrique) => fabrique(),
+        None => create_injector(),
+    }
+}
+
 /// Encodeur du flux hôte : **matériel d'abord** (NVENC via le MFT asynchrone,
 /// repli MFT logiciel documenté par `nd-codec`), puis repli openh264 si la
 /// pile plateforme est entièrement indisponible. Ne panique jamais : dégrade.
@@ -2838,8 +2878,8 @@ fn executer_hote(
     params: &ParamsEpoqueHote<'_>,
     arret: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let injecteur = create_injector()?;
-    let capteur = create_capturer()?;
+    let injecteur = creer_injecteur_hote(params)?;
+    let capteur = creer_capteur_hote(params)?;
     let encodeur = creer_encodeur_hote()?;
     params.compteurs.note_backend(encodeur.nom_backend());
     // Construit le pipeline avant de lancer le thread auxiliaire : tout échec
@@ -3923,8 +3963,8 @@ fn derouler_epoque_hote_ext(
     }
     let partage = TransportPartage::new(Box::new(securise), Arc::clone(params.compteurs));
 
-    let injecteur = create_injector()?;
-    let capteur = create_capturer()?;
+    let injecteur = creer_injecteur_hote(params)?;
+    let capteur = creer_capteur_hote(params)?;
     let encodeur = creer_encodeur_hote()?;
     params.compteurs.note_backend(encodeur.nom_backend());
     let mut hote = HostPipeline::new(capteur, encodeur, Box::new(partage.clone()))?;

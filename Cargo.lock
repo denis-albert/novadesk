@@ -2075,6 +2075,7 @@ dependencies = [
  "flutter_rust_bridge",
  "irondash_engine_context",
  "irondash_texture",
+ "nd-api",
  "nd-audio",
  "nd-capture",
  "nd-codec",
@@ -2083,6 +2084,8 @@ dependencies = [
  "nd-features",
  "nd-files",
  "nd-proto",
+ "nd-rendezvous",
+ "nd-signaling",
  "nd-transport",
  "serde",
  "serde_json",
@@ -2137,9 +2140,11 @@ name = "nd-service"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "nd-capture",
  "nd-core",
  "nd-crypto",
  "nd-features",
+ "nd-input",
  "nd-proto",
  "nd-transport",
  "serde",

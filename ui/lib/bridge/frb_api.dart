@@ -563,6 +563,48 @@ class FrbNativeApi implements NativeApi {
   Future<String> generateEphemeralPassword() =>
       frb.generateEphemeralPassword();
 
+  // ---------------------------------------------------------------------------
+  // Compte réseau (« Internet par ID ») — délégation aux fonctions générées
+  // (u64 ⇄ BigInt) ; les `Result<_, String>` du cœur (adresse absente, jeton
+  // vide, serveur injoignable, allocation refusée, identité illisible) sont
+  // retransformés en [NovaApiException] au message français affichable.
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<NetworkIdentityDto> acquireNetworkId({
+    required String apiAddr,
+    required String jetonCompte,
+  }) async {
+    try {
+      final identite = await frb.acquireNetworkId(
+        apiAddr: apiAddr,
+        jetonCompte: jetonCompte,
+      );
+      return _identiteReseauDepuis(identite);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<NetworkIdentityDto?> networkIdentity() async {
+    try {
+      final identite = await frb.networkIdentity();
+      return identite == null ? null : _identiteReseauDepuis(identite);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> clearNetworkId() async {
+    try {
+      await frb.clearNetworkId();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
   @override
   Future<List<AddressBookEntryDto>> listContacts() async {
     final contacts = await frb.listContacts();
@@ -835,6 +877,10 @@ class FrbNativeApi implements NativeApi {
         favori: c.favori,
         derniereConnexion: c.derniereConnexion?.toInt(),
       );
+
+  /// Aplatit l'identité réseau générée (id `u64` ⇄ `BigInt`).
+  static NetworkIdentityDto _identiteReseauDepuis(frb.NetworkIdentityDto i) =>
+      NetworkIdentityDto(id: i.id.toInt(), idFormate: i.idFormate);
 
   /// FRB lève la `String` d'erreur telle quelle pour un `Result<_, String>`.
   static String _message(Object e) {

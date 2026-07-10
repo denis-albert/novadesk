@@ -28,6 +28,12 @@ nd-files = { workspace = true }
 # État applicatif persistant (lot « état réel ») : identité locale stable via
 # `nd_crypto::IdentityStore::load_or_create` + empreinte `PeerFingerprint`.
 nd-crypto = { workspace = true }
+# « Internet par ID » : acquisition d'un NovaId + jeton d'enregistrement signé
+# auprès de nd-api (`ApiClient::allocate_id`) au premier lancement.
+nd-api = { path = "../../server/nd-api" }
+# « Internet par ID » : clé de signature Ed25519 (`auth::SigningKey`) persistée
+# et enregistrement authentifié au rendez-vous (`register_authentifie`).
+nd-signaling = { workspace = true }
 # Persistance pur Rust : JSON atomique (sérialisation des DTO plats de la façade).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -71,6 +77,11 @@ tempfile = "3"
 # `nd-features`), afin d'exercer `open_recording`/`recording_next_frame` de bout
 # en bout. Uniquement pour les tests — pas une dépendance de la façade.
 nd-capture = { workspace = true }
+# Test d'intégration « Internet par ID » (tests/internet_par_id.rs) : monte la
+# vraie façade authentifiée du rendez-vous de production en process pour prouver
+# que l'enregistrement authentifié de l'hôte est accepté et l'ID résolvable.
+# Cycle de DEV toléré (comme crates/nd-signaling/tests/register_authentifie.rs).
+nd-rendezvous = { path = "../../server/nd-rendezvous" }
 
 [lints]
 workspace = true

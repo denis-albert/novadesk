@@ -63,14 +63,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use nd_api::ApiClient;
 use nd_crypto::{IdentityStore, PeerFingerprint, StaticKeypair};
 use nd_features::invite::{generate_invite, unix_now};
 use nd_features::Mp4Reader;
 use nd_proto::NovaId;
+use nd_signaling::auth::SigningKey;
 
 use crate::api::{
-    AccessLogEntryDto, AddressBookEntryDto, InviteDto, LocalIdentityDto, RecentSessionDto,
-    RecordingDto, SettingDto, UnattendedConfigDto,
+    AccessLogEntryDto, AddressBookEntryDto, InviteDto, LocalIdentityDto, NetworkIdentityDto,
+    RecentSessionDto, RecordingDto, SettingDto, UnattendedConfigDto,
 };
 
 /// Borne de l'historique de sessions récentes (les plus récentes conservées).
@@ -90,6 +92,12 @@ const FICHIER_REGLAGES: &str = "reglages.json";
 const FICHIER_HISTORIQUE: &str = "historique.json";
 const FICHIER_NON_SURVEILLE: &str = "non_surveille.json";
 const FICHIER_INVITATIONS: &str = "invitations.json";
+const FICHIER_IDENTITE_RESEAU: &str = "identite_reseau.json";
+
+/// Clé de réglage de l'adresse du serveur `nd-api` (« Internet par ID ») :
+/// adresse « ip:port » interrogée par [`Magasin::acquerir_identite_reseau`] à
+/// défaut d'argument explicite.
+pub(crate) const CLE_SERVEUR_API: &str = "serveur_api";
 
 /// Préfixe (ASCII) d'un fichier de **clé d'identité chiffrée au repos** (DPAPI
 /// sous Windows), suivi immédiatement du blob binaire protégé. Un fichier sans ce
@@ -830,6 +838,137 @@ impl Magasin {
         self.ecrire_json(FICHIER_INVITATIONS, &stock)?;
         Ok(Some(bits))
     }
+
+    // --- 8. Identité réseau (« Internet par ID ») --------------------------
+    //
+    // Au premier lancement, l'application acquiert auprès de `nd-api` un NovaId
+    // et un **jeton d'enregistrement signé**, liés à une **clé de signature**
+    // Ed25519 générée localement. Ces trois éléments sont persistés — la clé et
+    // le jeton **chiffrés au repos** (DPAPI, comme la clé d'identité et le haché
+    // du mot de passe). L'hôte non surveillé s'en sert pour un `register`
+    // **authentifié** au rendez-vous de production (voir
+    // [`crate::flux::demarrer_hote_non_surveille`]).
+
+    /// Identité réseau persistée, si elle a été acquise (`None` au premier
+    /// lancement ou après [`Magasin::effacer_identite_reseau`]).
+    pub(crate) fn identite_reseau(&self) -> Result<Option<NetworkIdentityDto>, String> {
+        let _garde = self.verrouiller();
+        let stock: IdentiteReseauStockee = self.lire_json(FICHIER_IDENTITE_RESEAU)?;
+        Ok(dto_identite_reseau(&stock))
+    }
+
+    /// Acquiert (ou **réutilise**) l'identité réseau : si une identité complète
+    /// est déjà persistée, elle est renvoyée telle quelle (idempotent) ; sinon,
+    /// génère une **clé de signature** Ed25519, demande à `nd-api`
+    /// ([`ApiClient::allocate_id`]) un NovaId + son jeton d'enregistrement signé,
+    /// puis persiste `(id, jeton, clé)` — jeton et clé **chiffrés au repos**.
+    ///
+    /// `api_addr` vide se replie sur le réglage [`CLE_SERVEUR_API`]
+    /// (`serveur_api`). `jeton_compte` est le jeton applicatif du compte agissant
+    /// (obtenu à la connexion — `nd-accounts`, lot 09) : `nd-api` en dérive le
+    /// compte propriétaire de l'ID.
+    ///
+    /// L'appel réseau se fait **hors verrou** (une allocation lente ou un serveur
+    /// injoignable ne gèle pas les autres opérations d'état) ; la persistance
+    /// re-vérifie l'existence sous verrou (le premier acquéreur fait foi).
+    pub(crate) fn acquerir_identite_reseau(
+        &self,
+        api_addr: &str,
+        jeton_compte: &str,
+    ) -> Result<NetworkIdentityDto, String> {
+        // 1. Déjà acquise ? réutilisation idempotente.
+        if let Some(dto) = self.identite_reseau()? {
+            return Ok(dto);
+        }
+        // Adresse effective : argument, sinon réglage `serveur_api`.
+        let adresse = if api_addr.trim().is_empty() {
+            self.reglage(CLE_SERVEUR_API)?
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| {
+                    "adresse du serveur nd-api absente (argument vide et réglage \
+                     « serveur_api » non défini)"
+                        .to_owned()
+                })?
+        } else {
+            api_addr.to_owned()
+        };
+        if jeton_compte.trim().is_empty() {
+            return Err("jeton de compte requis pour acquérir un identifiant réseau".to_owned());
+        }
+
+        // 2. Clé de signature Ed25519 (32 octets du CSPRNG).
+        let graine: [u8; 32] = octets_aleatoires(32)
+            .try_into()
+            .map_err(|_| "génération de la clé de signature impossible".to_owned())?;
+        let cle = SigningKey::from_bytes(&graine);
+
+        // 3. Allocation auprès de nd-api (hors verrou) : (ID, jeton signé).
+        let client = ApiClient::connect(adresse.as_str(), jeton_compte)
+            .map_err(|e| format!("connexion à nd-api « {adresse} » impossible : {e}"))?;
+        let alloue = client
+            .allocate_id(cle.verifying_key().to_bytes())
+            .map_err(|e| format!("attribution d'un identifiant réseau refusée par nd-api : {e}"))?;
+
+        // 4. Persistance chiffrée. On relit sous verrou pour ne pas écraser une
+        //    acquisition concurrente (le premier acquéreur fait foi).
+        let _garde = self.verrouiller();
+        let existante: IdentiteReseauStockee = self.lire_json(FICHIER_IDENTITE_RESEAU)?;
+        if let Some(dto) = dto_identite_reseau(&existante) {
+            return Ok(dto);
+        }
+        let stock = IdentiteReseauStockee {
+            id: alloue.id,
+            cle_signature_protegee: hex_minuscule(&crate::plateforme::proteger(&cle.to_bytes())?),
+            jeton_protege: hex_minuscule(&crate::plateforme::proteger(
+                &alloue.jeton_enregistrement,
+            )?),
+        };
+        self.ecrire_json(FICHIER_IDENTITE_RESEAU, &stock)?;
+        Ok(NetworkIdentityDto {
+            id: alloue.id,
+            id_formate: NovaId(alloue.id).to_string(),
+        })
+    }
+
+    /// Identité réseau **complète** pour l'enregistrement authentifié :
+    /// `(id, jeton, clé de signature)` déchiffrés au vol. `None` tant qu'aucune
+    /// identité n'est acquise. Consommée par
+    /// [`crate::flux::demarrer_hote_non_surveille`].
+    pub(crate) fn identite_reseau_complete(
+        &self,
+    ) -> Result<Option<(u64, Vec<u8>, SigningKey)>, String> {
+        let _garde = self.verrouiller();
+        let stock: IdentiteReseauStockee = self.lire_json(FICHIER_IDENTITE_RESEAU)?;
+        if !stock.est_complete() {
+            return Ok(None);
+        }
+        let cle_blob = decoder_hex(&stock.cle_signature_protegee).ok_or_else(|| {
+            "clé de signature réseau illisible (hexadécimal mal formé)".to_owned()
+        })?;
+        let cle_clair = crate::plateforme::deproteger(&cle_blob)?;
+        let graine: [u8; 32] = cle_clair
+            .as_slice()
+            .try_into()
+            .map_err(|_| "clé de signature réseau de taille inattendue".to_owned())?;
+        let cle = SigningKey::from_bytes(&graine);
+        let jeton_blob = decoder_hex(&stock.jeton_protege).ok_or_else(|| {
+            "jeton d'enregistrement réseau illisible (hexadécimal mal formé)".to_owned()
+        })?;
+        let jeton = crate::plateforme::deproteger(&jeton_blob)?;
+        Ok(Some((stock.id, jeton, cle)))
+    }
+
+    /// Efface l'identité réseau persistée (le prochain
+    /// [`Magasin::acquerir_identite_reseau`] en réacquerra une neuve). Idempotent :
+    /// une identité absente n'est pas une erreur.
+    pub(crate) fn effacer_identite_reseau(&self) -> Result<(), String> {
+        let _garde = self.verrouiller();
+        match fs::remove_file(self.chemin(FICHIER_IDENTITE_RESEAU)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("suppression de l'identité réseau impossible : {e}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1120,38 @@ struct InvitationStockee {
     consommee: bool,
 }
 
+/// Identité réseau (« Internet par ID ») persistée : NovaId alloué par `nd-api`,
+/// plus la **clé de signature** Ed25519 et le **jeton d'enregistrement** signé,
+/// tous deux **chiffrés au repos** (DPAPI) — hexadécimal du blob protégé. Un
+/// fichier absent ou incomplet vaut « non acquise ».
+#[derive(Default, Serialize, Deserialize)]
+struct IdentiteReseauStockee {
+    #[serde(default)]
+    id: u64,
+    /// Clé de signature Ed25519 (32 octets privés) protégée au repos, hex du
+    /// blob DPAPI.
+    #[serde(default)]
+    cle_signature_protegee: String,
+    /// Jeton d'enregistrement (opaque) protégé au repos, hex du blob DPAPI.
+    #[serde(default)]
+    jeton_protege: String,
+}
+
+impl IdentiteReseauStockee {
+    /// Une identité **complète et exploitable** est-elle persistée ?
+    fn est_complete(&self) -> bool {
+        self.id != 0 && !self.cle_signature_protegee.is_empty() && !self.jeton_protege.is_empty()
+    }
+}
+
+/// Vue affichable d'une identité réseau persistée (`None` si incomplète).
+fn dto_identite_reseau(stock: &IdentiteReseauStockee) -> Option<NetworkIdentityDto> {
+    stock.est_complete().then(|| NetworkIdentityDto {
+        id: stock.id,
+        id_formate: NovaId(stock.id).to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Réglages par défaut
 // ---------------------------------------------------------------------------
@@ -994,6 +1165,7 @@ fn reglages_par_defaut(racine: &Path) -> BTreeMap<String, String> {
     [
         ("serveur_rendezvous", String::new()),
         ("serveur_relais", String::new()),
+        (CLE_SERVEUR_API, String::new()),
         ("serveurs_stun", "stun.l.google.com:19302".to_owned()),
         ("prereglage_qualite", "auto".to_owned()),
         (CLE_DOSSIER_ENREGISTREMENT, dossier_enregistrement),
@@ -1696,5 +1868,87 @@ mod tests {
             mag.revoquer_invitation(code).is_err(),
             "re-révoquer un code inconnu échoue proprement"
         );
+    }
+
+    // --- Identité réseau (« Internet par ID ») ----------------------------
+    //
+    // L'acquisition réelle (appel réseau à nd-api) est prouvée de bout en bout
+    // par `tests/internet_par_id.rs`. Ici on couvre les branches **sans
+    // réseau** : identité absente, validations d'entrée, effacement idempotent,
+    // et l'aller-retour chiffré au repos (persistance → relecture complète).
+
+    #[test]
+    fn identite_reseau_absente_au_depart() {
+        let (mag, _dir) = magasin_temporaire();
+        assert_eq!(mag.identite_reseau().expect("lecture"), None);
+        assert!(mag
+            .identite_reseau_complete()
+            .expect("lecture complète")
+            .is_none());
+        // Effacer une identité absente n'est pas une erreur (idempotent).
+        mag.effacer_identite_reseau().expect("effacement à vide");
+    }
+
+    #[test]
+    fn acquisition_refuse_adresse_ou_jeton_manquant_sans_reseau() {
+        let (mag, _dir) = magasin_temporaire();
+        // Argument vide + réglage `serveur_api` non défini (défaut vide) :
+        // erreur d'adresse, sans le moindre accès réseau.
+        let err = mag
+            .acquerir_identite_reseau("", "jeton")
+            .expect_err("adresse absente");
+        assert!(err.contains("serveur_api"), "{err}");
+
+        // Adresse fournie mais jeton de compte vide : refus avant tout réseau.
+        let err = mag
+            .acquerir_identite_reseau("127.0.0.1:1", "  ")
+            .expect_err("jeton absent");
+        assert!(err.contains("jeton"), "{err}");
+    }
+
+    #[test]
+    fn identite_reseau_aller_retour_chiffre_et_effacement() {
+        let (mag, dir) = magasin_temporaire();
+        // Fabrique directement une identité persistée (chiffrée au repos), comme
+        // le ferait `acquerir_identite_reseau` après une allocation nd-api.
+        let cle = SigningKey::from_bytes(&[9u8; 32]);
+        let jeton = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let stock = IdentiteReseauStockee {
+            id: 123_456_789,
+            cle_signature_protegee: hex_minuscule(
+                &crate::plateforme::proteger(&cle.to_bytes()).expect("protéger clé"),
+            ),
+            jeton_protege: hex_minuscule(
+                &crate::plateforme::proteger(&jeton).expect("protéger jeton"),
+            ),
+        };
+        mag.ecrire_json(FICHIER_IDENTITE_RESEAU, &stock)
+            .expect("écriture");
+
+        // Vue affichable.
+        assert_eq!(
+            mag.identite_reseau().expect("lecture"),
+            Some(NetworkIdentityDto {
+                id: 123_456_789,
+                id_formate: NovaId(123_456_789).to_string(),
+            })
+        );
+
+        // Relecture COMPLÈTE : clé et jeton restitués à l'identique (déchiffrés).
+        let (id, jeton_relu, cle_relue) = mag
+            .identite_reseau_complete()
+            .expect("lecture complète")
+            .expect("identité présente");
+        assert_eq!(id, 123_456_789);
+        assert_eq!(jeton_relu, jeton);
+        assert_eq!(cle_relue.to_bytes(), cle.to_bytes());
+
+        // Persistance survivant à une réouverture depuis le disque.
+        let mag2 = Magasin::nouveau(dir.path().to_path_buf());
+        assert!(mag2.identite_reseau().expect("réouverture").is_some());
+
+        // Effacement : l'identité disparaît, la relecture redevient `None`.
+        mag.effacer_identite_reseau().expect("effacement");
+        assert_eq!(mag.identite_reseau().expect("après effacement"), None);
     }
 }

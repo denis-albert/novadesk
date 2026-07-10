@@ -45,6 +45,7 @@ pub use media::ChatMessage;
 // [`SessionHandle::set_audio_source`], ré-exporté pour que l'appelant n'ait pas à
 // dépendre de `nd-audio`.
 pub use nd_audio::SourceEmission;
+pub use p2p::IdentiteReseau;
 pub use session::{
     raccourcis_hote_defaut, DemandeAdmissionManuelle, ListingDistant, SecretAdmission,
     SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions, SessionStats,
@@ -57,6 +58,29 @@ pub use unattended::{UnattendedHost, UnattendedHostHandle};
 /// observée par la boucle de diffusion hôte pour appliquer
 /// [`ScreenCapturer::set_region`]. `None` = plein écran.
 pub type RegionPartagee = Arc<Mutex<Option<Rect>>>;
+
+/// **Fabrique de capteur d'écran** injectée dans la boucle hôte : appelée à
+/// **chaque époque servie** pour obtenir une **instance neuve** de
+/// [`ScreenCapturer`] (une capture n'est pas rejouable d'une connexion à
+/// l'autre). Branchée via
+/// [`UnattendedHost::start_with_admission_enrichie_fabriques`] ; à `None`
+/// (défaut), la boucle retombe sur [`nd_capture::create_capturer`] — le capteur
+/// système, comportement historique strictement inchangé.
+///
+/// C'est le point d'ancrage du `CapteurAssistant` de `nd-service` : en session 0,
+/// un capteur système ne verrait qu'un bureau vide ; la fabrique fournit à la
+/// place un capteur alimenté par l'assistant lancé dans la **session active**,
+/// qui capture le **vrai bureau** de l'utilisateur.
+pub type FabriqueCapteur = Arc<dyn Fn() -> Result<Box<dyn ScreenCapturer>> + Send + Sync>;
+
+/// **Fabrique d'injecteur d'entrées** injectée dans la boucle hôte : symétrique
+/// de [`FabriqueCapteur`] pour [`InputInjector`] — une **instance neuve** par
+/// époque servie. À `None` (défaut), la boucle retombe sur
+/// [`nd_input::create_injector`] (injecteur système, comportement historique).
+///
+/// Point d'ancrage de l'`InjecteurAssistant` de `nd-service`, qui transmet les
+/// entrées à l'assistant pour injection **dans la session de l'utilisateur**.
+pub type FabriqueInjecteur = Arc<dyn Fn() -> Result<Box<dyn InputInjector>> + Send + Sync>;
 
 /// Un écran de l'hôte, tel que **publié au contrôleur** sur le plan de contrôle
 /// (plan de contrôle de session, capacité « liste des moniteurs »). Miroir plat

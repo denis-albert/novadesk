@@ -62,12 +62,12 @@ use nd_proto::{NovaId, Result};
 use nd_signaling::RendezvousClient;
 use nd_transport::{QuicTransport, ServerIdentity};
 
-use crate::p2p::{self, AttenteRendezvous};
+use crate::p2p::{self, AttenteRendezvous, IdentiteReseau};
 use crate::session::{
     vivre_epoque_hote, vivre_epoque_hote_avec_admission, CompteursSession, ControleAdmission,
     DemandeAdmissionManuelle, ParamsEpoqueHote,
 };
-use crate::HostStreamOptions;
+use crate::{FabriqueCapteur, FabriqueInjecteur, HostStreamOptions};
 
 /// Délai maximal accordé au thread de service pour se terminer dans
 /// [`UnattendedHostHandle::stop`].
@@ -109,7 +109,16 @@ impl UnattendedHost {
         permissions: PermissionSet,
         accept: impl Fn(NovaId) -> bool + Send + 'static,
     ) -> Result<UnattendedHostHandle> {
-        let service = Service::nouveau(local_id, rendezvous, stun_servers, identity, permissions);
+        let service = Service::nouveau(
+            local_id,
+            rendezvous,
+            stun_servers,
+            identity,
+            permissions,
+            None,
+            None,
+            None,
+        );
         service.lancer(move |service| service.boucle(&accept))
     }
 
@@ -152,7 +161,16 @@ impl UnattendedHost {
         verif_mdp: impl Fn(&str) -> bool + Send + 'static,
         est_de_confiance: impl Fn(NovaId) -> bool + Send + 'static,
     ) -> Result<UnattendedHostHandle> {
-        let service = Service::nouveau(local_id, rendezvous, stun_servers, identity, permissions);
+        let service = Service::nouveau(
+            local_id,
+            rendezvous,
+            stun_servers,
+            identity,
+            permissions,
+            None,
+            None,
+            None,
+        );
         service.lancer(move |service| {
             // Adapte le crochet historique (ID seul) au crochet enrichi ; ce mode
             // n'honore aucune invitation (validateur toujours `None`).
@@ -186,6 +204,14 @@ impl UnattendedHost {
     /// Le clair (mot de passe, code) ne circule que dans le canal Noise ; rien
     /// n'est honoré avant l'admission.
     ///
+    /// # Enregistrement authentifié (« Internet par ID »)
+    ///
+    /// `identite_reseau` est le passage **additif** du jeton + clé de possession :
+    /// `Some(..)` → l'hôte publie son ID au rendez-vous par un `register`
+    /// **authentifié** (`register_authentifie`), exigé par le rendez-vous de
+    /// production ; `None` → enregistrement **nu** (comportement historique,
+    /// registre de développement / LAN). Voir [`IdentiteReseau`].
+    ///
     /// # Errors
     /// Mêmes conditions que [`UnattendedHost::start`].
     #[allow(clippy::too_many_arguments)]
@@ -199,8 +225,81 @@ impl UnattendedHost {
         verif_mdp: impl Fn(&str) -> bool + Send + 'static,
         est_de_confiance: impl Fn(NovaId) -> bool + Send + 'static,
         verif_invitation: impl Fn(NovaId, &str) -> Option<PermissionSet> + Send + 'static,
+        identite_reseau: Option<IdentiteReseau>,
     ) -> Result<UnattendedHostHandle> {
-        let service = Service::nouveau(local_id, rendezvous, stun_servers, identity, permissions);
+        // Superset strict : capteur/injecteur **système** (aucune fabrique
+        // injectée). Le comportement historique est ainsi préservé mot pour mot,
+        // et les appelants existants (nd-ffi, tests, exemples) restent inchangés.
+        Self::start_with_admission_enrichie_fabriques(
+            local_id,
+            rendezvous,
+            stun_servers,
+            identity,
+            permissions,
+            accept,
+            verif_mdp,
+            est_de_confiance,
+            verif_invitation,
+            identite_reseau,
+            None,
+            None,
+        )
+    }
+
+    /// Démarre le service avec admission enrichie **et fabriques de capteur /
+    /// injecteur injectées** : superset **additif** de
+    /// [`UnattendedHost::start_with_admission_enrichie`] (mêmes règles
+    /// d'admission, à l'identique) dont les deux derniers paramètres branchent le
+    /// **point d'injection** de la boucle hôte.
+    ///
+    /// À **chaque époque servie**, la boucle hôte appelle `capturer_factory`
+    /// (resp. `injector_factory`) — si `Some(..)` — pour obtenir le
+    /// [`ScreenCapturer`](nd_capture::ScreenCapturer) (resp.
+    /// [`InputInjector`](nd_input::InputInjector)) de l'époque, **au lieu** de
+    /// [`nd_capture::create_capturer`] (resp. [`nd_input::create_injector`]). Un
+    /// paramètre à `None` conserve la brique système par défaut. Une **instance
+    /// neuve par époque** est requise : une capture / injection n'est pas
+    /// rejouable d'une connexion à l'autre.
+    ///
+    /// C'est le raccord de l'accès non surveillé **en service** : `nd-service` y
+    /// fournit un `CapteurAssistant` / `InjecteurAssistant` adossés à un assistant
+    /// lancé dans la **session active**, de sorte que le service capture le
+    /// **vrai bureau** de l'utilisateur (là où un capteur créé en session 0 ne
+    /// verrait qu'un bureau vide) et injecte dans **sa** session. Si une fabrique
+    /// échoue (assistant indisponible — pas de session active, privilège
+    /// manquant), l'erreur remonte comme n'importe quel échec de capture : la
+    /// boucle hôte **avorte proprement l'époque**, l'erreur est consignée
+    /// ([`UnattendedHostHandle::last_error`]) et le service **retourne à
+    /// l'attente** — un appelant suivant relance une tentative (donc un nouvel
+    /// assistant) quand une session redevient servable.
+    ///
+    /// # Errors
+    /// Mêmes conditions que [`UnattendedHost::start`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_admission_enrichie_fabriques(
+        local_id: NovaId,
+        rendezvous: SocketAddr,
+        stun_servers: Vec<SocketAddr>,
+        identity: ServerIdentity,
+        permissions: PermissionSet,
+        accept: impl Fn(&DemandeAdmissionManuelle) -> bool + Send + 'static,
+        verif_mdp: impl Fn(&str) -> bool + Send + 'static,
+        est_de_confiance: impl Fn(NovaId) -> bool + Send + 'static,
+        verif_invitation: impl Fn(NovaId, &str) -> Option<PermissionSet> + Send + 'static,
+        identite_reseau: Option<IdentiteReseau>,
+        capturer_factory: Option<FabriqueCapteur>,
+        injector_factory: Option<FabriqueInjecteur>,
+    ) -> Result<UnattendedHostHandle> {
+        let service = Service::nouveau(
+            local_id,
+            rendezvous,
+            stun_servers,
+            identity,
+            permissions,
+            identite_reseau,
+            capturer_factory,
+            injector_factory,
+        );
         service.lancer(move |service| {
             service.boucle_admission(&accept, &verif_mdp, &est_de_confiance, &verif_invitation);
         })
@@ -290,6 +389,16 @@ struct Service {
     stun_servers: Vec<SocketAddr>,
     identity: ServerIdentity,
     permissions: PermissionSet,
+    /// Identité réseau optionnelle : `Some(..)` → enregistrement **authentifié**
+    /// au rendez-vous de production ; `None` → enregistrement **nu**.
+    identite_reseau: Option<IdentiteReseau>,
+    /// Fabrique de capteur d'écran fournie à chaque époque servie (`None` =
+    /// capteur système par défaut). Raccord de l'accès non surveillé en service :
+    /// `nd-service` y branche son `CapteurAssistant`. Voir [`FabriqueCapteur`].
+    capturer_factory: Option<FabriqueCapteur>,
+    /// Fabrique d'injecteur d'entrées fournie à chaque époque servie (`None` =
+    /// injecteur système par défaut). Voir [`FabriqueInjecteur`].
+    injector_factory: Option<FabriqueInjecteur>,
     stop: Arc<AtomicBool>,
     compteurs: Arc<CompteursSession>,
     sessions_servies: Arc<AtomicU64>,
@@ -300,12 +409,16 @@ struct Service {
 impl Service {
     /// Construit l'état du service (et les poignées partagées qui iront dans la
     /// [`UnattendedHostHandle`]).
+    #[allow(clippy::too_many_arguments)]
     fn nouveau(
         local_id: NovaId,
         rendezvous: SocketAddr,
         stun_servers: Vec<SocketAddr>,
         identity: ServerIdentity,
         permissions: PermissionSet,
+        identite_reseau: Option<IdentiteReseau>,
+        capturer_factory: Option<FabriqueCapteur>,
+        injector_factory: Option<FabriqueInjecteur>,
     ) -> Service {
         Service {
             local_id,
@@ -313,6 +426,9 @@ impl Service {
             stun_servers,
             identity,
             permissions,
+            identite_reseau,
+            capturer_factory,
+            injector_factory,
             stop: Arc::new(AtomicBool::new(false)),
             compteurs: Arc::new(CompteursSession::default()),
             sessions_servies: Arc::new(AtomicU64::new(0)),
@@ -410,6 +526,8 @@ impl Service {
                 stun_servers: &self.stun_servers,
                 relay: None,
                 admission,
+                // Présente → `register` authentifié ; `None` → nu (dev / LAN).
+                identite_reseau: self.identite_reseau.as_ref(),
             };
             // Attente bornée par fenêtre : la boucle revient vérifier `stop`
             // (et rafraîchir le heartbeat) entre deux fenêtres.
@@ -444,6 +562,12 @@ impl Service {
             // session en cours — le service retourne à l'attente.
             raccourcis: crate::raccourcis_hote_defaut(),
             deconnexion_globale: false,
+            // Fabriques injectées au démarrage du service (clonées par époque) :
+            // `nd-service` y fournit capteur/injecteur adossés à l'assistant, de
+            // sorte que la boucle hôte capture le vrai bureau et injecte dans la
+            // session de l'utilisateur. `None` = capteur/injecteur système.
+            capturer_factory: self.capturer_factory.clone(),
+            injector_factory: self.injector_factory.clone(),
         }
     }
 

@@ -712,6 +712,7 @@ class MockNativeApi implements NativeApi {
   final Map<String, String> _reglages = {
     'theme': 'systeme',
     'langue': 'fr',
+    'serveur_api': '',
     'serveur_rendezvous': '127.0.0.1:9000',
     'serveur_relais': '',
     'serveurs_stun': '',
@@ -792,6 +793,63 @@ class MockNativeApi implements NativeApi {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
     return List.generate(
         10, (_) => alphabet[_alea.nextInt(alphabet.length)]).join();
+  }
+
+  // -------------------------------------------------------------------------
+  // Compte réseau (« Internet par ID ») — identité factice EN MÉMOIRE : mêmes
+  // validations et repli sur le réglage `serveur_api` que le cœur
+  // (`acquire_network_id`), sans aucun appel réseau.
+  // -------------------------------------------------------------------------
+
+  /// Identité réseau « acquise » ; `null` tant qu'aucune ne l'a été (premier
+  /// lancement, ou après [clearNetworkId]).
+  NetworkIdentityDto? _identiteReseau;
+
+  /// Hachage FNV-1a 32 bits, stable entre exécutions (contrairement à
+  /// `String.hashCode`) : l'id factice reste **déterministe** pour un même
+  /// jeton, démo et tests reproductibles.
+  static int _fnv1a(String texte) {
+    var h = 0x811c9dc5;
+    for (final unite in texte.codeUnits) {
+      h = ((h ^ unite) * 0x01000193) & 0xffffffff;
+    }
+    return h;
+  }
+
+  @override
+  Future<NetworkIdentityDto> acquireNetworkId({
+    required String apiAddr,
+    required String jetonCompte,
+  }) async {
+    // Adresse : argument, sinon repli sur le réglage `serveur_api` (comme le
+    // cœur). La validation précède toute « allocation ».
+    final adresse =
+        apiAddr.trim().isNotEmpty ? apiAddr.trim() : (_reglages['serveur_api'] ?? '');
+    if (adresse.trim().isEmpty) {
+      throw const NovaApiException(
+          'adresse du serveur nd-api absente : passez-la en argument ou '
+          'renseignez le réglage « serveur_api »');
+    }
+    if (jetonCompte.trim().isEmpty) {
+      throw const NovaApiException('le jeton de compte est vide');
+    }
+    // Idempotent : l'identité déjà acquise est réutilisée, sans réallocation.
+    final existante = _identiteReseau;
+    if (existante != null) return existante;
+    // NovaId factice à 9 chiffres, déterministe (dérivé du jeton).
+    final id = 100000000 + _fnv1a(jetonCompte) % 900000000;
+    final identite = NetworkIdentityDto(id: id, idFormate: _formater(id));
+    _identiteReseau = identite;
+    return identite;
+  }
+
+  @override
+  Future<NetworkIdentityDto?> networkIdentity() async => _identiteReseau;
+
+  @override
+  Future<void> clearNetworkId() async {
+    // Idempotent, comme le cœur : effacer une identité absente est sans effet.
+    _identiteReseau = null;
   }
 
   @override

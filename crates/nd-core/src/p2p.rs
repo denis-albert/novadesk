@@ -56,6 +56,24 @@ const FENETRE_AWAIT: Duration = Duration::from_secs(2);
 /// est un marqueur documenté « joignable par punch uniquement ».
 const ADRESSE_PUNCH_SEULEMENT: &str = "0.0.0.0:0";
 
+/// Identité réseau (« Internet par ID ») pour l'enregistrement **authentifié**
+/// au rendez-vous de production (plan 11).
+///
+/// Présente → le pair contrôlé prouve la **possession de son ID** au `register`
+/// (jeton d'attribution émis par `nd-api` + signature Ed25519 de possession),
+/// comme l'exige la façade de production `server/nd-rendezvous` (le `Register`
+/// nu y est refusé). Absente → enregistrement **nu** : registre de
+/// développement (`nd-registre`) ou LAN, comportement historique.
+///
+/// Voir [`nd_signaling::RendezvousClient::register_authentifie`].
+pub struct IdentiteReseau {
+    /// Jeton d'enregistrement émis par `nd-api`, **opaque** ici (seul le serveur
+    /// le vérifie) : transmis tel quel au `register` authentifié.
+    pub jeton: Vec<u8>,
+    /// Clé de signature Ed25519 du client — celle que le jeton lie à l'ID.
+    pub cle_signature: nd_signaling::auth::SigningKey,
+}
+
 /// Ticket de relais **partagé** par les deux pairs d'une session : dérivé de la
 /// paire d'IDs (appelant, appelé), donc calculable des deux côtés sans échange
 /// supplémentaire.
@@ -70,11 +88,30 @@ pub(crate) fn ticket_relais(appelant: NovaId, appele: NovaId) -> Vec<u8> {
 
 /// Enregistre `local_id` au rendez-vous avec le certificat de `identite`
 /// (l'adresse publiée est le marqueur [`ADRESSE_PUNCH_SEULEMENT`]).
-fn enregistrer(rv: &RendezvousClient, local_id: NovaId, identite: &ServerIdentity) -> Result<()> {
+///
+/// `identite_reseau` présente → enregistrement **authentifié**
+/// (`register_authentifie` : jeton + preuve de possession), exigé par le
+/// rendez-vous de production ; absente → enregistrement **nu** (registre de
+/// développement / LAN), comportement historique.
+fn enregistrer(
+    rv: &RendezvousClient,
+    local_id: NovaId,
+    identite: &ServerIdentity,
+    identite_reseau: Option<&IdentiteReseau>,
+) -> Result<()> {
     let adresse: SocketAddr = ADRESSE_PUNCH_SEULEMENT
         .parse()
         .expect("adresse de punch valide");
-    rv.register(local_id, adresse, identite.cert_der())
+    match identite_reseau {
+        Some(reseau) => rv.register_authentifie(
+            local_id,
+            adresse,
+            identite.cert_der(),
+            &reseau.jeton,
+            &reseau.cle_signature,
+        ),
+        None => rv.register(local_id, adresse, identite.cert_der()),
+    }
 }
 
 /// Établit un transport QUIC vers `peer_id` (côté **appelant**, rôle
@@ -171,6 +208,10 @@ pub(crate) struct AttenteRendezvous<'a> {
     /// abandonnée, l'attente continue) sans qu'aucun octet applicatif ne
     /// circule.
     pub admission: AdmissionPair<'a>,
+    /// Identité réseau optionnelle (« Internet par ID ») : présente →
+    /// enregistrement **authentifié** (`register_authentifie`) ; `None` →
+    /// enregistrement **nu** (comportement historique, registre de dev / LAN).
+    pub identite_reseau: Option<&'a IdentiteReseau>,
 }
 
 /// Attend une connexion entrante par rendez-vous : enregistre l'ID (certificat
@@ -190,7 +231,12 @@ pub(crate) fn accepter_par_rendezvous(
     delai_max: Option<Duration>,
     stop: &Arc<AtomicBool>,
 ) -> Result<(QuicTransport, NovaId)> {
-    enregistrer(attente.rv, attente.local_id, attente.identite)?;
+    enregistrer(
+        attente.rv,
+        attente.local_id,
+        attente.identite,
+        attente.identite_reseau,
+    )?;
     let echeance = delai_max.map(|d| Instant::now() + d);
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -207,7 +253,12 @@ pub(crate) fn accepter_par_rendezvous(
         // Présence : un heartbeat par itération (≪ TTL du registre) ; s'il
         // échoue (entrée expirée, serveur redémarré), on se ré-enregistre.
         if attente.rv.heartbeat(attente.local_id).is_err() {
-            enregistrer(attente.rv, attente.local_id, attente.identite)?;
+            enregistrer(
+                attente.rv,
+                attente.local_id,
+                attente.identite,
+                attente.identite_reseau,
+            )?;
         }
         match nd_signaling::await_p2p(
             attente.rv,

@@ -7,11 +7,13 @@
 /// Réglages **réellement câblés** : le **Thème** (segmenté Clair/Sombre/Système
 /// piloté par [themeModeProvider]), la **Version** de l'onglet « À propos »
 /// (lue via [appInfoProvider]), les lignes persistées via
-/// `get_setting`/`set_setting` (langue, serveurs, dossiers…) et **Démarrer
+/// `get_setting`/`set_setting` (langue, serveurs, dossiers…), **Démarrer
 /// avec le système**, qui applique en plus l'effet OS **immédiat** via
 /// `apply_autostart` (clé de registre `Run` utilisateur, sans droits
-/// administrateur). Les autres contrôles restent de l'état de présentation
-/// local.
+/// administrateur), et la section **« Compte réseau (Internet par ID) »** de
+/// l'onglet Connexion (`acquire_network_id` / `network_identity` /
+/// `clear_network_id`). Les autres contrôles restent de l'état de
+/// présentation local.
 library;
 
 import 'dart:async';
@@ -20,6 +22,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app_routes.dart';
+import '../bridge/native_api.dart' show NetworkIdentityDto;
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
@@ -171,6 +174,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   /// câblés). Rempli une fois au démarrage de l'écran.
   final Map<String, String> _reglages = {};
 
+  // ---- Compte réseau (« Internet par ID »), section de l'onglet Connexion --
+
+  /// Champ « Serveur API » (réglage persistant `serveur_api`).
+  final TextEditingController _serveurApi = TextEditingController();
+
+  /// Champ « Jeton de compte » (jamais persisté par l'UI : présenté tel quel
+  /// à `acquire_network_id`, le cœur seul persiste — chiffré — ses secrets).
+  final TextEditingController _jetonCompte = TextEditingController();
+
+  /// Identité réseau courante (`network_identity`) ; `null` = « Aucun ».
+  NetworkIdentityDto? _identiteReseau;
+
+  /// Vrai pendant l'appel `acquire_network_id` (bouton neutralisé).
+  bool _acquisitionEnCours = false;
+
   @override
   void initState() {
     super.initState();
@@ -190,6 +208,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       }
     }
     unawaited(_chargerReglages());
+    unawaited(_chargerIdentiteReseau());
   }
 
   /// Charge les réglages persistés et hydrate les contrôles câblés.
@@ -202,6 +221,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         _reglages
           ..clear()
           ..addAll(map);
+        final serveurApi = map['serveur_api'];
+        if (serveurApi != null) _serveurApi.text = serveurApi;
         for (final onglet in _onglets) {
           for (final ligne in onglet.lignes) {
             final cleReglage = ligne.cleReglage;
@@ -275,8 +296,63 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Compte réseau (« Internet par ID ») — acquisition, relecture, oubli
+  // -------------------------------------------------------------------------
+
+  /// Relit l'identité réseau persistée (`network_identity`) pour afficher
+  /// l'ID courant ; illisible ou absente → la ligne affiche « Aucun ».
+  Future<void> _chargerIdentiteReseau() async {
+    try {
+      final identite = await ref.read(nativeApiProvider).networkIdentity();
+      if (!mounted) return;
+      setState(() => _identiteReseau = identite);
+    } catch (_) {
+      // Identité illisible : on laisse « Aucun » (réacquisition possible).
+    }
+  }
+
+  /// « Obtenir un ID réseau » : `acquire_network_id(serveur_api, jeton)` —
+  /// idempotent côté cœur (l'identité déjà acquise est réutilisée). Succès →
+  /// toast avec l'ID formaté ; échec → toast d'erreur (message français du
+  /// cœur, affiché tel quel).
+  Future<void> _obtenirIdReseau() async {
+    if (_acquisitionEnCours) return;
+    setState(() => _acquisitionEnCours = true);
+    try {
+      final identite = await ref.read(nativeApiProvider).acquireNetworkId(
+            apiAddr: _serveurApi.text.trim(),
+            jetonCompte: _jetonCompte.text,
+          );
+      if (!mounted) return;
+      setState(() => _identiteReseau = identite);
+      NovaToast.montrer(context, 'ID réseau obtenu : ${identite.idFormate}');
+    } catch (e) {
+      if (!mounted) return;
+      NovaToast.montrer(context, messageNova(e), info: true);
+    } finally {
+      if (mounted) setState(() => _acquisitionEnCours = false);
+    }
+  }
+
+  /// « Oublier » : `clear_network_id` (id + jeton + clé effacés côté cœur) ;
+  /// l'app retombe sur le rendez-vous LAN/direct jusqu'à réacquisition.
+  Future<void> _oublierIdReseau() async {
+    try {
+      await ref.read(nativeApiProvider).clearNetworkId();
+      if (!mounted) return;
+      setState(() => _identiteReseau = null);
+      NovaToast.montrer(context, 'ID réseau oublié');
+    } catch (e) {
+      if (!mounted) return;
+      NovaToast.montrer(context, messageNova(e), info: true);
+    }
+  }
+
   @override
   void dispose() {
+    _serveurApi.dispose();
+    _jetonCompte.dispose();
     for (final controleur in _champs.values) {
       controleur.dispose();
     }
@@ -353,15 +429,36 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           for (var i = 0; i < onglet.lignes.length; i++)
             _ligneReglage(t, onglet, onglet.lignes[i],
                 dernier: i == onglet.lignes.length - 1),
+          // Section câblée « Compte réseau (Internet par ID) » de l'onglet
+          // Connexion (acquisition d'identité réseau auprès de `nd-api`).
+          if (onglet.cle == 'Connexion') _sectionCompteReseau(t),
         ],
       ),
     );
   }
 
-  /// Une ligne de réglage (`.set`) : textes à gauche, contrôle à droite,
-  /// filet inférieur sauf pour la dernière ligne.
+  /// Une ligne de réglage (`.set`) déclarée dans un onglet : délègue le cadre
+  /// à [_ligneCadre] et le contrôle à [_construireControle].
   Widget _ligneReglage(NovaTokens t, _Onglet onglet, _Ligne ligne,
       {required bool dernier}) {
+    return _ligneCadre(
+      t,
+      titre: ligne.titre,
+      sousTitre: ligne.sousTitre,
+      controle: _construireControle(t, onglet, ligne),
+      dernier: dernier,
+    );
+  }
+
+  /// Cadre d'une ligne de réglage (`.set`) : textes à gauche, contrôle à
+  /// droite, filet inférieur sauf pour la dernière ligne.
+  Widget _ligneCadre(
+    NovaTokens t, {
+    required String titre,
+    String? sousTitre,
+    required Widget controle,
+    required bool dernier,
+  }) {
     return Container(
       decoration: BoxDecoration(
         border:
@@ -377,19 +474,19 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               children: [
                 // .a
                 Text(
-                  ligne.titre,
+                  titre,
                   style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
                       color: t.texte),
                 ),
                 // .b
-                if (ligne.sousTitre != null) ...[
+                if (sousTitre != null) ...[
                   const SizedBox(height: 2),
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 430),
                     child: Text(
-                      ligne.sousTitre!,
+                      sousTitre,
                       style: TextStyle(fontSize: 11.5, color: t.texte3),
                     ),
                   ),
@@ -398,9 +495,97 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           ),
           const SizedBox(width: 16),
-          _construireControle(t, onglet, ligne),
+          controle,
         ],
       ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Section « Compte réseau (Internet par ID) » — onglet Connexion
+  // -------------------------------------------------------------------------
+
+  /// Section câblée à l'acquisition d'ID réseau : serveur `nd-api` (réglage
+  /// persistant `serveur_api`), jeton de compte, acquisition et oubli de
+  /// l'identité, dans le patron des lignes de réglage existantes.
+  Widget _sectionCompteReseau(NovaTokens t) {
+    final identite = _identiteReseau;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 24),
+        // Titre et description de section (mêmes styles que `.stitle`/`.sdesc`).
+        Text(
+          'Compte réseau (Internet par ID)',
+          style: TextStyle(
+              fontSize: 14, fontWeight: FontWeight.w600, color: t.texte),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          'Sans ID réseau, NovaDesk reste en mise en relation LAN/directe '
+          '(repli actuel).',
+          style: TextStyle(fontSize: 12, color: t.texte3),
+        ),
+        const SizedBox(height: 3),
+        _ligneCadre(
+          t,
+          titre: 'Serveur API',
+          sousTitre: 'Adresse « ip:port » du serveur nd-api '
+              '(réglage persistant serveur_api).',
+          controle: _champ(
+            t,
+            _serveurApi,
+            onChanged: (v) => _definirReglage('serveur_api', v),
+          ),
+          dernier: false,
+        ),
+        _ligneCadre(
+          t,
+          titre: 'Jeton de compte',
+          sousTitre: 'Fourni par la connexion à un compte NovaDesk — la '
+              'connexion au compte (nd-accounts) viendra ensuite.',
+          controle: _champ(t, _jetonCompte, masque: true),
+          dernier: false,
+        ),
+        _ligneCadre(
+          t,
+          titre: 'Obtenir un ID réseau',
+          sousTitre: 'Alloue (ou réutilise) un NovaId auprès du serveur '
+              'nd-api avec le jeton ci-dessus.',
+          controle: NovaBoutonSecondaire(
+            libelle:
+                _acquisitionEnCours ? 'Obtention…' : 'Obtenir un ID réseau',
+            onPressed:
+                _acquisitionEnCours ? null : () => unawaited(_obtenirIdReseau()),
+          ),
+          dernier: false,
+        ),
+        _ligneCadre(
+          t,
+          titre: 'ID réseau actuel',
+          sousTitre: identite == null
+              ? 'Aucune identité réseau acquise sur ce poste.'
+              : 'Identité allouée par nd-api, persistée sur ce poste.',
+          controle: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                identite?.idFormate ?? 'Aucun',
+                style: TextStyle(fontSize: 12.5, color: t.texte2),
+              ),
+              if (identite != null) ...[
+                const SizedBox(width: 10),
+                NovaBoutonSecondaire(
+                  libelle: 'Oublier',
+                  danger: true,
+                  onPressed: () => unawaited(_oublierIdReseau()),
+                ),
+              ],
+            ],
+          ),
+          dernier: true,
+        ),
+      ],
     );
   }
 
@@ -518,15 +703,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   /// Champ de saisie 210×32 (`.field`) — habillage hérité du thème. Pour les
-  /// champs câblés, [onChanged] persiste la valeur via `set_setting`.
+  /// champs câblés, [onChanged] persiste la valeur via `set_setting` ;
+  /// [masque] occulte la saisie (secrets : jeton de compte).
   Widget _champ(NovaTokens t, TextEditingController controleur,
-      {ValueChanged<String>? onChanged}) {
+      {ValueChanged<String>? onChanged, bool masque = false}) {
     return SizedBox(
       width: 210,
       height: 32,
       child: TextField(
         controller: controleur,
         onChanged: onChanged,
+        obscureText: masque,
         textAlignVertical: TextAlignVertical.center,
         cursorColor: kNovaRouge,
         style: TextStyle(fontSize: 12.5, color: t.texte),
