@@ -41,9 +41,14 @@ mod tunnel;
 mod unattended;
 
 pub use media::ChatMessage;
+// Source d'émission audio de l'hôte : type du paramètre de
+// [`SessionHandle::set_audio_source`], ré-exporté pour que l'appelant n'ait pas à
+// dépendre de `nd-audio`.
+pub use nd_audio::SourceEmission;
 pub use session::{
     raccourcis_hote_defaut, DemandeAdmissionManuelle, ListingDistant, SecretAdmission,
     SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions, SessionStats,
+    TelechargementDistant,
 };
 pub use tunnel::TunnelHandle;
 pub use unattended::{UnattendedHost, UnattendedHostHandle};

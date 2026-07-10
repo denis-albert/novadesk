@@ -38,10 +38,11 @@
 
 use std::path::PathBuf;
 
-use nd_audio::AudioPacket;
+use nd_audio::{AudioPacket, SourceEmission};
 use nd_capture::Rect;
 use nd_codec::ContentProfile;
 use nd_features::PermissionSet;
+use nd_files::RequeteFichier;
 use nd_proto::{ChannelKind, MonitorId, NovaId};
 
 use crate::{PeerInfo, RemoteMonitor};
@@ -152,6 +153,22 @@ pub(crate) enum SousTypeControle {
     /// de corrélation côté contrôleur
     /// ([`crate::SessionHandle::list_remote_dir`]).
     ReponseFs = 15,
+    /// **Requête de récupération d'une tranche de fichier distant**, contrôleur
+    /// → hôte (payload = [`nd_files::RequeteFichier::to_bytes`] : chemin, offset,
+    /// taille max). L'hôte la sert **derrière la même permission**
+    /// [`nd_features::Capability::FileDownload`] que le listing : refus ⇒ réponse
+    /// dont `erreur` vaut « accès refusé », **jamais** de lecture du disque sans
+    /// droit. Complète [`RequeteFs`](Self::RequeteFs) (repérer) par le contenu.
+    RequeteFichierDistant = 16,
+    /// **Réponse d'une tranche de fichier distant**, hôte → contrôleur (payload =
+    /// [`nd_files::ReponseFichier::to_bytes`]). Corrélée par chemin **et** offset
+    /// côté contrôleur ([`crate::SessionHandle::download_remote_file`]).
+    ReponseFichierDistant = 17,
+    /// **Source d'émission audio de l'hôte**, contrôleur → hôte (payload =
+    /// `[mode u8]`, voir [`encoder_source_audio`]). L'hôte applique
+    /// [`nd_audio::AudioSession::definir_source_emission`] (système / micro /
+    /// mixé) à sa session audio ; micro absent ⇒ repli système (géré par nd-audio).
+    MajSourceAudio = 18,
 }
 
 impl SousTypeControle {
@@ -173,6 +190,9 @@ impl SousTypeControle {
             13 => Some(SousTypeControle::DemandeAdmission),
             14 => Some(SousTypeControle::RequeteFs),
             15 => Some(SousTypeControle::ReponseFs),
+            16 => Some(SousTypeControle::RequeteFichierDistant),
+            17 => Some(SousTypeControle::ReponseFichierDistant),
+            18 => Some(SousTypeControle::MajSourceAudio),
             _ => None,
         }
     }
@@ -245,6 +265,17 @@ pub(crate) enum CommandeMedia {
     /// dans [`crate::SessionHandle::list_remote_dir`]. Sans effet côté hôte
     /// (le poste liste ses propres dossiers sans passer par la session).
     ListerRepertoireDistant(String),
+    /// Demander à l'hôte une **tranche de fichier distant** (rôle contrôleur) :
+    /// la requête part sur le canal `Control`
+    /// ([`SousTypeControle::RequeteFichierDistant`]) et la réponse revient par
+    /// [`SousTypeControle::ReponseFichierDistant`] — attendue, corrélée par
+    /// chemin + offset, dans la boucle de
+    /// [`crate::SessionHandle::download_remote_file`]. Sans effet côté hôte.
+    TelechargerFichierDistant(RequeteFichier),
+    /// Piloter la **source d'émission audio** de l'hôte : contrôleur → demande à
+    /// l'hôte ([`SousTypeControle::MajSourceAudio`]) ; hôte → applique directement
+    /// [`nd_audio::AudioSession::definir_source_emission`] à sa session audio.
+    MajSourceAudio(SourceEmission),
 }
 
 /// Encode une région / cadre d'écran pour le canal `Control` : payload **vide**
@@ -324,6 +355,31 @@ pub(crate) fn decoder_qualite(payload: &[u8]) -> Option<(ContentProfile, u32)> {
     };
     let plafond = u32::from_be_bytes([octets[1], octets[2], octets[3], octets[4]]);
     Some((profil, plafond))
+}
+
+/// Encode la **source d'émission audio** pour le canal `Control` : un octet de
+/// mode (`0` = [`SourceEmission::SystemeSeul`], `1` = [`SourceEmission::MicroSeul`],
+/// `2` = [`SourceEmission::SystemeEtMicro`]). Sous-type
+/// [`SousTypeControle::MajSourceAudio`].
+pub(crate) fn encoder_source_audio(source: SourceEmission) -> Vec<u8> {
+    let mode = match source {
+        SourceEmission::SystemeSeul => 0u8,
+        SourceEmission::MicroSeul => 1,
+        SourceEmission::SystemeEtMicro => 2,
+    };
+    vec![mode]
+}
+
+/// Décode une **source d'émission audio** (inverse d'[`encoder_source_audio`]).
+/// Longueur ou octet de mode invalide ⇒ `None` (jamais de panique sur entrée
+/// hostile).
+pub(crate) fn decoder_source_audio(payload: &[u8]) -> Option<SourceEmission> {
+    match payload {
+        [0] => Some(SourceEmission::SystemeSeul),
+        [1] => Some(SourceEmission::MicroSeul),
+        [2] => Some(SourceEmission::SystemeEtMicro),
+        _ => None,
+    }
 }
 
 /// Taille d'une entrée moniteur sérialisée : `index`,`w`,`h` (u32 BE) + `principal` (u8).
@@ -667,9 +723,30 @@ mod tests {
             SousTypeControle::DemandeAdmission,
             SousTypeControle::RequeteFs,
             SousTypeControle::ReponseFs,
+            SousTypeControle::RequeteFichierDistant,
+            SousTypeControle::ReponseFichierDistant,
+            SousTypeControle::MajSourceAudio,
         ] {
             assert_eq!(SousTypeControle::depuis_octet(st as u8), Some(st));
         }
+    }
+
+    #[test]
+    fn roundtrip_source_audio() {
+        for source in [
+            SourceEmission::SystemeSeul,
+            SourceEmission::MicroSeul,
+            SourceEmission::SystemeEtMicro,
+        ] {
+            assert_eq!(
+                decoder_source_audio(&encoder_source_audio(source)),
+                Some(source)
+            );
+        }
+        // Longueur ou octet de mode invalide ⇒ None sans panique.
+        assert_eq!(decoder_source_audio(&[]), None);
+        assert_eq!(decoder_source_audio(&[3]), None);
+        assert_eq!(decoder_source_audio(&[0, 0]), None);
     }
 
     /// Demande sortante « simple » (seul un mot de passe éventuel) — pour les

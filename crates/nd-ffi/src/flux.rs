@@ -28,11 +28,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nd_audio::AudioSession;
+use nd_audio::{AudioSession, SourceEmission};
 use nd_codec::{ContentProfile, DecodedFrame};
 use nd_core::{
-    ChatMessage, SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions,
-    SessionState, TunnelHandle, UnattendedHost, UnattendedHostHandle,
+    ChatMessage, DemandeAdmissionManuelle, SessionEndpoint, SessionEngine, SessionHandle,
+    SessionMedia, SessionOptions, SessionState, TunnelHandle, UnattendedHost, UnattendedHostHandle,
 };
 use nd_features::decouverte::{
     AnnonceurPresence, EcouteurPresence, OptionsEcoute, PORT_DECOUVERTE_DEFAUT,
@@ -43,7 +43,7 @@ use nd_proto::{InputEvent, NovaId};
 use nd_transport::ServerIdentity;
 
 use crate::api::{
-    AnnotationDto, ChatMessageDto, DiscoveredPeerDto, EntreeFsDto, IncomingRequestDto,
+    AnnotationDto, ChatMessageDto, DiscoveredPeerDto, EntreeFsDto, IncomingRequestDto, InviteDto,
     ListenInfoDto, MonitorInfoDto, PeerInfoDto, PermissionsDto, SessionConfigDto,
     SessionEndpointDto, SessionOptionsDto, SessionStateDto, SessionStatsDto, TransferEventDto,
     TunnelOuvertDto, VideoFrameDto,
@@ -354,6 +354,31 @@ pub(crate) fn basculer_moniteur(id: u64, moniteur: u32) -> Result<(), String> {
     avec_entree(id, |entree| entree.poignee.switch_monitor(moniteur))
 }
 
+/// Traduit un **mode de source audio** (contrat UI) en [`SourceEmission`]. Un
+/// mode inconnu renvoie une erreur française listant les valeurs acceptées
+/// (l'analyse précède tout accès à la session).
+fn source_audio_depuis_mode(mode: &str) -> Result<SourceEmission, String> {
+    let source = match mode {
+        "systeme" => SourceEmission::SystemeSeul,
+        "micro" => SourceEmission::MicroSeul,
+        "mixe" => SourceEmission::SystemeEtMicro,
+        autre => {
+            return Err(format!(
+                "source audio inconnue : « {autre} » (attendu : systeme, micro, mixe)"
+            ))
+        }
+    };
+    Ok(source)
+}
+
+/// Pilote la source d'émission audio de l'hôte (système / micro / mixé).
+pub(crate) fn definir_source_audio(id: u64, mode: &str) -> Result<(), String> {
+    // L'analyse du mode précède l'accès à la session (erreur claire, sans
+    // toucher à la session pour un mode fautif).
+    let source = source_audio_depuis_mode(mode)?;
+    avec_entree(id, |entree| entree.poignee.set_audio_source(source))
+}
+
 // ---------------------------------------------------------------------------
 // Capacités moteur avancées : confidentialité, cadre d'écran, tunnel, annotation
 // ---------------------------------------------------------------------------
@@ -559,6 +584,27 @@ pub(crate) fn lister_repertoire_distant(
         return Err(erreur);
     }
     Ok(reponse.entrees.into_iter().map(EntreeFsDto::from).collect())
+}
+
+/// Télécharge le fichier distant `chemin` via la session `id` (rôle contrôleur,
+/// mode étendu) sous `dossier` et renvoie le chemin local écrit. La boucle de
+/// tranches (bornée par tranche par le moteur) tourne **hors verrou** : les
+/// autres appels de session restent fluides pendant le téléchargement. Le refus
+/// ou l'échec côté hôte (accès refusé, fichier inexistant…) est propagé en
+/// `Err(String)`.
+pub(crate) fn telecharger_fichier_distant(
+    id: u64,
+    chemin: String,
+    dossier: String,
+) -> Result<String, String> {
+    // 1. Sous verrou : détache le client de téléchargement de la poignée. La
+    //    table des sessions n'est PAS retenue pendant la boucle de tranches.
+    let client = avec_entree(id, |entree| entree.poignee.remote_download())?;
+    // 2. Hors verrou : requêtes de tranche + écriture locale jusqu'à la fin.
+    let dest = client
+        .telecharger(chemin, PathBuf::from(dossier))
+        .map_err(|e| format!("téléchargement distant impossible : {e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
 }
 
 // --- Table des tunnels TCP par session --------------------------------------
@@ -945,15 +991,19 @@ fn avec_hote<R>(host_id: u64, action: impl FnOnce(&mut EntreeHote) -> R) -> Resu
 
 /// Démarre un hôte « accès non surveillé » et l'enregistre dans la table.
 ///
-/// L'admission est **automatique** ([`UnattendedHost::start_with_admission`]) :
-/// le vérificateur du mot de passe permanent et la confiance de l'appelant
-/// viennent de l'état persistant ([`crate::etat`]). La **confiance à l'admission**
-/// vaut **liste blanche d'admission ∪ appareils de confiance** (un ID de l'une ou
-/// l'autre liste est accepté sans mot de passe). Le clair reçu du canal Noise
-/// n'est comparé qu'au **hachage salé** stocké (déchiffré au repos à la volée),
-/// jamais conservé ni journalisé, et toute erreur de lecture vaut refus (fermé
-/// par défaut). Sans preuve, l'`accept` du moteur se replie sur la file
-/// d'approbation pilotée par le Dart (le dialogue manuel existant).
+/// L'admission est **automatique et enrichie**
+/// ([`UnattendedHost::start_with_admission_enrichie`]) : le vérificateur du mot
+/// de passe permanent, la confiance de l'appelant et le **magasin d'invitations
+/// éphémères** viennent de l'état persistant ([`crate::etat`]). La **confiance à
+/// l'admission** vaut **liste blanche d'admission ∪ appareils de confiance** (un
+/// ID de l'une ou l'autre liste est accepté sans mot de passe). Une **invitation
+/// valide** (présentée via [`SessionOptionsDto::invitation`]) admet la session
+/// **avec le profil de l'invitation** et **consomme** le code (usage unique). Le
+/// clair reçu du canal Noise (mot de passe, code) n'est comparé qu'aux données
+/// persistées (déchiffrées au repos à la volée pour le mot de passe), jamais
+/// conservé ni journalisé, et toute erreur de lecture vaut refus (fermé par
+/// défaut). Sans preuve, l'`accept` du moteur se replie sur la file d'approbation
+/// pilotée par le Dart (le dialogue manuel existant).
 pub(crate) fn demarrer_hote_non_surveille(
     local_id: u64,
     rendezvous: String,
@@ -968,14 +1018,18 @@ pub(crate) fn demarrer_hote_non_surveille(
 
     let approbation = Arc::new(ApprobationHote::new());
     let approbation_accept = Arc::clone(&approbation);
-    let poignee = UnattendedHost::start_with_admission(
+    let poignee = UnattendedHost::start_with_admission_enrichie(
         NovaId(local_id),
         serveur,
         stun,
         identite,
         permissions_moteur,
-        // Repli manuel : dialogue de l'UI (refus par défaut à l'expiration).
-        move |pair| approbation_accept.attendre_approbation(pair),
+        // Repli manuel : dialogue de l'UI (refus par défaut à l'expiration). La
+        // demande enrichie porte aussi le nom d'affichage / profil demandé ; le
+        // dialogue actuel n'en a besoin que du pair.
+        move |demande: &DemandeAdmissionManuelle| {
+            approbation_accept.attendre_approbation(demande.pair)
+        },
         // Vérificateur du mot de passe permanent : recalcul BLAKE3 salé contre
         // le hachage persisté (déchiffré au repos à la volée — `etat`).
         |mdp: &str| {
@@ -992,6 +1046,17 @@ pub(crate) fn demarrer_hote_non_surveille(
             let id = pair.as_u64();
             magasin.appareil_de_confiance(id).unwrap_or(false)
                 || magasin.admission_contient(id).unwrap_or(false)
+        },
+        // Vérificateur d'**invitation éphémère** : le magasin persistant valide le
+        // code (non expiré, non consommé), le **consomme** (usage unique) et rend
+        // les bits du profil à accorder ; sinon `None` (refus, sans dialogue).
+        // Toute erreur de lecture vaut refus (fermé par défaut).
+        |_pair: NovaId, code: &str| {
+            crate::etat::magasin()
+                .consommer_invitation(code.to_owned())
+                .ok()
+                .flatten()
+                .map(PermissionSet::from_bits)
         },
     )
     .map_err(|e| format!("démarrage de l'hôte non surveillé impossible : {e}"))?;
@@ -1141,6 +1206,54 @@ pub(crate) fn arreter_decouverte() {
         annonceur.arreter();
         ecouteur.arreter();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Invitations éphémères (magasin persistant, `etat`)
+// ---------------------------------------------------------------------------
+
+/// Traduit un **profil d'invitation** (contrat UI) en bits de [`PermissionSet`].
+/// Un profil inconnu renvoie une erreur française listant les valeurs acceptées.
+fn profil_invitation_bits(cle: &str) -> Result<u16, String> {
+    let ensemble = match cle {
+        "observation" => PermissionSet::view_only(),
+        "standard" => [
+            Capability::ViewScreen,
+            Capability::ControlMouse,
+            Capability::ControlKeyboard,
+            Capability::ClipboardRead,
+            Capability::ClipboardWrite,
+        ]
+        .into_iter()
+        .collect(),
+        "controle_total" => PermissionSet::full(),
+        autre => {
+            return Err(format!(
+                "profil d'invitation inconnu : « {autre} » \
+                 (attendu : observation, standard, controle_total)"
+            ))
+        }
+    };
+    Ok(ensemble.to_bits())
+}
+
+/// Crée et persiste une invitation éphémère pour `profil` (validé), valable
+/// `ttl_minutes`. Renvoie le code généré.
+pub(crate) fn creer_invitation(profil: String, ttl_minutes: u32) -> Result<String, String> {
+    // L'analyse du profil précède la persistance (erreur claire pour un profil
+    // fautif, sans écrire quoi que ce soit).
+    let bits = profil_invitation_bits(&profil)?;
+    crate::etat::magasin().creer_invitation(profil, bits, ttl_minutes)
+}
+
+/// Liste les invitations actives (non expirées, non consommées).
+pub(crate) fn lister_invitations() -> Result<Vec<InviteDto>, String> {
+    crate::etat::magasin().lister_invitations()
+}
+
+/// Révoque l'invitation `code` (erreur si inconnue).
+pub(crate) fn revoquer_invitation(code: String) -> Result<(), String> {
+    crate::etat::magasin().revoquer_invitation(code)
 }
 
 // ---------------------------------------------------------------------------

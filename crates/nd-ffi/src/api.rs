@@ -375,6 +375,16 @@ pub struct SessionOptionsDto {
     /// l'hôte non surveillé se replie sur son dialogue manuel (comportement
     /// historique) ; un hôte classique ignore le message.
     pub mot_de_passe: Option<String>,
+    /// **Code d'invitation éphémère** présenté à un hôte « accès non surveillé »
+    /// (rôle contrôleur) — champ **additif**, `None` par défaut. Transmis à
+    /// l'hôte **dans le canal `Control` déjà chiffré par Noise** (message
+    /// `DemandeAdmission`). L'hôte le valide contre son magasin d'invitations
+    /// persistant ([`create_invite`]) : s'il est valide (non expiré, non déjà
+    /// consommé), la session est admise **avec le profil de l'invitation**, puis
+    /// le code est **consommé** (usage unique). Une invitation invalide est
+    /// refusée sans solliciter le dialogue manuel. Sans effet sur un hôte
+    /// classique (message ignoré).
+    pub invitation: Option<String>,
 }
 
 impl From<SessionOptionsDto> for SessionOptions {
@@ -389,6 +399,9 @@ impl From<SessionOptionsDto> for SessionOptions {
             // Enveloppe opaque : le secret ne fuit ni par `Debug` ni dans les
             // journaux du moteur (voir `nd_core::SecretAdmission`).
             mot_de_passe: dto.mot_de_passe.map(SecretAdmission::new),
+            // Code d'invitation éphémère présenté à l'hôte non surveillé (canal
+            // Noise), validé côté hôte contre son magasin d'invitations.
+            invitation: dto.invitation,
             // Profil ABR et politique de reconnexion : défauts du moteur.
             ..SessionOptions::default()
         }
@@ -893,6 +906,49 @@ pub fn set_audio_enabled(id: u64, actif: bool) -> Result<(), String> {
 /// multi-écran). L'hôte applique au mieux (un index hors bornes est ignoré).
 pub fn switch_monitor(id: u64, moniteur: u32) -> Result<(), String> {
     crate::flux::basculer_moniteur(id, moniteur)
+}
+
+/// Télécharge le **fichier distant** `chemin_distant` à travers la session
+/// `session_id` (rôle contrôleur, mode étendu
+/// [`SessionOptionsDto::extended_features`]) et l'écrit sous `dossier_local` :
+/// la requête part **par tranches** sur le canal `Control` chiffré, l'hôte les
+/// sert **derrière la permission** fichiers/réception (`fichiers_reception`, la
+/// même que le listing — [`session_set_permission`]) et chaque tranche reçue est
+/// écrite localement jusqu'à la fin du fichier. **Boucle synchrone interne** qui
+/// **ne bloque pas les autres appels de session** (la table n'est pas retenue
+/// pendant les allers-retours).
+///
+/// Renvoie le **chemin local écrit** (nom = composant de base sûr du chemin
+/// distant, sous `dossier_local` ; jamais de traversée `..` ni de chemin absolu).
+///
+/// # Errors
+/// Session inconnue ou terminée, tranche sans réponse dans le délai (session non
+/// étendue, pair injoignable), **refus de l'hôte** (« accès refusé » sans la
+/// permission, fichier inexistant…) propagé, ou écriture locale impossible.
+pub fn session_download_file(
+    session_id: u64,
+    chemin_distant: String,
+    dossier_local: String,
+) -> Result<String, String> {
+    crate::flux::telecharger_fichier_distant(session_id, chemin_distant, dossier_local)
+}
+
+/// Pilote la **source d'émission audio de l'hôte** entendue par le contrôleur :
+/// `mode` ∈ `systeme` (audio système seul), `micro` (microphone de l'hôte seul)
+/// ou `mixe` (les deux mélangés). Le contrôleur transmet la demande à l'hôte, qui
+/// applique `nd_audio::AudioSession::definir_source_emission` à sa session audio ;
+/// si le micro est indisponible côté hôte, nd-audio se replie sur le système.
+/// Sans effet hors mode étendu ou si la permission audio n'est pas accordée.
+///
+/// Note : c'est le micro **de l'hôte** que le contrôleur entend (source
+/// d'émission de l'hôte). Le micro contrôleur → hôte serait un flux inverse, hors
+/// périmètre.
+///
+/// # Errors
+/// `mode` invalide (message français listant les valeurs acceptées), ou session
+/// inconnue.
+pub fn session_set_audio_source(session_id: u64, mode: String) -> Result<(), String> {
+    crate::flux::definir_source_audio(session_id, &mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -2216,6 +2272,67 @@ pub fn discovery_peers() -> Vec<DiscoveredPeerDto> {
 pub fn discovery_stop() -> Result<(), String> {
     crate::flux::arreter_decouverte();
     Ok(())
+}
+
+// ===========================================================================
+// Invitations éphémères (type « QuickSupport »)
+// ===========================================================================
+//
+// Magasin d'invitations **persistant** (via [`crate::etat`], enveloppe
+// `nd_features::invite`) : un code court usage-unique + TTL + profil de
+// permissions, que l'utilisateur aidé communique au technicien. Le magasin est
+// **branché dans le vérificateur d'admission** de l'hôte non surveillé
+// ([`start_unattended_host`]) : un contrôleur qui présente le code via
+// [`SessionOptionsDto::invitation`] est admis **avec le profil de l'invitation**,
+// et le code est consommé. Toutes **synchrones à DTO plats** : aucun
+// `pont_provisoire` requis — le codegen produira leurs `SseEncode`/`SseDecode` à
+// la régénération.
+
+/// Une invitation éphémère active, telle que rendue par [`list_invites`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteDto {
+    /// Code lisible au format `XXX-XXX-XXX` (à dicter au technicien).
+    pub code: String,
+    /// Profil de permissions accordé à l'admission : `observation`, `standard`
+    /// ou `controle_total` (voir [`create_invite`]).
+    pub profil: String,
+    /// Secondes restantes avant expiration (0 = sur le point d'expirer).
+    pub expire_dans_s: u64,
+}
+
+/// Crée une **invitation éphémère** à usage unique et la persiste : génère un
+/// code court (CSPRNG, format `XXX-XXX-XXX`), l'associe à `profil` et à une
+/// expiration à `ttl_minutes` d'ici, puis renvoie le **code** (à communiquer au
+/// technicien ; un contrôleur le présente via [`SessionOptionsDto::invitation`]).
+///
+/// `profil` fixe les permissions accordées à l'admission :
+/// * `observation` — voir l'écran seulement ;
+/// * `standard` — voir l'écran + souris + clavier + presse-papiers ;
+/// * `controle_total` — toutes les capacités.
+///
+/// # Errors
+/// `profil` inconnu (message français listant les valeurs acceptées), ou
+/// persistance impossible.
+pub fn create_invite(profil: String, ttl_minutes: u32) -> Result<String, String> {
+    crate::flux::creer_invitation(profil, ttl_minutes)
+}
+
+/// Liste les **invitations actives** (non expirées, non consommées), chacune avec
+/// son code, son profil et le temps restant. Liste vide si aucune n'est active.
+///
+/// # Errors
+/// Magasin d'invitations illisible (JSON corrompu).
+pub fn list_invites() -> Result<Vec<InviteDto>, String> {
+    crate::flux::lister_invitations()
+}
+
+/// **Révoque** (supprime) l'invitation de code `code` avant son expiration : un
+/// contrôleur qui la présenterait ensuite serait refusé.
+///
+/// # Errors
+/// Code inconnu (déjà révoqué, consommé ou expiré), ou persistance impossible.
+pub fn revoke_invite(code: String) -> Result<(), String> {
+    crate::flux::revoquer_invitation(code)
 }
 
 #[cfg(test)]

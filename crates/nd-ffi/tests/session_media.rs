@@ -6,10 +6,11 @@
 use std::time::{Duration, Instant};
 
 use nd_ffi::{
-    collect_video_frames, new_session_config, send_chat, send_files, session_last_error,
-    session_listen_info, set_audio_enabled, start_session_with_options, stop_session,
-    switch_monitor, wait_session_state, ChatMessageDto, PermissionsDto, SessionEndpointDto,
-    SessionOptionsDto, SessionRoleDto, SessionStateDto, TransferEventDto,
+    collect_video_frames, new_session_config, send_chat, send_files, session_download_file,
+    session_last_error, session_listen_info, session_set_audio_source, set_audio_enabled,
+    start_session_with_options, stop_session, switch_monitor, wait_session_state, ChatMessageDto,
+    PermissionsDto, SessionEndpointDto, SessionOptionsDto, SessionRoleDto, SessionStateDto,
+    TransferEventDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,8 +139,27 @@ fn commandes_media_sur_session_inconnue() {
         send_files(id, vec!["/tmp/x.bin".to_owned()]).unwrap_err(),
         set_audio_enabled(id, true).unwrap_err(),
         switch_monitor(id, 1).unwrap_err(),
+        // Mode valide : l'erreur restante est bien l'absence de session.
+        session_set_audio_source(id, "systeme".to_owned()).unwrap_err(),
+        session_download_file(id, "C:\\x.bin".to_owned(), "C:\\tmp".to_owned()).unwrap_err(),
     ] {
         assert!(erreur.contains("inconnue"), "message peu utile : {erreur}");
+    }
+}
+
+/// Un **mode de source audio invalide** échoue avec un message français —
+/// l'analyse précède la recherche de session (aucune session requise) ; les trois
+/// modes valides passent l'analyse et n'échouent que sur l'absence de session.
+#[test]
+fn session_set_audio_source_mode_invalide_erreur_fr() {
+    let err = session_set_audio_source(u64::MAX, "chuchotement".to_owned()).unwrap_err();
+    assert!(
+        err.contains("source audio inconnue"),
+        "message peu utile : {err}"
+    );
+    for mode in ["systeme", "micro", "mixe"] {
+        let err = session_set_audio_source(u64::MAX, mode.to_owned()).unwrap_err();
+        assert!(err.contains("inconnue"), "mode « {mode} » : {err}");
     }
 }
 
@@ -164,6 +184,7 @@ fn options_etendues() -> SessionOptionsDto {
         transfer_dir: None,
         transport_reconnect: false,
         mot_de_passe: None,
+        invitation: None,
     }
 }
 
@@ -249,6 +270,44 @@ fn session_etendue_loopback_chat_fichiers_audio_moniteur() {
     set_audio_enabled(id_viewer, false).expect("bascule audio");
     set_audio_enabled(id_viewer, true).expect("bascule audio");
     switch_monitor(id_viewer, 0).expect("bascule moniteur");
+    // Source d'émission audio de l'hôte : chaque mode valide part sans erreur.
+    for mode in ["systeme", "micro", "mixe"] {
+        session_set_audio_source(id_viewer, mode.to_owned())
+            .unwrap_or_else(|e| panic!("bascule de source audio « {mode} » : {e}"));
+    }
+
+    // 5b. Téléchargement distant **réel** : un fichier du poste hôte (loopback,
+    //     donc le même poste) est reconstruit localement par le viewer, par
+    //     tranches. On vérifie le chemin local rendu et le contenu à l'octet près.
+    //     Contenu > 1 MiB (tranche max) : la boucle offset → `fin` itère.
+    let source_dl = std::env::temp_dir().join(format!("nd_ffi_dl_src_{}.bin", std::process::id()));
+    let contenu: Vec<u8> = (0..1_048_576u32 + 5_000)
+        .map(|i| (i.wrapping_mul(31) & 0xff) as u8)
+        .collect();
+    std::fs::write(&source_dl, &contenu).expect("écriture de la source à télécharger");
+    let dossier_recu = std::env::temp_dir().join(format!("nd_ffi_dl_dst_{}", std::process::id()));
+    std::fs::create_dir_all(&dossier_recu).expect("création du dossier de réception");
+
+    let ecrit = session_download_file(
+        id_viewer,
+        source_dl.to_string_lossy().into_owned(),
+        dossier_recu.to_string_lossy().into_owned(),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "téléchargement distant (erreur hôte : {:?}) : {e}",
+            session_last_error(id_hote)
+        )
+    });
+    assert!(
+        std::path::Path::new(&ecrit).starts_with(&dossier_recu),
+        "le fichier téléchargé doit être écrit SOUS le dossier local : {ecrit}"
+    );
+    assert_eq!(
+        std::fs::read(&ecrit).expect("relecture du fichier téléchargé"),
+        contenu,
+        "le fichier local doit avoir exactement le contenu de la source"
+    );
 
     // 6. Arrêt propre des deux moteurs ; identifiants retirés de la table.
     stop_session(id_viewer).expect("arrêt du viewer");
@@ -256,4 +315,6 @@ fn session_etendue_loopback_chat_fichiers_audio_moniteur() {
     assert!(stop_session(id_viewer).is_err(), "viewer déjà arrêté");
 
     let _ = std::fs::remove_file(&fichier);
+    let _ = std::fs::remove_file(&source_dl);
+    let _ = std::fs::remove_dir_all(&dossier_recu);
 }

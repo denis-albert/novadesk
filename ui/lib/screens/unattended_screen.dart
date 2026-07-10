@@ -1,6 +1,7 @@
 /// Accès non surveillé (maquette `novadesk-app.html`, `#v-unattended`) : volet
 /// façon réglages — activation, mot de passe permanent + jauge de force,
-/// profils de permissions, appareils de confiance, journal des accès.
+/// profils de permissions, appareils de confiance, liste blanche d'admission
+/// (ACL), journal des accès.
 ///
 /// L'écran est une **vue** : le cycle de vie de l'hôte réel (démarrage,
 /// demandes entrantes et leur dialogue d'acceptation, statistiques, arrêt)
@@ -21,6 +22,14 @@ import '../theme/nova_theme.dart';
 import '../widgets/nova_icons.dart';
 import '../widgets/nova_id_field.dart';
 import '../widgets/nova_kit.dart';
+
+/// Liste blanche d'admission (`list_admission_allowlist`) : IDs admis **sans
+/// mot de passe** en accès non surveillé. Déclarée ici car seul cet écran la
+/// consomme ; invalidée après chaque ajout/retrait, comme
+/// [unattendedConfigProvider] pour les appareils de confiance.
+final _admissionAllowlistProvider = FutureProvider<List<int>>((ref) {
+  return ref.watch(nativeApiProvider).listAdmissionAllowlist();
+});
 
 class UnattendedScreen extends ConsumerStatefulWidget {
   const UnattendedScreen({super.key});
@@ -130,6 +139,19 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           'sans mot de passe.';
     }
     return '${ids.map(_aliasPour).join(' · ')} — connexion sans mot de passe.';
+  }
+
+  /// Sous-titre de la ligne « Liste blanche d'admission » (depuis
+  /// `list_admission_allowlist`).
+  String _sousTitreListeBlanche() {
+    final ids =
+        ref.watch(_admissionAllowlistProvider).valueOrNull ?? const <int>[];
+    if (ids.isEmpty) {
+      return 'Aucun identifiant admis — ces appareils se connectent sans '
+          'mot de passe.';
+    }
+    return '${ids.map(_aliasPour).join(' · ')} — ces appareils se connectent '
+        'sans mot de passe.';
   }
 
   double _force(String motDePasse) {
@@ -314,6 +336,135 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // Liste blanche d'admission (add_admission_allowed / remove_admission_allowed)
+  // ---------------------------------------------------------------------------
+
+  /// Saisit un ID NovaDesk à admettre ; renvoie l'ID analysé ou `null`.
+  Future<int?> _saisirAdmissionId() async {
+    final idController = TextEditingController();
+    final valide = await montrerDialogueNova<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ajouter à la liste blanche'),
+        content: NovaIdField(
+            controller: idController,
+            libelle: "ID de l'appareil",
+            autofocus: true),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Annuler')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Ajouter')),
+        ],
+      ),
+    );
+    int? resultat;
+    if (valide == true) {
+      try {
+        resultat = await _api.parseNovaId(texte: idController.text);
+      } on NovaApiException catch (e) {
+        if (mounted) NovaToast.montrer(context, e.message, info: true);
+      }
+    }
+    idController.dispose();
+    return resultat;
+  }
+
+  Future<void> _ajouterAdmission() async {
+    final id = await _saisirAdmissionId();
+    if (id == null) return;
+    try {
+      await _api.addAdmissionAllowed(id: id);
+      ref.invalidate(_admissionAllowlistProvider);
+      if (mounted) {
+        NovaToast.montrer(context, "ID ajouté à la liste blanche d'admission");
+      }
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
+  }
+
+  Future<void> _retirerAdmission(int id) async {
+    try {
+      await _api.removeAdmissionAllowed(id: id);
+      ref.invalidate(_admissionAllowlistProvider);
+      if (mounted) {
+        NovaToast.montrer(context, 'ID retiré de la liste blanche');
+      }
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    }
+  }
+
+  Future<void> _gererListeBlanche() async {
+    await montrerDialogueNova<void>(
+      context: context,
+      builder: (context) {
+        final t = NovaTokens.of(context);
+        return AlertDialog(
+          title: const Text("Liste blanche d'admission"),
+          backgroundColor: t.fenetre,
+          content: SizedBox(
+            width: 380,
+            child: Consumer(
+              builder: (context, ref, _) {
+                final ids =
+                    ref.watch(_admissionAllowlistProvider).valueOrNull ??
+                        const <int>[];
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (ids.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(
+                              'Aucun identifiant admis sans mot de passe.',
+                              style:
+                                  TextStyle(fontSize: 12.5, color: t.texte3)),
+                        ),
+                      ),
+                    for (final id in ids)
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const NovaIcone(NovaIcones.moniteur),
+                        title: Text(_formaterId(id)),
+                        subtitle: Text(_aliasPour(id)),
+                        trailing: IconButton(
+                          tooltip: 'Retirer',
+                          icon: const NovaIcone(NovaIcones.corbeille,
+                              taille: 16),
+                          onPressed: () => unawaited(_retirerAdmission(id)),
+                        ),
+                      ),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () => unawaited(_ajouterAdmission()),
+                        icon: const NovaIcone(NovaIcones.plus, taille: 14),
+                        label: const Text('Ajouter'),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Fermer'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   void _voirJournal() {
     montrerDialogueNova<void>(
       context: context,
@@ -423,6 +574,14 @@ class _UnattendedScreenState extends ConsumerState<UnattendedScreen> {
           sousTitre: _sousTitreAppareils(),
           controle: NovaBoutonSecondaire(
               libelle: 'Gérer', onPressed: () => unawaited(_gererAppareils())),
+        ),
+        _ligne(
+          t,
+          titre: "Liste blanche d'admission",
+          sousTitre: _sousTitreListeBlanche(),
+          controle: NovaBoutonSecondaire(
+              libelle: 'Gérer',
+              onPressed: () => unawaited(_gererListeBlanche())),
         ),
         _ligne(
           t,

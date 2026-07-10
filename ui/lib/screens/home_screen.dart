@@ -13,9 +13,16 @@
 ///
 /// L'onglet « Découverts » affiche les **pairs LAN réels** : `discovery_peers`
 /// est sondé (~2 s) tant que l'onglet est actif — la découverte elle-même est
-/// démarrée au niveau application (coquille, `main.dart`). Un **mot de passe
+/// démarrée au niveau application (coquille, `main.dart`). Un **secret
 /// optionnel** (hôte en accès non surveillé), déplié par la puce cadenas sous
-/// le champ d'adresse, est transmis via [SessionOptionsDto.motDePasse].
+/// le champ d'adresse, est transmis via [SessionOptionsDto.motDePasse] — ou,
+/// si la saisie a la forme d'un code d'invitation « XXX-XXX-XXX », via
+/// [SessionOptionsDto.invitation] (routage par `_estCodeInvitation`).
+///
+/// Le dialogue « Inviter » crée des **invitations éphémères réelles** via la
+/// façade : profil accordé + durée de validité → `create_invite` renvoie un
+/// code copiable ; la modale liste aussi les invitations actives
+/// (`list_invites`, « expire dans … ») et les révoque (`revoke_invite`).
 library;
 
 import 'dart:async';
@@ -82,8 +89,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final TextEditingController _adresseController = TextEditingController();
   final FocusNode _adresseFocus = FocusNode(debugLabel: 'champ-adresse');
 
-  /// Mot de passe **optionnel** présenté à un hôte en accès non surveillé
-  /// (admission automatique) ; champ déplié à la demande par la puce cadenas.
+  /// Secret **optionnel** présenté à un hôte en accès non surveillé : mot de
+  /// passe d'admission automatique **ou** code d'invitation « XXX-XXX-XXX »
+  /// — le routage se fait à la connexion selon la forme de la saisie (voir
+  /// [_seConnecter]) ; champ déplié à la demande par la puce cadenas.
   final TextEditingController _mdpController = TextEditingController();
   final FocusNode _mdpFocus = FocusNode(debugLabel: 'champ-mot-de-passe');
   bool _mdpDeplie = false;
@@ -237,12 +246,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         stunServers: ref.read(stunServersProvider),
         relay: ref.read(relayProvider),
       );
-      // Mot de passe optionnel (hôte en accès non surveillé) : transmis tel
-      // quel s'il est saisi — vide → `null`, l'hôte garde son dialogue manuel.
-      final motDePasse = _mdpController.text;
+      // Secret optionnel (hôte en accès non surveillé) : le champ unique
+      // accepte **mot de passe ou code d'invitation**. Une saisie à la forme
+      // d'un code « XXX-XXX-XXX » ([_estCodeInvitation]) part dans
+      // [SessionOptionsDto.invitation] — normalisée en majuscules, l'hôte
+      // comparant le code exact tel que généré — sinon elle reste un mot de
+      // passe transmis tel quel. Vide → `null` pour les deux (comportement
+      // inchangé : l'hôte garde son dialogue d'approbation manuel).
+      final secret = _mdpController.text;
+      final estInvitation = _estCodeInvitation(secret.trim());
       final options = SessionOptionsDto(
         permissions: mode.permissions,
-        motDePasse: motDePasse.isEmpty ? null : motDePasse,
+        motDePasse: secret.isEmpty || estInvitation ? null : secret,
+        invitation: estInvitation ? secret.trim().toUpperCase() : null,
       );
       // Journalise la session au démarrage (historique + dernière connexion du
       // contact) puis rafraîchit les vues concernées.
@@ -566,10 +582,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  /// Puce « Mot de passe » (cadenas) : déplie/replie le champ de mot de passe
-  /// d'accès non surveillé sous le champ d'adresse. Reste « active » (bleue)
-  /// tant qu'un mot de passe est saisi — la saisie est transmise même champ
-  /// replié.
+  /// Puce « Mot de passe / code » (cadenas) : déplie/replie le champ de secret
+  /// d'accès non surveillé — mot de passe **ou** code d'invitation — sous le
+  /// champ d'adresse. Reste « active » (bleue) tant qu'une saisie est présente
+  /// — la saisie est transmise même champ replié.
   Widget _puceMotDePasse(NovaTokens t) {
     final actif = _mdpDeplie || _mdpRenseigne;
     return NovaActivable(
@@ -579,7 +595,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         // le champ s'attache à l'arbre, au frame suivant).
         if (_mdpDeplie) _mdpFocus.requestFocus();
       },
-      label: 'Mot de passe (hôte en accès non surveillé)',
+      label: "Mot de passe ou code d'invitation (hôte en accès non surveillé)",
       builder: (context, survole, focus) => Container(
         padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
         decoration: BoxDecoration(
@@ -594,7 +610,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 taille: 13, couleur: actif ? t.bleu : t.texte2),
             const SizedBox(width: 6),
             Text(
-              'Mot de passe',
+              'Mot de passe / code',
               style:
                   TextStyle(fontSize: 11.5, color: actif ? t.bleu : t.texte2),
             ),
@@ -604,10 +620,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  /// Champ **mot de passe optionnel** (accès non surveillé), déplié sous le
-  /// champ d'adresse par la puce cadenas. Sa valeur non vide part dans
-  /// [SessionOptionsDto.motDePasse] à la connexion ([_seConnecter]) ; vide →
-  /// `null` (l'hôte se replie sur son dialogue d'approbation manuel).
+  /// Champ **secret optionnel** (accès non surveillé), déplié sous le champ
+  /// d'adresse par la puce cadenas. À la connexion ([_seConnecter]), une
+  /// saisie à la forme d'un code d'invitation « XXX-XXX-XXX » part dans
+  /// [SessionOptionsDto.invitation], toute autre saisie non vide dans
+  /// [SessionOptionsDto.motDePasse] ; vide → `null` (l'hôte se replie sur son
+  /// dialogue d'approbation manuel).
   Widget _champMotDePasse(NovaTokens t) {
     return AnimatedContainer(
       duration: const Duration(milliseconds: 120),
@@ -644,7 +662,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 border: InputBorder.none,
                 enabledBorder: InputBorder.none,
                 focusedBorder: InputBorder.none,
-                hintText: 'Optionnel — pour un hôte en accès non surveillé',
+                hintText: "Optionnel — mot de passe ou code d'invitation",
                 hintStyle: TextStyle(fontSize: 12.5, color: t.texte3),
               ),
               onSubmitted: (_) => unawaited(_seConnecter()),
@@ -1045,6 +1063,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   // --- Modale d'invitation --------------------------------------------------
 
+  /// Ouvre la modale « Inviter à se connecter » : génération d'invitations
+  /// éphémères **réelles** (profil accordé + durée → code), liste des
+  /// invitations actives et révocation unitaire.
   void _montrerInvitation() {
     montrerDialogueNova<void>(
         context: context, builder: (context) => const _InviteDialog());
@@ -1062,6 +1083,18 @@ String? _normaliserMac(String saisie) {
     for (var i = 0; i < hex.length; i += 2) hex.substring(i, i + 2),
   ].join(':');
 }
+
+/// Vrai si [saisie] a la forme d'un **code d'invitation** « XXX-XXX-XXX » :
+/// trois groupes de trois symboles de l'alphabet des codes (lettres sans `I`
+/// ni `O`, chiffres 2–9 — jamais `0` ni `1`), casse tolérée à la saisie. Sert
+/// à router le champ optionnel « mot de passe / code » vers
+/// [SessionOptionsDto.invitation] plutôt que [SessionOptionsDto.motDePasse] :
+/// l'alphabet restreint rend improbable la collision avec un vrai mot de
+/// passe de cette forme exacte.
+bool _estCodeInvitation(String saisie) => RegExp(
+      r'^[A-HJ-NP-Z2-9]{3}-[A-HJ-NP-Z2-9]{3}-[A-HJ-NP-Z2-9]{3}$',
+      caseSensitive: false,
+    ).hasMatch(saisie);
 
 // ===========================================================================
 // Composants privés
@@ -1326,11 +1359,172 @@ class _FormateurAdresse extends TextInputFormatter {
   }
 }
 
-/// Modale « Inviter à se connecter » (maquette `.modal.invite`).
-class _InviteDialog extends StatelessWidget {
+// ===========================================================================
+// Invitations éphémères (modale « Inviter »)
+// ===========================================================================
+
+/// Profil de permissions accordé à l'admission par une **invitation
+/// éphémère** — les trois valeurs acceptées par [NativeApi.createInvite],
+/// avec libellé et icône d'affichage.
+enum _ProfilInvitation {
+  observation('observation', 'Observation', NovaIcones.observation),
+  standard('standard', 'Standard', NovaIcones.controle),
+  controleTotal('controle_total', 'Contrôle total', NovaIcones.eclair);
+
+  const _ProfilInvitation(this.valeurApi, this.libelle, this.icone);
+
+  /// Valeur attendue par la façade ([NativeApi.createInvite],
+  /// [InviteDto.profil]).
+  final String valeurApi;
+
+  /// Libellé d'affichage.
+  final String libelle;
+
+  /// Icône de la puce de choix.
+  final IconData icone;
+
+  /// Libellé du profil [valeurApi] tel que rendu par la façade ; la valeur
+  /// brute est restituée telle quelle si elle est inconnue (robustesse
+  /// d'affichage : la liste ne doit jamais casser).
+  static String libellePour(String valeurApi) =>
+      values.where((p) => p.valeurApi == valeurApi).firstOrNull?.libelle ??
+      valeurApi;
+}
+
+/// Durées de validité proposées à la création d'une invitation.
+const List<({int minutes, String libelle})> _dureesInvitation = [
+  (minutes: 10, libelle: '10 min'),
+  (minutes: 60, libelle: '1 h'),
+  (minutes: 1440, libelle: '24 h'),
+];
+
+/// Temps restant lisible d'une invitation active (« expire dans 9 min ») —
+/// arrondi vers le bas : pour un compte à rebours, sous-estimer est honnête.
+String _formaterExpiration(int secondes) {
+  final s = secondes < 0 ? 0 : secondes;
+  if (s < 60) return 'expire dans $s s';
+  final minutes = s ~/ 60;
+  if (minutes < 60) return 'expire dans $minutes min';
+  return 'expire dans ${minutes ~/ 60} h';
+}
+
+/// Modale « Inviter à se connecter » (maquette `.modal.invite`), branchée sur
+/// les **invitations éphémères réelles** de la façade : choix du profil
+/// accordé et de la durée de validité → [NativeApi.createInvite] renvoie un
+/// code « XXX-XXX-XXX » copiable à dicter au technicien. En dessous, la liste
+/// des invitations **actives** ([NativeApi.listInvites], relevée à l'ouverture
+/// puis toutes les ~30 s pour un « expire dans … » honnête) avec révocation
+/// unitaire ([NativeApi.revokeInvite]).
+class _InviteDialog extends ConsumerStatefulWidget {
   const _InviteDialog();
 
-  static const String _lien = 'https://novadesk.io/i/9x7-Kd2-mQ';
+  @override
+  ConsumerState<_InviteDialog> createState() => _InviteDialogState();
+}
+
+class _InviteDialogState extends ConsumerState<_InviteDialog> {
+  /// Profil accordé à la prochaine invitation (moindre privilège par défaut).
+  _ProfilInvitation _profil = _ProfilInvitation.observation;
+
+  /// Durée de validité de la prochaine invitation, en minutes.
+  int _ttlMinutes = 10;
+
+  bool _creationEnCours = false;
+
+  /// Dernier code généré par la modale, affiché dans l'encart copiable.
+  String? _codeGenere;
+
+  /// Invitations actives — `null` tant que le premier relevé n'est pas rendu
+  /// (squelettes de chargement).
+  List<InviteDto>? _invitations;
+
+  /// Code dont la révocation est en cours (désactive les corbeilles le temps
+  /// de l'aller-retour).
+  String? _revocationEnCours;
+
+  /// Rafraîchissement périodique de la liste : les « expire dans … » restent
+  /// honnêtes et les invitations expirées disparaissent d'elles-mêmes.
+  Timer? _minuteurRafraichissement;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_rafraichirInvitations(premierReleve: true));
+    _minuteurRafraichissement = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(_rafraichirInvitations()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _minuteurRafraichissement?.cancel();
+    super.dispose();
+  }
+
+  /// Relève la liste des invitations actives. Un tic périodique échoue en
+  /// silence (liste précédente conservée, prochain tic retentera) ; le
+  /// **premier** relevé signale l'erreur par un toast et se replie sur une
+  /// liste vide pour ne pas laisser des squelettes permanents.
+  Future<void> _rafraichirInvitations({bool premierReleve = false}) async {
+    try {
+      final invitations = await ref.read(nativeApiProvider).listInvites();
+      if (mounted) setState(() => _invitations = invitations);
+    } on NovaApiException catch (e) {
+      if (premierReleve && mounted) {
+        setState(() => _invitations = const []);
+        NovaToast.montrer(context, e.message, info: true);
+      }
+    }
+  }
+
+  /// Crée l'invitation (profil + durée choisis) via la façade, affiche le
+  /// code renvoyé dans l'encart copiable et rafraîchit la liste des actives.
+  Future<void> _genererCode() async {
+    setState(() => _creationEnCours = true);
+    try {
+      final code = await ref.read(nativeApiProvider).createInvite(
+            profil: _profil.valeurApi,
+            ttlMinutes: _ttlMinutes,
+          );
+      if (!mounted) return;
+      setState(() => _codeGenere = code);
+      NovaToast.montrer(context, 'Invitation créée');
+      await _rafraichirInvitations();
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    } finally {
+      if (mounted) setState(() => _creationEnCours = false);
+    }
+  }
+
+  /// Révoque [code] puis rafraîchit la liste — y compris après une erreur, le
+  /// code ayant pu expirer ou être consommé entre l'affichage et le clic.
+  Future<void> _revoquer(String code) async {
+    setState(() => _revocationEnCours = code);
+    try {
+      await ref.read(nativeApiProvider).revokeInvite(code: code);
+      if (!mounted) return;
+      // Un code révoqué n'est plus présentable : retire l'encart s'il l'affiche.
+      setState(() {
+        if (_codeGenere == code) _codeGenere = null;
+      });
+      NovaToast.montrer(context, 'Invitation $code révoquée');
+    } on NovaApiException catch (e) {
+      if (mounted) NovaToast.montrer(context, e.message, info: true);
+    } finally {
+      if (mounted) {
+        setState(() => _revocationEnCours = null);
+        await _rafraichirInvitations();
+      }
+    }
+  }
+
+  /// Copie [code] dans le presse-papiers système.
+  Future<void> _copierCode(String code) async {
+    await Clipboard.setData(ClipboardData(text: code));
+    if (mounted) NovaToast.montrer(context, "Code d'invitation copié");
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1342,84 +1536,26 @@ class _InviteDialog extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 17, 20, 17),
-              child: Row(
-                children: [
-                  Container(
-                    width: 42,
-                    height: 42,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: kNovaRouge,
-                      borderRadius: BorderRadius.circular(kNovaRayon),
-                    ),
-                    child: const NovaIcone(NovaIcones.inviter,
-                        taille: 20, couleur: Colors.white),
-                  ),
-                  const SizedBox(width: 13),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Inviter à se connecter',
-                          style: TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w600,
-                              color: t.texte)),
-                      const SizedBox(height: 1),
-                      Text('Lien à usage unique',
-                          style: TextStyle(fontSize: 12, color: t.texte3)),
-                    ],
-                  ),
-                ],
-              ),
-            ),
+            _entete(t),
             Divider(height: 1, color: t.filet),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const NovaSectionLabel("Lien d'invitation"),
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Container(
-                          height: 34,
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
-                          alignment: Alignment.centerLeft,
-                          decoration: BoxDecoration(
-                            color: t.panneau,
-                            borderRadius: BorderRadius.circular(kNovaRayon),
-                            border: Border.all(color: t.champBordure),
-                          ),
-                          child: Text(_lien,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 12, color: t.texte)),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      NovaBoutonPrimaire(
-                        libelle: 'Copier',
-                        onPressed: () async {
-                          await Clipboard.setData(
-                              const ClipboardData(text: _lien));
-                          if (context.mounted) {
-                            NovaToast.montrer(context, "Lien d'invitation copié");
-                          }
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Expire dans 10 min · une seule connexion · profil '
-                    '« Observation ».',
-                    style: TextStyle(fontSize: 11.5, color: t.texte3),
-                  ),
-                ],
+            // Corps déroulant : la modale reste utilisable sur une fenêtre
+            // basse ou avec une longue liste d'invitations, sans déborder.
+            Flexible(
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+                      child: _sectionCreation(t),
+                    ),
+                    Divider(height: 1, color: t.filet),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 14, 20, 16),
+                      child: _sectionActives(t),
+                    ),
+                  ],
+                ),
               ),
             ),
             Divider(height: 1, color: t.filet),
@@ -1437,6 +1573,275 @@ class _InviteDialog extends StatelessWidget {
                   ),
                 ],
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// En-tête de la modale (pastille rouge + titre), fidèle à la maquette.
+  Widget _entete(NovaTokens t) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 17, 20, 17),
+      child: Row(
+        children: [
+          Container(
+            width: 42,
+            height: 42,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: kNovaRouge,
+              borderRadius: BorderRadius.circular(kNovaRayon),
+            ),
+            child: const NovaIcone(NovaIcones.inviter,
+                taille: 20, couleur: Colors.white),
+          ),
+          const SizedBox(width: 13),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Inviter à se connecter',
+                  style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      color: t.texte)),
+              const SizedBox(height: 1),
+              Text('Code éphémère à usage unique',
+                  style: TextStyle(fontSize: 12, color: t.texte3)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Générateur d'invitation : puces **profil accordé** et **durée de
+  /// validité**, résumé dynamique (reprend la formulation de la maquette),
+  /// bouton « Générer le code » puis encart du code renvoyé (sélectionnable,
+  /// bouton Copier).
+  Widget _sectionCreation(NovaTokens t) {
+    final libelleDuree =
+        _dureesInvitation.firstWhere((d) => d.minutes == _ttlMinutes).libelle;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const NovaSectionLabel('Profil accordé'),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (final profil in _ProfilInvitation.values)
+              _PuceChoix(
+                libelle: profil.libelle,
+                icone: profil.icone,
+                actif: _profil == profil,
+                onTap: () => setState(() => _profil = profil),
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        const NovaSectionLabel('Durée de validité'),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (final duree in _dureesInvitation)
+              _PuceChoix(
+                libelle: duree.libelle,
+                actif: _ttlMinutes == duree.minutes,
+                onTap: () => setState(() => _ttlMinutes = duree.minutes),
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Expire dans $libelleDuree · une seule connexion · profil '
+          '« ${_profil.libelle} ».',
+          style: TextStyle(fontSize: 11.5, color: t.texte3),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: NovaBoutonPrimaire(
+                libelle: 'Générer le code',
+                icone: NovaIcones.inviter,
+                hauteur: 34,
+                enCours: _creationEnCours,
+                onPressed:
+                    _creationEnCours ? null : () => unawaited(_genererCode()),
+              ),
+            ),
+          ],
+        ),
+        if (_codeGenere != null) ...[
+          const SizedBox(height: 12),
+          const NovaSectionLabel("Code d'invitation"),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: Container(
+                  height: 34,
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  alignment: Alignment.centerLeft,
+                  decoration: BoxDecoration(
+                    color: t.panneau,
+                    borderRadius: BorderRadius.circular(kNovaRayon),
+                    border: Border.all(color: t.champBordure),
+                  ),
+                  child: SelectableText(
+                    _codeGenere!,
+                    maxLines: 1,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: t.texte,
+                      letterSpacing: 1,
+                      fontFamily: 'Cascadia Code',
+                      fontFamilyFallback: const ['Consolas', 'monospace'],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              NovaBoutonPrimaire(
+                libelle: 'Copier',
+                onPressed: () => unawaited(_copierCode(_codeGenere!)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Code à dicter au technicien — il le saisit dans le champ '
+            '« Mot de passe / code » avant de se connecter.',
+            style: TextStyle(fontSize: 11.5, color: t.texte3),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// Liste des invitations **actives** (non expirées, non consommées) : code
+  /// en chasse fixe, profil + « expire dans … », corbeille de révocation.
+  /// Squelettes tant que le premier relevé n'est pas rendu.
+  Widget _sectionActives(NovaTokens t) {
+    final invitations = _invitations;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const NovaSectionLabel('Invitations actives'),
+        const SizedBox(height: 8),
+        if (invitations == null) ...[
+          const Padding(
+            padding: EdgeInsets.only(bottom: 8),
+            child: NovaSkeleton(largeur: 210, hauteur: 12),
+          ),
+          const NovaSkeleton(largeur: 150, hauteur: 12),
+        ] else if (invitations.isEmpty)
+          Text('Aucune invitation active.',
+              style: TextStyle(fontSize: 12, color: t.texte3))
+        else
+          for (var i = 0; i < invitations.length; i++)
+            _ligneInvitation(t, invitations[i],
+                derniere: i == invitations.length - 1),
+      ],
+    );
+  }
+
+  /// Une ligne d'invitation active — filet sous chaque ligne sauf la dernière.
+  Widget _ligneInvitation(NovaTokens t, InviteDto invitation,
+      {required bool derniere}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      decoration: derniere
+          ? null
+          : BoxDecoration(
+              border: Border(bottom: BorderSide(color: t.filet)),
+            ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  invitation.code,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: t.texte,
+                    letterSpacing: 0.5,
+                    fontFamily: 'Cascadia Code',
+                    fontFamilyFallback: const ['Consolas', 'monospace'],
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '${_ProfilInvitation.libellePour(invitation.profil)} · '
+                  '${_formaterExpiration(invitation.expireDansS)}',
+                  style: TextStyle(fontSize: 11.5, color: t.texte3),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          NovaBoutonAction(
+            icone: NovaIcones.corbeille,
+            tailleIcone: 14,
+            taille: 24,
+            infobulle: 'Révoquer',
+            onTap: _revocationEnCours == null
+                ? () => unawaited(_revoquer(invitation.code))
+                : null,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Puce de choix de la modale d'invitation (profil / durée) — même visuel que
+/// les puces de mode de l'accueil (maquette `.chip`) : fond sélection et
+/// bordure bleue quand active.
+class _PuceChoix extends StatelessWidget {
+  const _PuceChoix({
+    required this.libelle,
+    required this.actif,
+    required this.onTap,
+    this.icone,
+  });
+
+  final String libelle;
+  final bool actif;
+  final VoidCallback onTap;
+  final IconData? icone;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = NovaTokens.of(context);
+    return NovaActivable(
+      onTap: onTap,
+      label: libelle,
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+        decoration: BoxDecoration(
+          color: actif ? t.selection : Colors.transparent,
+          border: Border.all(color: actif ? t.bleu : t.champBordure),
+          borderRadius: BorderRadius.circular(kNovaRayon),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (icone != null) ...[
+              NovaIcone(icone!, taille: 13, couleur: actif ? t.bleu : t.texte2),
+              const SizedBox(width: 6),
+            ],
+            Text(
+              libelle,
+              style:
+                  TextStyle(fontSize: 11.5, color: actif ? t.bleu : t.texte2),
             ),
           ],
         ),

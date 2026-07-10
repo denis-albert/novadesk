@@ -50,7 +50,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use nd_audio::AudioSession;
+use nd_audio::{AudioSession, SourceEmission};
 use nd_capture::{create_capturer, enumerate_monitors, Rect};
 use nd_codec::{
     create_decoder, create_encoder, create_hardware_encoder, CodecKind, ContentProfile,
@@ -62,8 +62,9 @@ use nd_features::{
     PermissionBroker, PermissionSet, ReconnectController, ReconnectPolicy,
 };
 use nd_files::{
-    traiter_requete_liste, ClipboardSync, ReponseListe, RequeteListe, TransferEvent,
-    TransferSession,
+    chemin_local, ecrire_reponse_locale, traiter_requete_fichier, traiter_requete_liste,
+    ClipboardSync, ReponseFichier, ReponseListe, RequeteFichier, RequeteListe, TransferEvent,
+    TransferSession, TAILLE_TRANCHE_MAX,
 };
 use nd_input::{create_injector, InputInjector};
 use nd_proto::{ChannelKind, InputEvent, MonitorId, NdError, NovaId, Reliability, Result};
@@ -75,10 +76,11 @@ use nd_transport::{
 
 use crate::media::{
     decoder_audio, decoder_controle, decoder_demande_admission, decoder_infos_pair,
-    decoder_moniteurs, decoder_permissions, decoder_qualite, decoder_region, encoder_audio,
-    encoder_controle, encoder_demande_admission, encoder_infos_pair, encoder_moniteurs,
-    encoder_permissions, encoder_qualite, encoder_region, Categorie, ChatMessage, CommandeMedia,
-    DemandeAdmissionRecue, DemandeAdmissionSortante, SousTypeControle, MONITEURS_MAX,
+    decoder_moniteurs, decoder_permissions, decoder_qualite, decoder_region, decoder_source_audio,
+    encoder_audio, encoder_controle, encoder_demande_admission, encoder_infos_pair,
+    encoder_moniteurs, encoder_permissions, encoder_qualite, encoder_region, encoder_source_audio,
+    Categorie, ChatMessage, CommandeMedia, DemandeAdmissionRecue, DemandeAdmissionSortante,
+    SousTypeControle, MONITEURS_MAX,
 };
 use crate::p2p::{self, AttenteRendezvous};
 use crate::tunnel::{EtatTunnels, TunnelHandle};
@@ -125,6 +127,15 @@ const DELAI_LISTING_DISTANT: Duration = Duration::from_secs(10);
 /// expirées dont la réponse arrive trop tard) : au-delà, les plus anciennes
 /// sont oubliées — jamais d'accumulation sans borne.
 const REPONSES_LISTING_MAX: usize = 8;
+
+/// Délai maximal d'attente d'**une tranche** de fichier distant
+/// ([`SessionHandle::download_remote_file`]) : borne l'appel bloquant par
+/// tranche même quand l'hôte ne répond jamais (session non étendue, lien mou).
+const DELAI_TRANCHE_FICHIER: Duration = Duration::from_secs(10);
+
+/// Plafond de réponses de tranche de fichier **non réclamées** conservées :
+/// au-delà, les plus anciennes sont oubliées — jamais d'accumulation sans borne.
+const REPONSES_FICHIER_MAX: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Point de contact réseau
@@ -1057,6 +1068,188 @@ impl ListingDistant {
 }
 
 // ---------------------------------------------------------------------------
+// Téléchargement de fichier distant DANS la session (brique `nd_files` routée)
+// ---------------------------------------------------------------------------
+
+/// Réponses de **tranche de fichier distant** reçues du pair (rôle contrôleur),
+/// en attente de leur demandeur : le récepteur média les dépose
+/// ([`SousTypeControle::ReponseFichierDistant`]), la boucle de téléchargement
+/// attend puis réclame la sienne — la **corrélation** se fait par le couple
+/// (chemin, offset), tous deux échoyés tels quels par l'hôte dans la réponse
+/// ([`ReponseFichier::chemin`] / [`ReponseFichier::offset`]).
+struct ReponsesFichier {
+    /// Réponses non encore réclamées, bornées à [`REPONSES_FICHIER_MAX`].
+    recues: Mutex<Vec<ReponseFichier>>,
+    /// Réveille les attentes bloquantes dès qu'une réponse est déposée.
+    reveil: Condvar,
+}
+
+impl ReponsesFichier {
+    fn new() -> Self {
+        ReponsesFichier {
+            recues: Mutex::new(Vec::new()),
+            reveil: Condvar::new(),
+        }
+    }
+
+    /// Dépose une réponse reçue du pair et réveille les attentes. Table pleine,
+    /// la plus ancienne réponse non réclamée est oubliée (demande expirée).
+    fn deposer(&self, reponse: ReponseFichier) {
+        {
+            let mut recues = self.recues.lock().expect("verrou des réponses de fichier");
+            if recues.len() >= REPONSES_FICHIER_MAX {
+                recues.remove(0);
+            }
+            recues.push(reponse);
+        }
+        self.reveil.notify_all();
+    }
+
+    /// Retire toute réponse en attente pour la clé (chemin, offset) : appelé
+    /// **avant** chaque nouvelle demande, pour que la réponse rendue soit bien
+    /// celle de cette demande (pas celle, périmée, d'une demande expirée).
+    fn purger_cle(&self, chemin: &str, offset: u64) {
+        self.recues
+            .lock()
+            .expect("verrou des réponses de fichier")
+            .retain(|reponse| !(reponse.chemin == chemin && reponse.offset == offset));
+    }
+
+    /// Attend (au plus `delai`) puis réclame la réponse corrélée à (chemin,
+    /// offset) ; `None` si rien n'arrive dans le délai.
+    fn attendre(&self, chemin: &str, offset: u64, delai: Duration) -> Option<ReponseFichier> {
+        let echeance = Instant::now() + delai;
+        let mut recues = self.recues.lock().expect("verrou des réponses de fichier");
+        loop {
+            if let Some(position) = recues
+                .iter()
+                .position(|r| r.chemin == chemin && r.offset == offset)
+            {
+                return Some(recues.swap_remove(position));
+            }
+            let restant = echeance.saturating_duration_since(Instant::now());
+            if restant.is_zero() {
+                return None;
+            }
+            let (garde, _delai) = self
+                .reveil
+                .wait_timeout(recues, restant)
+                .expect("verrou des réponses de fichier");
+            recues = garde;
+        }
+    }
+}
+
+/// Client de **téléchargement de fichier distant**, détaché d'une session vivante
+/// (voir [`SessionHandle::remote_download`]) : envoie les requêtes de tranche sur
+/// le canal `Control` chiffré et **reconstitue le fichier localement** par une
+/// boucle synchrone (offset → `fin`), **sans retenir la poignée** — comme
+/// [`ListingDistant`], les façades à table verrouillée (ex. `nd-ffi`) détachent
+/// ce client puis téléchargent hors verrou.
+///
+/// Rôle **contrôleur**, mode étendu ([`SessionOptions::extended_features`])
+/// requis ; ailleurs, la demande n'est jamais servie et l'attente expire
+/// proprement dans le délai borné par tranche.
+#[derive(Clone)]
+pub struct TelechargementDistant {
+    /// File de commandes des threads média (chaque requête de tranche part par
+    /// l'émetteur).
+    commandes: Sender<CommandeMedia>,
+    /// Réponses de tranche déposées par le récepteur média (corrélation par
+    /// chemin + offset).
+    recues: Arc<ReponsesFichier>,
+}
+
+impl TelechargementDistant {
+    /// Télécharge le fichier distant `chemin_distant` **par tranches** et l'écrit
+    /// sous `dossier_local` (le nom local est le composant de base sûr du chemin
+    /// distant, jamais un chemin absolu ni une traversée `..`). Renvoie le
+    /// **chemin local** écrit.
+    ///
+    /// La boucle demande `[offset, offset + `[`TAILLE_TRANCHE_MAX`]`)`, écrit
+    /// chaque tranche reçue ([`nd_files::ecrire_reponse_locale`]) et avance
+    /// `offset` jusqu'au drapeau de fin — délai borné par tranche
+    /// ([`DELAI_TRANCHE_FICHIER`]).
+    ///
+    /// # Errors
+    /// Session terminée, tranche sans réponse dans le délai (session non étendue,
+    /// pair injoignable), **échec côté hôte** (accès refusé sans la permission
+    /// [`Capability::FileDownload`], fichier inexistant…) propagé depuis
+    /// [`ReponseFichier::erreur`], nom de fichier distant inexploitable, ou
+    /// écriture locale impossible.
+    pub fn telecharger(
+        &self,
+        chemin_distant: impl Into<String>,
+        dossier_local: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        let chemin_distant = chemin_distant.into();
+        // Nom local sûr : le dernier composant du chemin distant (séparateurs des
+        // deux plateformes tolérés), assaini par `nd_files::chemin_local`
+        // (anti-traversée : jamais de `..` ni de chemin absolu hors du dossier).
+        let nom = nom_de_base_distant(&chemin_distant);
+        let dest = chemin_local(dossier_local.as_ref(), nom)?;
+
+        let mut offset = 0u64;
+        loop {
+            let reponse =
+                self.telecharger_tranche(&chemin_distant, offset, DELAI_TRANCHE_FICHIER)?;
+            let recu = reponse.donnees.len() as u64;
+            // Écrit la tranche (positionnée à son offset) ; une réponse en erreur
+            // (refus, inexistant…) échoue ici et propage le message de l'hôte.
+            let fin = ecrire_reponse_locale(&dest, &reponse)?;
+            if fin {
+                return Ok(dest);
+            }
+            // Garde-fou anti-boucle : une tranche non finale mais vide ne peut pas
+            // faire progresser l'offset — l'hôte est incohérent, on abandonne.
+            if recu == 0 {
+                return Err(NdError::Protocol(format!(
+                    "tranche vide non finale à l'offset {offset} de « {chemin_distant} » \
+                     (réponse incohérente de l'hôte)"
+                )));
+            }
+            offset += recu;
+        }
+    }
+
+    /// Demande **une** tranche `[offset, offset + `[`TAILLE_TRANCHE_MAX`]`)` du
+    /// fichier distant `chemin` et attend la réponse corrélée (délai borné).
+    fn telecharger_tranche(
+        &self,
+        chemin: &str,
+        offset: u64,
+        delai: Duration,
+    ) -> Result<ReponseFichier> {
+        // Purge des réponses périmées de la même clé (demande précédente
+        // expirée) : la réponse rendue est celle de CETTE demande.
+        self.recues.purger_cle(chemin, offset);
+        self.commandes
+            .send(CommandeMedia::TelechargerFichierDistant(RequeteFichier {
+                chemin: chemin.to_owned(),
+                offset,
+                taille_max: TAILLE_TRANCHE_MAX,
+            }))
+            .map_err(|_| {
+                NdError::Protocol("session terminée : téléchargement distant impossible".to_owned())
+            })?;
+        self.recues.attendre(chemin, offset, delai).ok_or_else(|| {
+            NdError::Protocol(format!(
+                "tranche à l'offset {offset} de « {chemin} » sans réponse dans le délai \
+                 ({} s) — session non étendue, pair injoignable ou parti",
+                delai.as_secs()
+            ))
+        })
+    }
+}
+
+/// Dernier composant d'un chemin **distant** (séparateurs `/` et `\` tolérés,
+/// quelle que soit la plateforme locale) : la base du nom de fichier local
+/// (l'assainissement anti-traversée reste fait par [`nd_files::chemin_local`]).
+fn nom_de_base_distant(chemin: &str) -> &str {
+    chemin.rsplit(['/', '\\']).next().unwrap_or(chemin)
+}
+
+// ---------------------------------------------------------------------------
 // Poignée de session
 // ---------------------------------------------------------------------------
 
@@ -1120,6 +1313,10 @@ pub struct SessionHandle {
     /// récepteur média — corrélation par chemin. Consommées par
     /// [`SessionHandle::list_remote_dir`] / [`SessionHandle::remote_fs`].
     listing_recu: Arc<ReponsesListing>,
+    /// Réponses de tranche de fichier distant reçues (contrôleur), partagées avec
+    /// le récepteur média — corrélation par chemin + offset. Consommées par
+    /// [`SessionHandle::download_remote_file`] / [`SessionHandle::remote_download`].
+    fichier_recu: Arc<ReponsesFichier>,
     compteurs: Arc<CompteursSession>,
     stop: Arc<AtomicBool>,
     pilote: Option<JoinHandle<()>>,
@@ -1340,6 +1537,59 @@ impl SessionHandle {
         }
     }
 
+    /// Télécharge le **fichier distant** `chemin_distant` via la session (rôle
+    /// **contrôleur**, mode étendu) et l'écrit sous `dossier_local` : la boucle
+    /// demande des tranches sur le canal `Control` chiffré
+    /// ([`SousTypeControle::RequeteFichierDistant`]), l'hôte les sert **derrière
+    /// la permission** [`Capability::FileDownload`] (la même que le listing —
+    /// refus ⇒ erreur « accès refusé », jamais de lecture sans droit), et chaque
+    /// tranche reçue est écrite localement ([`nd_files::ecrire_reponse_locale`])
+    /// jusqu'au drapeau de fin. Renvoie le **chemin local** écrit (nom = composant
+    /// de base sûr du chemin distant, sous `dossier_local`).
+    ///
+    /// # Errors
+    /// Session terminée, tranche sans réponse dans le délai (session non étendue,
+    /// pair injoignable), échec côté hôte (accès refusé, fichier inexistant…)
+    /// propagé, ou écriture locale impossible. Voir [`TelechargementDistant::telecharger`].
+    pub fn download_remote_file(
+        &self,
+        chemin_distant: impl Into<String>,
+        dossier_local: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        self.remote_download()
+            .telecharger(chemin_distant, dossier_local)
+    }
+
+    /// Client de téléchargement distant **détachable** ([`TelechargementDistant`]) :
+    /// mêmes effets que [`SessionHandle::download_remote_file`], mais utilisable
+    /// sans retenir la poignée pendant la boucle de tranches (façades à table
+    /// verrouillée).
+    #[must_use]
+    pub fn remote_download(&self) -> TelechargementDistant {
+        TelechargementDistant {
+            commandes: self.commandes_tx.clone(),
+            recues: Arc::clone(&self.fichier_recu),
+        }
+    }
+
+    /// Pilote la **source d'émission audio de l'hôte** : côté **contrôleur**, la
+    /// demande (système / micro / mixé) est transmise à l'hôte, qui applique
+    /// [`nd_audio::AudioSession::definir_source_emission`] à sa session audio
+    /// (sous le verrou audio) ; côté hôte, elle est appliquée directement. Si le
+    /// micro est indisponible côté hôte, nd-audio se replie sur le système —
+    /// l'état réel reste interrogeable côté hôte
+    /// ([`nd_audio::AudioSession::source_emission_courante`]). Sans effet hors
+    /// mode étendu ou si [`Capability::Audio`] n'est pas accordé.
+    ///
+    /// Remarque : c'est le micro **de l'hôte** que le contrôleur entend (source
+    /// d'émission de l'hôte). Le micro contrôleur → hôte serait un flux inverse,
+    /// hors périmètre.
+    pub fn set_audio_source(&self, source: SourceEmission) {
+        let _ = self
+            .commandes_tx
+            .send(CommandeMedia::MajSourceAudio(source));
+    }
+
     /// Ouvre un **tunnel TCP de session** : écoute sur `127.0.0.1:port_local`
     /// (port `0` = éphémère) et relaie chaque connexion locale vers
     /// `cible_distante` **à travers le canal fiable de la session** (l'hôte
@@ -1487,6 +1737,7 @@ impl SessionEngine {
         let moniteurs_recus = Arc::new(Mutex::new(None));
         let infos_pair_recues = Arc::new(Mutex::new(None));
         let listing_recu = Arc::new(ReponsesListing::new());
+        let fichier_recu = Arc::new(ReponsesFichier::new());
 
         let media = Arc::new(EtatMedia {
             role: config.role,
@@ -1516,6 +1767,8 @@ impl SessionEngine {
             infos_pair_recues: Arc::clone(&infos_pair_recues),
             listing_recu: Arc::clone(&listing_recu),
             listing_a_emettre: Mutex::new(Vec::new()),
+            fichier_recu: Arc::clone(&fichier_recu),
+            fichier_a_emettre: Mutex::new(Vec::new()),
         });
 
         let ctx = ContextePilote {
@@ -1550,6 +1803,7 @@ impl SessionEngine {
             moniteurs_recus,
             infos_pair_recues,
             listing_recu,
+            fichier_recu,
             compteurs,
             stop,
             pilote: Some(pilote),
@@ -1636,6 +1890,14 @@ struct EtatMedia {
     /// émetteur ([`envoyer_listings_en_attente`]) — un seul émetteur par côté,
     /// l'ordre des nonces Noise est préservé.
     listing_a_emettre: Mutex<Vec<Vec<u8>>>,
+    /// Réponses de **tranche de fichier** reçues (contrôleur), partagées avec la
+    /// [`SessionHandle`] — corrélation par chemin + offset (voir [`ReponsesFichier`]).
+    fichier_recu: Arc<ReponsesFichier>,
+    /// Réponses de tranche de fichier **encodées** à émettre (hôte) : produites
+    /// par le récepteur (requête → permission → `nd_files::download`), drainées
+    /// par le thread émetteur ([`envoyer_fichiers_en_attente`]) — un seul
+    /// émetteur par côté, l'ordre des nonces Noise est préservé.
+    fichier_a_emettre: Mutex<Vec<Vec<u8>>>,
 }
 
 impl EtatMedia {
@@ -2868,6 +3130,64 @@ fn traiter_controle(media: &EtatMedia, data: &[u8]) {
                 }
             }
         }
+        SousTypeControle::RequeteFichierDistant => {
+            // Requête de tranche de fichier du contrôleur : l'hôte la sert
+            // **derrière la permission vivante** [`Capability::FileDownload`] —
+            // la **même** garde que le listing (refus ⇒ réponse en erreur « accès
+            // refusé », **jamais** de lecture du disque sans droit). La réponse
+            // encodée est mise en file, émise par le thread émetteur (un seul
+            // émetteur par côté : l'ordre des nonces Noise est préservé).
+            if media.role == SessionRole::Controlled {
+                let octets = if media.perms().allows(Capability::FileDownload) {
+                    traiter_requete_fichier(payload)
+                } else {
+                    reponse_fichier_refuse(payload).to_bytes()
+                };
+                media
+                    .fichier_a_emettre
+                    .lock()
+                    .expect("verrou du fichier à émettre")
+                    .push(octets);
+            }
+        }
+        SousTypeControle::ReponseFichierDistant => {
+            // Réponse de tranche de l'hôte : déposée pour l'attente corrélée
+            // ([`SessionHandle::download_remote_file`]). Une réponse illisible
+            // (trame hostile ou tronquée) est ignorée sans paniquer.
+            if media.role == SessionRole::Controller {
+                if let Ok(reponse) = ReponseFichier::from_bytes(payload) {
+                    media.fichier_recu.deposer(reponse);
+                }
+            }
+        }
+        SousTypeControle::MajSourceAudio => {
+            // Le contrôleur pilote la source d'émission audio de l'hôte : l'hôte
+            // applique `definir_source_emission` à sa session audio (sous le
+            // verrou audio existant). Micro absent ⇒ repli système (nd-audio).
+            if media.role == SessionRole::Controlled {
+                if let Some(source) = decoder_source_audio(payload) {
+                    if let Some(audio) = media.audio.lock().expect("verrou audio").as_mut() {
+                        let _ = audio.definir_source_emission(source);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Réponse de tranche « accès refusé » : le chemin et l'offset de la requête sont
+/// échoyés tels quels (corrélation côté contrôleur) mais **aucun** octet n'est lu
+/// — le refus de [`Capability::FileDownload`] ne laisse rien fuiter du disque.
+fn reponse_fichier_refuse(requete: &[u8]) -> ReponseFichier {
+    let (chemin, offset) = RequeteFichier::from_bytes(requete)
+        .map(|r| (r.chemin, r.offset))
+        .unwrap_or_default();
+    ReponseFichier {
+        chemin,
+        offset,
+        donnees: Vec::new(),
+        fin: false,
+        erreur: Some("accès refusé (capacité « récupérer des fichiers » non accordée)".to_owned()),
     }
 }
 
@@ -3085,6 +3405,36 @@ fn traiter_commandes(
                     let _ = transport.send(canal_controle, trame, Reliability::Reliable);
                 }
             }
+            CommandeMedia::TelechargerFichierDistant(requete) => {
+                // Rôle contrôleur : la requête de tranche part sur le canal
+                // `Control` fiable ; la réponse reviendra par le récepteur
+                // ([`SousTypeControle::ReponseFichierDistant`] → [`ReponsesFichier`]).
+                // Côté hôte, la commande est sans objet (il lit ses propres
+                // fichiers sans passer par la session).
+                if media.role == SessionRole::Controller {
+                    let trame = encoder_controle(
+                        SousTypeControle::RequeteFichierDistant,
+                        &requete.to_bytes(),
+                    );
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+            }
+            CommandeMedia::MajSourceAudio(source) => match media.role {
+                // Le contrôleur demande la source à l'hôte ; l'hôte l'applique
+                // directement à sa session audio (sous le verrou audio).
+                SessionRole::Controller => {
+                    let trame = encoder_controle(
+                        SousTypeControle::MajSourceAudio,
+                        &encoder_source_audio(source),
+                    );
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+                SessionRole::Controlled => {
+                    if let Some(audio) = media.audio.lock().expect("verrou audio").as_mut() {
+                        let _ = audio.definir_source_emission(source);
+                    }
+                }
+            },
         }
     }
 }
@@ -3180,6 +3530,33 @@ fn envoyer_listings_en_attente(
     };
     for octets in reponses {
         let trame = encoder_controle(SousTypeControle::ReponseFs, &octets);
+        if transport
+            .send(canal_controle, trame, Reliability::Reliable)
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Émet les réponses de **tranche de fichier distant** en attente (canal
+/// `Control`, sous-type [`SousTypeControle::ReponseFichierDistant`]), produites
+/// par le récepteur hôte derrière la permission
+/// ([`SousTypeControle::RequeteFichierDistant`]).
+fn envoyer_fichiers_en_attente(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    let reponses: Vec<Vec<u8>> = {
+        let mut garde = media
+            .fichier_a_emettre
+            .lock()
+            .expect("verrou du fichier à émettre");
+        std::mem::take(&mut *garde)
+    };
+    for octets in reponses {
+        let trame = encoder_controle(SousTypeControle::ReponseFichierDistant, &octets);
         if transport
             .send(canal_controle, trame, Reliability::Reliable)
             .is_err()
@@ -3424,6 +3801,7 @@ fn emetteur_features_hote(
         envoyer_annotations_en_attente(&mut transport, canal_controle, media);
         envoyer_tunnels_en_attente(&mut transport, canal_controle, media);
         envoyer_listings_en_attente(&mut transport, canal_controle, media);
+        envoyer_fichiers_en_attente(&mut transport, canal_controle, media);
         annoncer_confidentialite(
             &mut transport,
             canal_controle,

@@ -190,6 +190,43 @@
 //!    fonctions sont **synchrones à DTO plats** — donc **aucun `pont_provisoire`
 //!    n'est requis** ; le codegen produira leurs `SseEncode`/`SseDecode` à la
 //!    régénération.
+//!
+//! **Lot « routage UI : téléchargement, micro, invitations » (nouvelles)** —
+//! trois briques déjà livrées, mises à portée du Dart :
+//! 1. **Téléchargement de fichier distant** — `session_download_file(session_id,
+//!    chemin_distant, dossier_local) -> String` : routé DANS la session par
+//!    `nd-core` (sous-types `Control` additifs `RequeteFichierDistant` /
+//!    `ReponseFichierDistant`, réponse corrélée par chemin + offset, délai borné
+//!    par tranche), servi par l'hôte **derrière la même permission**
+//!    fichiers/réception (`fichiers_reception`) que le listing — refus ⇒
+//!    `Err("… accès refusé …")`, jamais de contenu sans droit. Boucle synchrone
+//!    interne (offset → `fin`, écriture locale via
+//!    `nd_files::ecrire_reponse_locale`) ; renvoie le **chemin local écrit**.
+//! 2. **Micro de l'hôte** — `session_set_audio_source(session_id, mode) ->
+//!    ()` (`mode ∈ systeme | micro | mixe`) : le contrôleur pilote la **source
+//!    d'émission audio de l'hôte** (sous-type `Control` additif `MajSourceAudio`),
+//!    que l'hôte applique via `nd_audio::AudioSession::definir_source_emission`
+//!    (repli système si le micro manque, géré par nd-audio). C'est le micro **de
+//!    l'hôte** que le contrôleur entend ; le micro contrôleur → hôte serait un
+//!    flux inverse, **hors périmètre**.
+//! 3. **Invitations éphémères** — magasin **persistant** (module [`etat`],
+//!    enveloppe `nd_features::invite`) : `create_invite(profil, ttl_minutes) ->
+//!    String` (génère/persiste un code usage-unique + profil + expiration),
+//!    `list_invites() -> Vec<InviteDto>` (actives : non expirées/non consommées),
+//!    `revoke_invite(code)`. Le magasin est **branché dans le vérificateur
+//!    d'admission** de l'hôte non surveillé (`start_unattended_host` passe
+//!    désormais par `nd_core::UnattendedHost::start_with_admission_enrichie` avec
+//!    un `verif_invitation` adossé au magasin) : un contrôleur qui présente le
+//!    code via le champ **additif** `SessionOptionsDto.invitation: Option<String>`
+//!    est admis **avec le profil de l'invitation**, puis le code est **consommé**.
+//!
+//! DTO **neuf** (que la régénération ajoutera) : `InviteDto` (`code`, `profil`,
+//! `expire_dans_s`). Les fonctions ci-dessus sont **synchrones à DTO plats**
+//! (aucun `StreamSink`) — donc **aucun `pont_provisoire` n'est requis**. **Stopgap
+//! `frb_generated.rs`** : `SessionOptionsDto` gagne le champ additif `invitation`
+//! ; seul l'`impl SseDecode` (littéral exhaustif) a été complété sur place
+//! (`invitation: None`, marqué « lot routage UI ») — le Dart courant ne transmet
+//! pas encore ce champ ; la régénération l'exposera et l'écrasera à l'identique.
 
 // Binding généré par `flutter_rust_bridge_codegen generate` (config dans
 // `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit

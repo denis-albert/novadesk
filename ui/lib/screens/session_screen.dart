@@ -23,18 +23,22 @@
 /// permissions renégociées **à chaud** (`session_set_permission`), préréglage
 /// de qualité (`session_set_quality`), enregistrement à chaud
 /// (`session_set_recording`), liste des **moniteurs réels** de l'hôte
-/// (`session_monitors` → sous-menu écrans) et **infos système du pair**
-/// (`session_peer_info` → panneau d'infos).
+/// (`session_monitors` → sous-menu écrans), **infos système du pair**
+/// (`session_peer_info` → panneau d'infos) et **source d'émission audio de
+/// l'hôte** (`session_set_audio_source` → sélecteur Système / Micro /
+/// Système + micro du popover Permissions).
 ///
 /// Volet de transfert : le côté **distant** est un navigateur réel du poste
 /// hôte (`session_list_remote_dir` — racines/lecteurs, dossiers d'abord,
 /// tailles et dates, fil d'Ariane cliquable, remontée, rechargement) ; le côté
-/// local et l'envoi (`send_files`) sont inchangés, le téléchargement depuis le
-/// distant reste « à venir » (aucune façade ne l'expose).
+/// local et l'envoi (`send_files`) sont inchangés, et un clic sur un fichier
+/// distant le **télécharge réellement** (`session_download_file`) vers le
+/// dossier « Téléchargements » local (indicateur sur la ligne le temps du
+/// transfert, toast avec le chemin local écrit).
 library;
 
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show Directory, Platform;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -192,6 +196,10 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   /// Garde anti-course : seul le dernier listing demandé est appliqué.
   int _generationListingDistant = 0;
 
+  /// Chemins distants en cours de téléchargement (`session_download_file`) :
+  /// indicateur sur la ligne du fichier et garde anti double-clic.
+  final Set<String> _telechargementsEnCours = <String>{};
+
   /// Trame vidéo courante décodée en `ui.Image`, peinte par [_PeintreVideo].
   final ValueNotifier<ui.Image?> _trameCourante = ValueNotifier<ui.Image?>(null);
 
@@ -247,6 +255,11 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   /// Mode confidentialité **réel** : reflet local de `privacy_active`, piloté
   /// par `set_privacy` (rideau noir côté hôte).
   bool _permConfidentialite = false;
+
+  /// Source d'émission audio de l'hôte entendue ici — reflet local du choix
+  /// appliqué via `session_set_audio_source` (`systeme` = défaut du cœur :
+  /// audio système seul).
+  String _sourceAudio = 'systeme';
 
   // --- Plan de contrôle de session (lot « contrôles de session ») -----------
 
@@ -1095,13 +1108,14 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   }
 
   /// Clic sur une entrée distante : un dossier se liste (navigation), un
-  /// fichier reste honnêtement « à venir » (aucune façade de téléchargement).
+  /// fichier se **télécharge** vers le dossier « Téléchargements » local
+  /// (`session_download_file`).
   void _ouvrirEntreeDistante(EntreeFsDto e) {
     if (e.estDossier) {
       unawaited(_chargerRepertoireDistant(
           _joindreCheminDistant(_cheminDistant, e.nom)));
     } else {
-      _aVenir('Téléchargement depuis le poste distant');
+      unawaited(_telechargerFichierDistant(e));
     }
   }
 
@@ -1109,6 +1123,74 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   void _remonterDossierDistant() {
     final parent = _parentCheminDistant(_cheminDistant);
     if (parent != null) unawaited(_chargerRepertoireDistant(parent));
+  }
+
+  /// Dossier local de dépôt des téléchargements distants : « Downloads » du
+  /// profil utilisateur (`USERPROFILE` sous Windows, `HOME` ailleurs) s'il
+  /// existe, sinon le profil lui-même ; `null` si aucun profil n'est résolu
+  /// (environnement exotique) — l'appelant affiche alors une erreur.
+  static String? _dossierTelechargements() {
+    String profil;
+    try {
+      profil = Platform.environment['USERPROFILE'] ??
+          Platform.environment['HOME'] ??
+          '';
+    } catch (_) {
+      return null; // environnement illisible sur cette plateforme
+    }
+    while (profil.endsWith('\\') || profil.endsWith('/')) {
+      profil = profil.substring(0, profil.length - 1);
+    }
+    if (profil.isEmpty) return null;
+    final separateur = profil.contains('\\') ? '\\' : '/';
+    final telechargements = '$profil${separateur}Downloads';
+    try {
+      if (Directory(telechargements).existsSync()) return telechargements;
+    } catch (_) {
+      // Sonde impossible : repli sur le profil lui-même.
+    }
+    return profil;
+  }
+
+  /// Télécharge le fichier distant [e] (du dossier affiché) via
+  /// `session_download_file` vers le dossier « Téléchargements » local —
+  /// asynchrone et **non bloquant** : la ligne du fichier porte un indicateur
+  /// le temps des tranches (le fichier peut être gros), puis toast avec le
+  /// **chemin local réellement écrit** par le cœur, ou toast d'erreur (refus
+  /// de l'hôte, permission manquante, écriture locale impossible).
+  Future<void> _telechargerFichierDistant(EntreeFsDto e) async {
+    final id = _sessionId;
+    if (id == null) {
+      _informer('Téléchargement : session non démarrée.');
+      return;
+    }
+    final cheminDistant = _joindreCheminDistant(_cheminDistant, e.nom);
+    if (_telechargementsEnCours.contains(cheminDistant)) {
+      _informer('Téléchargement de « ${e.nom} » déjà en cours…');
+      return;
+    }
+    final dossierLocal = _dossierTelechargements();
+    if (dossierLocal == null) {
+      _informer('Téléchargement : profil utilisateur introuvable '
+          '(aucun dossier local de dépôt).');
+      return;
+    }
+    setState(() => _telechargementsEnCours.add(cheminDistant));
+    try {
+      final cheminLocal =
+          await _api.sessionDownloadFile(id, cheminDistant, dossierLocal);
+      if (mounted) NovaToast.montrer(context, 'Téléchargé → $cheminLocal');
+    } catch (err) {
+      if (mounted) {
+        _informer('Téléchargement de « ${e.nom} » : ${_messageErreur(err)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _telechargementsEnCours.remove(cheminDistant));
+      } else {
+        _telechargementsEnCours.remove(cheminDistant);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1902,6 +1984,18 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
           coche: _permAudio,
           onTap: _basculerAudio,
         ),
+        // Sélecteur de la source d'émission audio de l'hôte (choix unique,
+        // même langage visuel que les préréglages) — `session_set_audio_source`.
+        const _PopHeader("Source audio de l'hôte"),
+        for (final (mode, libelle, infobulle) in _sourcesAudioProposees)
+          Tooltip(
+            message: infobulle,
+            child: _PopItem(
+              texte: libelle,
+              selectionne: _sourceAudio == mode,
+              onTap: () => unawaited(_choisirSourceAudio(mode)),
+            ),
+          ),
         _PopItem(
           icone: NovaIcones.dossier,
           texte: 'Autoriser le transfert de fichiers',
@@ -1996,6 +2090,53 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     final id = _sessionId;
     if (id != null) {
       unawaited(_api.setAudioEnabled(id, _permAudio));
+    }
+  }
+
+  /// Choix de source d'émission audio de l'hôte : mode du contrat
+  /// `session_set_audio_source` → libellé du sélecteur et infobulle. « Micro »
+  /// est bien le microphone **de l'hôte distant** entendu ici — l'envoi du
+  /// micro du contrôleur vers l'hôte n'existe pas encore.
+  static const List<(String, String, String)> _sourcesAudioProposees = [
+    ('systeme', 'Système', 'Audio système du poste distant.'),
+    (
+      'micro',
+      'Micro',
+      "Microphone de l'hôte distant — le micro de ce poste n'est pas transmis.",
+    ),
+    (
+      'mixe',
+      'Système + micro',
+      "Audio système et microphone de l'hôte distant, mélangés.",
+    ),
+  ];
+
+  /// Applique la **source d'émission audio de l'hôte**
+  /// (`session_set_audio_source`) : choix reflété tout de suite dans le
+  /// sélecteur, puis envoi au cœur ; si le cœur refuse, **retour au choix
+  /// précédent** et message français en toast. Sans effet audible tant que
+  /// « Entendre le son distant » est décoché (le cœur mémorise le choix).
+  Future<void> _choisirSourceAudio(String mode) async {
+    if (mode == _sourceAudio) return;
+    final id = _sessionId;
+    if (id == null) {
+      _informer('Source audio : session non démarrée.');
+      return;
+    }
+    final precedente = _sourceAudio;
+    setState(() => _sourceAudio = mode);
+    _rafraichirPopover();
+    try {
+      await _api.sessionSetAudioSource(id, mode);
+      if (!mounted) return;
+      final libelle =
+          _sourcesAudioProposees.firstWhere((s) => s.$1 == mode).$2;
+      NovaToast.montrer(context, 'Source audio : $libelle.');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sourceAudio = precedente);
+      _rafraichirPopover();
+      _informer('Source audio : ${_messageErreur(e)}');
     }
   }
 
@@ -3119,6 +3260,9 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
             icone: _iconeEntreeDistante(e),
             nom: e.nom,
             taille: _detailEntreeDistante(e),
+            enCours: !e.estDossier &&
+                _telechargementsEnCours
+                    .contains(_joindreCheminDistant(_cheminDistant, e.nom)),
             onTap: () => _ouvrirEntreeDistante(e),
           ),
       ],
@@ -3653,18 +3797,22 @@ class _PopItemState extends State<_PopItem> {
 /// Élément de fichier dans un volet de transfert (maquette `.fitem`).
 /// [onTap] (facultatif) rend la ligne activable — navigation du volet distant
 /// (clic sur un dossier) sans changer le rendu des lignes purement locales.
+/// [enCours] affiche un indicateur indéterminé devant le détail le temps d'un
+/// téléchargement distant (la façade ne publie pas de progression par tranche).
 class _ElementFichier extends StatefulWidget {
   const _ElementFichier({
     required this.icone,
     required this.nom,
     required this.taille,
     this.onTap,
+    this.enCours = false,
   });
 
   final IconData icone;
   final String nom;
   final String taille;
   final VoidCallback? onTap;
+  final bool enCours;
 
   @override
   State<_ElementFichier> createState() => _ElementFichierState();
@@ -3696,6 +3844,15 @@ class _ElementFichierState extends State<_ElementFichier> {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(fontSize: 12.5, color: t.texte)),
               ),
+              if (widget.enCours) ...[
+                SizedBox(
+                  width: 11,
+                  height: 11,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 1.5, color: t.texte3),
+                ),
+                const SizedBox(width: 6),
+              ],
               Text(widget.taille,
                   style: TextStyle(fontSize: 11, color: t.texte3)),
             ],

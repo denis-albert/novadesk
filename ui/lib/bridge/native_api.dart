@@ -557,6 +557,7 @@ class SessionOptionsDto {
     this.transferDir,
     this.transportReconnect = true,
     this.motDePasse,
+    this.invitation,
   });
 
   /// Permissions granulaires appliquées avant chaque injection d'entrée
@@ -595,6 +596,15 @@ class SessionOptionsDto {
   /// voir [NativeApi.verifyUnattendedPassword]).
   final String? motDePasse;
 
+  /// **Code d'invitation éphémère** présenté à un hôte « accès non surveillé »
+  /// (rôle contrôleur) ; `null` (défaut) = pas d'invitation. Transmis dans le
+  /// canal `Control` déjà chiffré, il est validé par l'hôte contre son magasin
+  /// persistant ([NativeApi.createInvite]) : s'il est valide (non expiré, non
+  /// déjà consommé), la session est admise **avec le profil de l'invitation**
+  /// puis le code est **consommé** (usage unique) ; invalide, elle est refusée
+  /// sans solliciter le dialogue manuel. Sans effet sur un hôte classique.
+  final String? invitation;
+
   @override
   bool operator ==(Object other) =>
       other is SessionOptionsDto &&
@@ -604,19 +614,22 @@ class SessionOptionsDto {
       other.extendedFeatures == extendedFeatures &&
       other.transferDir == transferDir &&
       other.transportReconnect == transportReconnect &&
-      other.motDePasse == motDePasse;
+      other.motDePasse == motDePasse &&
+      other.invitation == invitation;
 
   @override
   int get hashCode => Object.hash(permissions, recordingPath, deltaMode,
-      extendedFeatures, transferDir, transportReconnect, motDePasse);
+      extendedFeatures, transferDir, transportReconnect, motDePasse,
+      invitation);
 
   @override
   String toString() => 'SessionOptionsDto(permissions: $permissions, '
       'recordingPath: $recordingPath, deltaMode: $deltaMode, '
       'extendedFeatures: $extendedFeatures, transferDir: $transferDir, '
       'transportReconnect: $transportReconnect, '
-      // Secret jamais restitué en clair dans les journaux.
-      'motDePasse: ${motDePasse == null ? 'null' : '«masqué»'})';
+      // Secrets jamais restitués en clair dans les journaux.
+      'motDePasse: ${motDePasse == null ? 'null' : '«masqué»'}, '
+      'invitation: ${invitation == null ? 'null' : '«masqué»'})';
 }
 
 /// Demande d'accès entrante vers un hôte « accès non surveillé », poussée par
@@ -1350,6 +1363,49 @@ class DiscoveredPeerDto {
 }
 
 // ---------------------------------------------------------------------------
+// Admission automatique : invitations éphémères
+// (lot « admission & invitations »).
+//
+// Miroir du DTO de `nd-ffi`. Comme pour [EntreeFsDto], l'adaptateur FRB
+// convertit le type généré (`u64` exposé en `BigInt`) vers ce miroir écrit à
+// la main (`int` Dart).
+// ---------------------------------------------------------------------------
+
+/// Une invitation éphémère **active** (non expirée, non consommée), telle que
+/// rendue par [NativeApi.listInvites] (miroir de `nd_ffi::InviteDto`).
+class InviteDto {
+  const InviteDto({
+    required this.code,
+    required this.profil,
+    required this.expireDansS,
+  });
+
+  /// Code lisible au format `XXX-XXX-XXX` (à dicter au technicien).
+  final String code;
+
+  /// Profil de permissions accordé à l'admission : `observation`, `standard`
+  /// ou `controle_total` (voir [NativeApi.createInvite]).
+  final String profil;
+
+  /// Secondes restantes avant expiration (0 = sur le point d'expirer).
+  final int expireDansS;
+
+  @override
+  bool operator ==(Object other) =>
+      other is InviteDto &&
+      other.code == code &&
+      other.profil == profil &&
+      other.expireDansS == expireDansS;
+
+  @override
+  int get hashCode => Object.hash(code, profil, expireDansS);
+
+  @override
+  String toString() =>
+      'InviteDto(code: $code, profil: $profil, expireDansS: $expireDansS)';
+}
+
+// ---------------------------------------------------------------------------
 // Interface de la façade
 // ---------------------------------------------------------------------------
 
@@ -1497,6 +1553,16 @@ abstract interface class NativeApi {
   /// Miroir de `nd_ffi::set_audio_enabled`.
   Future<void> setAudioEnabled(int id, bool actif);
 
+  /// Pilote la **source d'émission audio de l'hôte** entendue par le
+  /// contrôleur : [mode] ∈ `systeme` (audio système seul), `micro` (microphone
+  /// de l'hôte seul) ou `mixe` (les deux mélangés) — c'est bien le micro **de
+  /// l'hôte** que le contrôleur entend ; s'il est indisponible côté hôte,
+  /// repli sur le système. Tout autre mode lève [NovaApiException] (message
+  /// français listant les valeurs acceptées). Sans effet hors mode étendu ou
+  /// si la permission audio n'est pas accordée. Miroir de
+  /// `nd_ffi::session_set_audio_source`.
+  Future<void> sessionSetAudioSource(int sessionId, String mode);
+
   /// Demande à l'hôte de diffuser le **moniteur** d'index [moniteur] (bascule
   /// multi-écran ; un index hors bornes est ignoré au mieux). Miroir de
   /// `nd_ffi::switch_monitor`.
@@ -1610,6 +1676,16 @@ abstract interface class NativeApi {
   /// clé est vide. Miroir de `nd_ffi::set_setting`.
   Future<void> setSetting({required String cle, required String valeur});
 
+  /// Applique le réglage « **démarrer avec le système** » **sans droits
+  /// administrateur** : ajoute (si [actif]) ou retire l'entrée `NovaDesk` de
+  /// la clé de registre `Run` de l'utilisateur, pointant sur l'exécutable
+  /// courant. À appeler quand l'utilisateur bascule le réglage (c'est aussi
+  /// fait automatiquement par [setSetting] quand la clé
+  /// `demarrer_avec_systeme` change) ; hors Windows : sans effet. Lève
+  /// [NovaApiException] si l'écriture du registre échoue. Miroir de
+  /// `nd_ffi::apply_autostart`.
+  Future<void> applyAutostart({required bool actif});
+
   /// Journalise le démarrage d'une session (à appeler au moment de se
   /// connecter) : entrée en tête de l'historique (dédupliquée par `id`, bornée)
   /// et dernière connexion du contact rafraîchie. Miroir de
@@ -1655,6 +1731,55 @@ abstract interface class NativeApi {
   /// Renvoie le journal des accès, du plus récent au plus ancien. Miroir de
   /// `nd_ffi::access_log`.
   Future<List<AccessLogEntryDto>> accessLog();
+
+  // -------------------------------------------------------------------------
+  // Admission automatique : liste blanche (ACL) et invitations éphémères
+  // (lot « admission & invitations ») — consultées par le vérificateur
+  // d'admission de l'hôte non surveillé ; l'ensemble admis sans mot de passe
+  // vaut liste blanche ∪ appareils de confiance ([addTrustedDevice]).
+  // -------------------------------------------------------------------------
+
+  /// Renvoie la **liste blanche d'admission** (ID admis **sans mot de passe**
+  /// en accès non surveillé), dans l'ordre d'ajout. Miroir de
+  /// `nd_ffi::list_admission_allowlist`.
+  Future<List<int>> listAdmissionAllowlist();
+
+  /// Ajoute un ID à la liste blanche d'admission (sans effet s'il y figure
+  /// déjà) : il sera dès lors admis **sans mot de passe** en accès non
+  /// surveillé. Miroir de `nd_ffi::add_admission_allowed`.
+  Future<void> addAdmissionAllowed({required int id});
+
+  /// Retire un ID de la liste blanche d'admission ; lève [NovaApiException]
+  /// s'il n'y figure pas. Miroir de `nd_ffi::remove_admission_allowed`.
+  Future<void> removeAdmissionAllowed({required int id});
+
+  /// Crée une **invitation éphémère** à usage unique et la persiste : génère
+  /// un code court lisible (format `XXX-XXX-XXX`), l'associe à [profil] et à
+  /// une expiration à [ttlMinutes] d'ici, puis renvoie le **code** — à
+  /// communiquer au technicien, dont le contrôleur le présentera via
+  /// [SessionOptionsDto.invitation] ; l'hôte admettra la session avec le
+  /// profil de l'invitation puis **consommera** le code (usage unique).
+  ///
+  /// [profil] fixe les permissions accordées à l'admission : `observation`
+  /// (voir l'écran seulement), `standard` (écran + souris + clavier +
+  /// presse-papiers) ou `controle_total` (toutes les capacités) ; tout autre
+  /// profil lève [NovaApiException] (message français listant les valeurs
+  /// acceptées). Miroir de `nd_ffi::create_invite`.
+  Future<String> createInvite({
+    required String profil,
+    required int ttlMinutes,
+  });
+
+  /// Liste les **invitations actives** (non expirées, non consommées),
+  /// chacune avec son code, son profil et le temps restant ; liste vide si
+  /// aucune n'est active. Miroir de `nd_ffi::list_invites`.
+  Future<List<InviteDto>> listInvites();
+
+  /// **Révoque** (supprime) l'invitation de code [code] avant son expiration :
+  /// un contrôleur qui la présenterait ensuite serait refusé. Lève
+  /// [NovaApiException] si le code est inconnu (déjà révoqué, consommé ou
+  /// expiré). Miroir de `nd_ffi::revoke_invite`.
+  Future<void> revokeInvite({required String code});
 
   // -------------------------------------------------------------------------
   // Capacités avancées de session (lot « capacités moteur ») — chacune gardée
@@ -1791,6 +1916,28 @@ abstract interface class NativeApi {
   /// chemin qui n'est pas un dossier…) — jamais de liste partielle trompeuse.
   /// Miroir de `nd_ffi::session_list_remote_dir`.
   Future<List<EntreeFsDto>> sessionListRemoteDir(int sessionId, String chemin);
+
+  /// Télécharge le **fichier distant** [cheminDistant] à travers la session
+  /// (rôle contrôleur, mode étendu) et l'écrit sous [dossierLocal] : la
+  /// requête part **par tranches** sur le canal `Control` chiffré, l'hôte les
+  /// sert derrière la permission `fichiers_reception` (la même que le listing
+  /// [sessionListRemoteDir]) et chaque tranche reçue est écrite localement
+  /// jusqu'à la fin du fichier, sans bloquer les autres appels de session.
+  ///
+  /// Renvoie le **chemin local écrit** (nom = composant de base sûr du chemin
+  /// distant, sous [dossierLocal] ; jamais de traversée `..` ni de chemin
+  /// absolu).
+  ///
+  /// Lève [NovaApiException] si la session est inconnue ou terminée, sans
+  /// réponse dans le délai (session non étendue, pair injoignable), sur
+  /// **refus de l'hôte** (accès refusé sans la permission, fichier
+  /// inexistant…) ou si l'écriture locale échoue. Miroir de
+  /// `nd_ffi::session_download_file`.
+  Future<String> sessionDownloadFile(
+    int sessionId,
+    String cheminDistant,
+    String dossierLocal,
+  );
 
   // -------------------------------------------------------------------------
   // Réseau annexe : Wake-on-LAN

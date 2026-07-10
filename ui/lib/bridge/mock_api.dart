@@ -359,6 +359,7 @@ class MockNativeApi implements NativeApi {
     _confidentialite.remove(id);
     _regions.remove(id);
     _enregistrementsAChaud.remove(id);
+    _sourcesAudio.remove(id);
   }
 
   // -------------------------------------------------------------------------
@@ -493,6 +494,31 @@ class MockNativeApi implements NativeApi {
     basculesMoniteur.add((id: id, moniteur: moniteur));
     debugPrint('MockNativeApi.switchMonitor(session $id) → moniteur $moniteur');
   }
+
+  /// Modes de source audio acceptés par [sessionSetAudioSource] (contrat UI
+  /// stable, aligné sur `nd_ffi::flux::source_audio_depuis_mode`).
+  static const List<String> _modesSourceAudio = ['systeme', 'micro', 'mixe'];
+
+  /// Source d'émission audio mémorisée par session (absent = défaut du cœur :
+  /// audio système seul).
+  final Map<int, String> _sourcesAudio = {};
+
+  @override
+  Future<void> sessionSetAudioSource(int sessionId, String mode) async {
+    // L'analyse du mode précède tout accès à la session, mêmes messages
+    // français que le cœur (`source_audio_depuis_mode`).
+    if (!_modesSourceAudio.contains(mode)) {
+      throw NovaApiException(
+          'source audio inconnue : « $mode » (attendu : systeme, micro, mixe)');
+    }
+    _sourcesAudio[sessionId] = mode;
+    debugPrint(
+        'MockNativeApi.sessionSetAudioSource(session $sessionId) → $mode');
+  }
+
+  /// Source d'émission audio active d'une session (**observable par les
+  /// tests**) ; `null` si jamais pilotée (défaut du cœur : audio système seul).
+  String? sourceAudio(int sessionId) => _sourcesAudio[sessionId];
 
   /// Nom de fichier depuis un chemin (séparateurs `/` ou `\`).
   static String _nomFichier(String chemin) {
@@ -879,6 +905,21 @@ class MockNativeApi implements NativeApi {
     _reglages[cle] = valeur;
   }
 
+  /// Dernier état **appliqué** du démarrage avec le système ; `null` tant que
+  /// [applyAutostart] n'a jamais été appelé.
+  bool? _autostart;
+
+  /// État appliqué du démarrage avec le système (**observable par les
+  /// tests**) ; le cœur réel, lui, écrit l'entrée de registre `Run`.
+  bool? get autostartApplique => _autostart;
+
+  @override
+  Future<void> applyAutostart({required bool actif}) async {
+    _autostart = actif;
+    debugPrint('MockNativeApi.applyAutostart → '
+        '${actif ? 'activé' : 'désactivé'}');
+  }
+
   @override
   Future<void> recordSession({required int id, required String alias}) async {
     final maintenant = _ilYa();
@@ -965,6 +1006,109 @@ class MockNativeApi implements NativeApi {
   @override
   Future<List<AccessLogEntryDto>> accessLog() async =>
       List.unmodifiable(_journalAcces);
+
+  // -------------------------------------------------------------------------
+  // Admission automatique — liste blanche (ACL) et invitations éphémères EN
+  // MÉMOIRE : mêmes validations et messages français que le cœur
+  // (`admission_retirer`, `profil_invitation_bits`, `revoquer_invitation`).
+  // -------------------------------------------------------------------------
+
+  /// Liste blanche d'admission (ID admis **sans mot de passe** en accès non
+  /// surveillé) ; le `Set` ordonné (insertion) reproduit l'« ordre d'ajout »
+  /// du cœur. Pré-peuplée d'un appareil hors liste de confiance (l'admission
+  /// réunit les deux listes).
+  final Set<int> _admissionAutorisee = {730118902};
+
+  /// Profils d'invitation acceptés par [createInvite] (contrat UI stable,
+  /// aligné sur `nd_ffi::flux::profil_invitation_bits`).
+  static const List<String> _profilsInvitation = [
+    'observation',
+    'standard',
+    'controle_total',
+  ];
+
+  /// Alphabet des codes d'invitation : 32 symboles sans caractères ambigus
+  /// (ni `I`, `O`, `0`, `1`), comme `nd_features::invite::CODE_ALPHABET`.
+  static const String _alphabetInvitation = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+  /// Invitations actives : code → profil accordé + instant d'expiration (le
+  /// temps restant [InviteDto.expireDansS] est recalculé à chaque listage,
+  /// comme le cœur).
+  final Map<String, ({String profil, DateTime expire})> _invitations = {};
+
+  @override
+  Future<List<int>> listAdmissionAllowlist() async =>
+      List.unmodifiable(_admissionAutorisee);
+
+  @override
+  Future<void> addAdmissionAllowed({required int id}) async {
+    // Sans effet si l'ID y figure déjà, comme le cœur.
+    _admissionAutorisee.add(id);
+  }
+
+  @override
+  Future<void> removeAdmissionAllowed({required int id}) async {
+    if (!_admissionAutorisee.remove(id)) {
+      throw NovaApiException(
+          "l'appareil ${_formater(id)} n'est pas dans la liste blanche "
+          "d'admission");
+    }
+  }
+
+  @override
+  Future<String> createInvite({
+    required String profil,
+    required int ttlMinutes,
+  }) async {
+    // La validation du profil précède toute écriture (comme le cœur).
+    if (!_profilsInvitation.contains(profil)) {
+      throw NovaApiException("profil d'invitation inconnu : « $profil » "
+          '(attendu : observation, standard, controle_total)');
+    }
+    final maintenant = DateTime.now();
+    // Purge les invitations expirées au passage (le magasin ne gonfle pas).
+    _invitations.removeWhere((_, i) => !i.expire.isAfter(maintenant));
+    // Code lisible `XXX-XXX-XXX` (le cœur réel tire du CSPRNG ; unique dans
+    // le magasin pour que la démo reste cohérente).
+    String code;
+    do {
+      code = List.generate(
+        3,
+        (_) => List.generate(
+          3,
+          (_) => _alphabetInvitation[_alea.nextInt(_alphabetInvitation.length)],
+        ).join(),
+      ).join('-');
+    } while (_invitations.containsKey(code));
+    _invitations[code] = (
+      profil: profil,
+      expire: maintenant.add(Duration(minutes: ttlMinutes)),
+    );
+    return code;
+  }
+
+  @override
+  Future<List<InviteDto>> listInvites() async {
+    final maintenant = DateTime.now();
+    return [
+      for (final entree in _invitations.entries)
+        if (entree.value.expire.isAfter(maintenant))
+          InviteDto(
+            code: entree.key,
+            profil: entree.value.profil,
+            expireDansS: entree.value.expire.difference(maintenant).inSeconds,
+          ),
+    ];
+  }
+
+  @override
+  Future<void> revokeInvite({required String code}) async {
+    if (_invitations.remove(code) == null) {
+      throw NovaApiException(
+          'invitation « $code » inconnue (déjà révoquée, consommée ou '
+          'expirée)');
+    }
+  }
 
   // -------------------------------------------------------------------------
   // Capacités avancées de session — confidentialité, cadre d'écran, tunnels,
@@ -1282,6 +1426,38 @@ class MockNativeApi implements NativeApi {
           "n'est pas un dossier");
     }
     return List.unmodifiable(entrees);
+  }
+
+  /// Journal **observable par les tests** des téléchargements demandés (le
+  /// cœur réel, lui, écrit réellement le fichier tranche par tranche).
+  final List<({int id, String cheminDistant, String cheminLocal})>
+      telechargements = <({int id, String cheminDistant, String cheminLocal})>[];
+
+  @override
+  Future<String> sessionDownloadFile(
+    int sessionId,
+    String cheminDistant,
+    String dossierLocal,
+  ) async {
+    // Petite latence plausible (tranches sur le canal `Control`).
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    // Composant de base sûr du chemin distant (jamais de traversée `..` ni de
+    // racine de lecteur), comme le cœur réel.
+    final nom = _nomFichier(cheminDistant);
+    if (nom.isEmpty || nom == '..' || nom.endsWith(':')) {
+      throw NovaApiException(
+          'téléchargement distant impossible : « $cheminDistant » '
+          "n'est pas un fichier");
+    }
+    final separateur =
+        dossierLocal.endsWith('\\') || dossierLocal.endsWith('/') ? '' : '\\';
+    final cheminLocal = '$dossierLocal$separateur$nom';
+    telechargements.add(
+      (id: sessionId, cheminDistant: cheminDistant, cheminLocal: cheminLocal),
+    );
+    debugPrint('MockNativeApi.sessionDownloadFile(session $sessionId) : '
+        '« $cheminDistant » → $cheminLocal');
+    return cheminLocal;
   }
 
   // -------------------------------------------------------------------------

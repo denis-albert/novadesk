@@ -4,11 +4,14 @@
 /// panneau de réglages à droite (`.spane`) listant des lignes titre/sous-titre +
 /// contrôle (`.set`).
 ///
-/// Seuls deux réglages sont **réellement câblés** : le **Thème** (segmenté
-/// Clair/Sombre/Système piloté par [themeModeProvider]) et la **Version** de
-/// l'onglet « À propos » (lue via [appInfoProvider]). Tous les autres contrôles
-/// sont de l'état de présentation local (interrupteurs, sélecteurs, champs) —
-/// la persistance appartiendra au cœur Rust via la façade `nd-ffi`.
+/// Réglages **réellement câblés** : le **Thème** (segmenté Clair/Sombre/Système
+/// piloté par [themeModeProvider]), la **Version** de l'onglet « À propos »
+/// (lue via [appInfoProvider]), les lignes persistées via
+/// `get_setting`/`set_setting` (langue, serveurs, dossiers…) et **Démarrer
+/// avec le système**, qui applique en plus l'effet OS **immédiat** via
+/// `apply_autostart` (clé de registre `Run` utilisateur, sans droits
+/// administrateur). Les autres contrôles restent de l'état de présentation
+/// local.
 library;
 
 import 'dart:async';
@@ -229,6 +232,49 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     ref.invalidate(settingsProvider);
   }
 
+  /// Bascule « **Démarrer avec le système** » : persiste le réglage
+  /// `demarrer_avec_systeme` (`set_setting`) puis applique **immédiatement**
+  /// l'effet OS via `apply_autostart` — entrée `NovaDesk` de la clé de
+  /// registre `Run` de l'utilisateur, sans droits administrateur. En cas
+  /// d'échec : toast d'erreur, interrupteur remis dans son état précédent et
+  /// valeur persistée rétablie (meilleur effort).
+  Future<void> _basculerDemarrageSysteme(String cleLocale, bool actif) async {
+    final precedent = _interrupteurs[cleLocale] ?? false;
+    setState(() => _interrupteurs[cleLocale] = actif);
+    final api = ref.read(nativeApiProvider);
+    final valeur = actif ? 'true' : 'false';
+    try {
+      await api.setSetting(cle: 'demarrer_avec_systeme', valeur: valeur);
+      await api.applyAutostart(actif: actif);
+      if (!mounted) return;
+      setState(() => _reglages['demarrer_avec_systeme'] = valeur);
+      ref.invalidate(settingsProvider);
+      NovaToast.montrer(
+          context,
+          actif
+              ? 'NovaDesk démarrera avec Windows'
+              : 'Démarrage automatique désactivé');
+    } catch (e) {
+      // Retour arrière : valeur persistée rétablie en meilleur effort…
+      Future<void> retablir() async {
+        try {
+          await api.setSetting(
+              cle: 'demarrer_avec_systeme',
+              valeur: precedent ? 'true' : 'false');
+        } catch (_) {
+          // L'écriture d'origine avait déjà échoué : rien à rétablir.
+        }
+        if (mounted) ref.invalidate(settingsProvider);
+      }
+
+      unawaited(retablir());
+      if (!mounted) return;
+      // … et interrupteur remis dans son état précédent, avec toast d'erreur.
+      setState(() => _interrupteurs[cleLocale] = precedent);
+      NovaToast.montrer(context, messageNova(e), info: true);
+    }
+  }
+
   @override
   void dispose() {
     for (final controleur in _champs.values) {
@@ -374,6 +420,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           actif: actif,
           label: ligne.titre,
           onChanged: (v) {
+            // « Démarrer avec le système » : persistance + effet OS immédiat
+            // (`apply_autostart`), avec retour arrière en cas d'échec.
+            if (cleReglage == 'demarrer_avec_systeme') {
+              unawaited(_basculerDemarrageSysteme(cle, v));
+              return;
+            }
             setState(() => _interrupteurs[cle] = v);
             if (cleReglage != null) {
               _definirReglage(cleReglage, v ? 'true' : 'false');

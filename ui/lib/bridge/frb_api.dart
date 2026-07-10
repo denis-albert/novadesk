@@ -237,6 +237,18 @@ class FrbNativeApi implements NativeApi {
       frb.setAudioEnabled(id: BigInt.from(id), actif: actif);
 
   @override
+  Future<void> sessionSetAudioSource(int sessionId, String mode) async {
+    try {
+      await frb.sessionSetAudioSource(
+        sessionId: BigInt.from(sessionId),
+        mode: mode,
+      );
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
   Future<void> switchMonitor(int id, int moniteur) =>
       frb.switchMonitor(id: BigInt.from(id), moniteur: moniteur);
 
@@ -413,6 +425,23 @@ class FrbNativeApi implements NativeApi {
         chemin: chemin,
       );
       return entrees.map(_entreeFsDepuis).toList();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<String> sessionDownloadFile(
+    int sessionId,
+    String cheminDistant,
+    String dossierLocal,
+  ) async {
+    try {
+      return await frb.sessionDownloadFile(
+        sessionId: BigInt.from(sessionId),
+        cheminDistant: cheminDistant,
+        dossierLocal: dossierLocal,
+      );
     } catch (e) {
       throw NovaApiException(_message(e));
     }
@@ -629,6 +658,15 @@ class FrbNativeApi implements NativeApi {
   }
 
   @override
+  Future<void> applyAutostart({required bool actif}) async {
+    try {
+      await frb.applyAutostart(actif: actif);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
   Future<void> recordSession({required int id, required String alias}) =>
       frb.recordSession(id: BigInt.from(id), alias: alias);
 
@@ -713,6 +751,73 @@ class FrbNativeApi implements NativeApi {
           accepte: e.accepte,
         ),
     ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Admission automatique : liste blanche (ACL) et invitations éphémères —
+  // délégation aux fonctions générées (u64 ⇄ BigInt, Uint64List ⇄ List<int>) ;
+  // les `Result<_, String>` du cœur (ID absent de la liste, profil ou code
+  // inconnu, persistance impossible) sont retransformés en [NovaApiException]
+  // au message français affichable.
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<List<int>> listAdmissionAllowlist() async {
+    try {
+      final ids = await frb.listAdmissionAllowlist();
+      return [for (final id in ids) id.toInt()];
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> addAdmissionAllowed({required int id}) async {
+    try {
+      await frb.addAdmissionAllowed(id: BigInt.from(id));
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> removeAdmissionAllowed({required int id}) async {
+    try {
+      await frb.removeAdmissionAllowed(id: BigInt.from(id));
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<String> createInvite({
+    required String profil,
+    required int ttlMinutes,
+  }) async {
+    try {
+      return await frb.createInvite(profil: profil, ttlMinutes: ttlMinutes);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<List<InviteDto>> listInvites() async {
+    try {
+      final invitations = await frb.listInvites();
+      return invitations.map(_inviteDepuis).toList();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<void> revokeInvite({required String code}) async {
+    try {
+      await frb.revokeInvite(code: code);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -817,6 +922,13 @@ class FrbNativeApi implements NativeApi {
         adresse: p.adresse,
       );
 
+  /// Aplatit une invitation générée (temps restant `u64` ⇄ `BigInt`).
+  static InviteDto _inviteDepuis(frb.InviteDto i) => InviteDto(
+        code: i.code,
+        profil: i.profil,
+        expireDansS: i.expireDansS.toInt(),
+      );
+
   static frb.AnnotationDto _annotationVers(AnnotationDto a) => frb.AnnotationDto(
         genre: a.genre,
         points: a.points,
@@ -901,6 +1013,9 @@ class FrbNativeApi implements NativeApi {
         // Mot de passe d'admission automatique (accès non surveillé) : relayé
         // tel quel, `null` = dialogue d'approbation manuel côté hôte.
         motDePasse: o.motDePasse,
+        // Code d'invitation éphémère (usage unique) : relayé tel quel,
+        // `null` = pas d'invitation présentée.
+        invitation: o.invitation,
       );
 
   /// Conversion des statistiques (u64 ⇄ BigInt ; `targetBitrateKbps`,

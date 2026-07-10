@@ -64,12 +64,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use nd_crypto::{IdentityStore, PeerFingerprint, StaticKeypair};
+use nd_features::invite::{generate_invite, unix_now};
 use nd_features::Mp4Reader;
 use nd_proto::NovaId;
 
 use crate::api::{
-    AccessLogEntryDto, AddressBookEntryDto, LocalIdentityDto, RecentSessionDto, RecordingDto,
-    SettingDto, UnattendedConfigDto,
+    AccessLogEntryDto, AddressBookEntryDto, InviteDto, LocalIdentityDto, RecentSessionDto,
+    RecordingDto, SettingDto, UnattendedConfigDto,
 };
 
 /// Borne de l'historique de sessions récentes (les plus récentes conservées).
@@ -88,6 +89,7 @@ const FICHIER_CARNET: &str = "carnet.json";
 const FICHIER_REGLAGES: &str = "reglages.json";
 const FICHIER_HISTORIQUE: &str = "historique.json";
 const FICHIER_NON_SURVEILLE: &str = "non_surveille.json";
+const FICHIER_INVITATIONS: &str = "invitations.json";
 
 /// Préfixe (ASCII) d'un fichier de **clé d'identité chiffrée au repos** (DPAPI
 /// sous Windows), suivi immédiatement du blob binaire protégé. Un fichier sans ce
@@ -737,6 +739,97 @@ impl Magasin {
             })
             .collect())
     }
+
+    // --- 7. Invitations éphémères -----------------------------------------
+    //
+    // Magasin persistant (enveloppe `nd_features::invite`) : un code
+    // usage-unique (CSPRNG) associé à un profil de permissions (`bits`) et à une
+    // expiration. Branché dans le vérificateur d'admission de l'hôte non
+    // surveillé (voir [`crate::flux::demarrer_hote_non_surveille`]) via
+    // [`Magasin::consommer_invitation`].
+
+    /// Crée une invitation à usage unique pour `profil` (bits de permissions
+    /// `bits`), valable `ttl_minutes`, la persiste et renvoie le **code** généré
+    /// (CSPRNG, format `XXX-XXX-XXX`). Purge au passage les invitations expirées
+    /// ou déjà consommées (le magasin ne gonfle pas).
+    pub(crate) fn creer_invitation(
+        &self,
+        profil: String,
+        bits: u16,
+        ttl_minutes: u32,
+    ) -> Result<String, String> {
+        let _garde = self.verrouiller();
+        let mut stock: InvitationsStocke = self.lire_json(FICHIER_INVITATIONS)?;
+        let maintenant = unix_now();
+        stock
+            .invitations
+            .retain(|i| !i.consommee && i.expires_unix > maintenant);
+        // Enveloppe `nd_features::invite` : code CSPRNG + expiration dérivée du TTL.
+        let invite = generate_invite(u64::from(ttl_minutes).saturating_mul(60), true);
+        let code = invite.code.clone();
+        stock.invitations.push(InvitationStockee {
+            code: code.clone(),
+            profil,
+            bits,
+            expires_unix: invite.expires_unix,
+            consommee: false,
+        });
+        self.ecrire_json(FICHIER_INVITATIONS, &stock)?;
+        Ok(code)
+    }
+
+    /// Invitations **actives** (non expirées, non consommées), aplaties en DTO
+    /// avec le temps restant. Liste vide si aucune n'est active.
+    pub(crate) fn lister_invitations(&self) -> Result<Vec<InviteDto>, String> {
+        let _garde = self.verrouiller();
+        let stock: InvitationsStocke = self.lire_json(FICHIER_INVITATIONS)?;
+        let maintenant = unix_now();
+        Ok(stock
+            .invitations
+            .into_iter()
+            .filter(|i| !i.consommee && i.expires_unix > maintenant)
+            .map(|i| InviteDto {
+                code: i.code,
+                profil: i.profil,
+                expire_dans_s: i.expires_unix.saturating_sub(maintenant),
+            })
+            .collect())
+    }
+
+    /// Révoque (supprime) l'invitation `code`. Erreur si le code est inconnu
+    /// (déjà révoqué, consommé ou expiré et purgé).
+    pub(crate) fn revoquer_invitation(&self, code: String) -> Result<(), String> {
+        let _garde = self.verrouiller();
+        let mut stock: InvitationsStocke = self.lire_json(FICHIER_INVITATIONS)?;
+        let avant = stock.invitations.len();
+        stock.invitations.retain(|i| i.code != code);
+        if stock.invitations.len() == avant {
+            return Err(format!(
+                "invitation « {code} » inconnue (déjà révoquée, consommée ou expirée)"
+            ));
+        }
+        self.ecrire_json(FICHIER_INVITATIONS, &stock)
+    }
+
+    /// **Consomme** l'invitation `code` si elle est valide (non expirée, non déjà
+    /// consommée) : la marque consommée (usage unique) et renvoie les **bits du
+    /// profil** à accorder ; `None` si le code est inconnu, expiré ou déjà
+    /// consommé. Consulté par le vérificateur d'admission de l'hôte non surveillé.
+    pub(crate) fn consommer_invitation(&self, code: String) -> Result<Option<u16>, String> {
+        let _garde = self.verrouiller();
+        let mut stock: InvitationsStocke = self.lire_json(FICHIER_INVITATIONS)?;
+        let maintenant = unix_now();
+        let Some(entree) = stock.invitations.iter_mut().find(|i| i.code == code) else {
+            return Ok(None);
+        };
+        if entree.consommee || entree.expires_unix <= maintenant {
+            return Ok(None);
+        }
+        entree.consommee = true;
+        let bits = entree.bits;
+        self.ecrire_json(FICHIER_INVITATIONS, &stock)?;
+        Ok(Some(bits))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +959,26 @@ struct EntreeJournal {
     peer_id: u64,
     timestamp: i64,
     accepte: bool,
+}
+
+/// Magasin d'invitations persisté.
+#[derive(Default, Serialize, Deserialize)]
+struct InvitationsStocke {
+    #[serde(default)]
+    invitations: Vec<InvitationStockee>,
+}
+
+/// Une invitation éphémère persistée : code, profil (nom + bits de permissions),
+/// expiration (secondes Unix) et drapeau de consommation (usage unique).
+#[derive(Clone, Serialize, Deserialize)]
+struct InvitationStockee {
+    code: String,
+    profil: String,
+    /// Bits d'un `nd_features::PermissionSet` (le profil accordé à l'admission).
+    bits: u16,
+    expires_unix: u64,
+    #[serde(default)]
+    consommee: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,6 +1618,83 @@ mod tests {
         assert_ne!(
             identite_a.id, identite_b.id,
             "deux répertoires distincts doivent donner deux ID distincts"
+        );
+    }
+
+    #[test]
+    fn invitations_cycle_creation_liste_consommation() {
+        let (mag, dir) = magasin_temporaire();
+        assert!(mag.lister_invitations().expect("vide").is_empty());
+
+        // Création : un code (usage unique) au profil « contrôle total » (bits
+        // pleins, ici les 12 capacités connues), TTL 30 min.
+        let bits = 0x0FFFu16;
+        let code = mag
+            .creer_invitation("controle_total".to_owned(), bits, 30)
+            .expect("création d'invitation");
+        assert_eq!(code.len(), 11, "code au format XXX-XXX-XXX");
+
+        // Liste : l'invitation active, avec son profil et un temps restant plausible.
+        let liste = mag.lister_invitations().expect("liste");
+        assert_eq!(liste.len(), 1);
+        assert_eq!(liste[0].code, code);
+        assert_eq!(liste[0].profil, "controle_total");
+        assert!(liste[0].expire_dans_s > 0 && liste[0].expire_dans_s <= 30 * 60);
+
+        // Admission = consommation : rend les bits du profil, **une seule fois**.
+        assert_eq!(
+            mag.consommer_invitation(code.clone())
+                .expect("consommation"),
+            Some(bits)
+        );
+        assert_eq!(
+            mag.consommer_invitation(code.clone()).expect("2e échange"),
+            None,
+            "usage unique : un second échange est refusé"
+        );
+        assert!(
+            mag.lister_invitations()
+                .expect("après consommation")
+                .is_empty(),
+            "une invitation consommée ne figure plus dans la liste active"
+        );
+
+        // Persistance : la consommation subsiste après réouverture depuis le disque.
+        let mag2 = Magasin::nouveau(dir.path().to_path_buf());
+        assert_eq!(
+            mag2.consommer_invitation(code).expect("réouverture"),
+            None,
+            "le code reste inutilisable après réouverture"
+        );
+    }
+
+    #[test]
+    fn invitation_expiree_ni_listee_ni_consommable() {
+        let (mag, _dir) = magasin_temporaire();
+        // TTL 0 minute : expire immédiatement (validité strictement avant l'expiration).
+        let code = mag
+            .creer_invitation("observation".to_owned(), 0b1, 0)
+            .expect("création");
+        assert!(mag.lister_invitations().expect("liste").is_empty());
+        assert_eq!(mag.consommer_invitation(code).expect("expirée"), None);
+    }
+
+    #[test]
+    fn invitation_revocation() {
+        let (mag, _dir) = magasin_temporaire();
+        let code = mag
+            .creer_invitation("standard".to_owned(), 0b0001_1111, 60)
+            .expect("création");
+        mag.revoquer_invitation(code.clone()).expect("révocation");
+        assert!(mag.lister_invitations().expect("liste").is_empty());
+        assert_eq!(
+            mag.consommer_invitation(code.clone()).expect("révoquée"),
+            None,
+            "une invitation révoquée n'est plus consommable"
+        );
+        assert!(
+            mag.revoquer_invitation(code).is_err(),
+            "re-révoquer un code inconnu échoue proprement"
         );
     }
 }
