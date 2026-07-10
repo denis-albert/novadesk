@@ -1142,6 +1142,149 @@ class MockNativeApi implements NativeApi {
       const PeerInfoDto(hote: 'MOCK-PC', os: 'Windows 11 Pro (mock)');
 
   // -------------------------------------------------------------------------
+  // Listing de répertoire distant — arborescence factice EN MÉMOIRE : le
+  // navigateur de fichiers est démontrable SANS le cœur natif. Chaque dossier
+  // listé est navigable (sa clé existe), dossiers d'abord puis fichiers,
+  // chaque groupe trié par nom, comme le rendu de l'hôte réel.
+  // -------------------------------------------------------------------------
+
+  /// Arborescence du « poste hôte » factice : chemin normalisé
+  /// ([_normaliserChemin]) → entrées. La clé vide donne les racines, dont
+  /// chaque nom (« C:\ », « D:\ ») est directement utilisable comme chemin de
+  /// la demande suivante — même contrat que le cœur réel.
+  late final Map<String, List<EntreeFsDto>> _arborescenceDistante = {
+    '': const [
+      EntreeFsDto(nom: 'C:\\', taille: 0, estDossier: true),
+      EntreeFsDto(nom: 'D:\\', taille: 0, estDossier: true),
+    ],
+    'C:\\': [
+      const EntreeFsDto(nom: 'Program Files', taille: 0, estDossier: true),
+      const EntreeFsDto(nom: 'Utilisateurs', taille: 0, estDossier: true),
+      const EntreeFsDto(nom: 'Windows', taille: 0, estDossier: true),
+      EntreeFsDto(
+          nom: 'pagefile.sys',
+          taille: 3 * 1024 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(heures: 1)),
+    ],
+    'C:\\Program Files': const [
+      EntreeFsDto(nom: 'NovaDesk', taille: 0, estDossier: true),
+    ],
+    'C:\\Program Files\\NovaDesk': [
+      EntreeFsDto(
+          nom: 'LISEZMOI.txt',
+          taille: 1834,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 7)),
+      EntreeFsDto(
+          nom: 'novadesk.exe',
+          taille: 18 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 7)),
+    ],
+    'C:\\Utilisateurs': const [
+      EntreeFsDto(nom: 'Public', taille: 0, estDossier: true),
+      EntreeFsDto(nom: 'marie', taille: 0, estDossier: true),
+    ],
+    'C:\\Utilisateurs\\Public': [
+      EntreeFsDto(
+          nom: 'partage.zip',
+          taille: 640 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 4)),
+    ],
+    'C:\\Utilisateurs\\marie': [
+      const EntreeFsDto(nom: 'Documents', taille: 0, estDossier: true),
+      EntreeFsDto(
+          nom: 'notes.txt',
+          taille: 4096,
+          estDossier: false,
+          modifieLe: _ilYa(heures: 5)),
+    ],
+    'C:\\Utilisateurs\\marie\\Documents': [
+      EntreeFsDto(
+          nom: 'budget.xlsx',
+          taille: 88 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 2)),
+      EntreeFsDto(
+          nom: 'rapport.pdf',
+          taille: 2 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 1)),
+    ],
+    'C:\\Windows': [
+      const EntreeFsDto(nom: 'System32', taille: 0, estDossier: true),
+      EntreeFsDto(
+          nom: 'explorer.exe',
+          taille: 5 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 30)),
+    ],
+    'C:\\Windows\\System32': [
+      EntreeFsDto(
+          nom: 'kernel32.dll',
+          taille: 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 30)),
+      EntreeFsDto(
+          nom: 'ntdll.dll',
+          taille: 2 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 30)),
+    ],
+    'D:\\': [
+      const EntreeFsDto(nom: 'Sauvegardes', taille: 0, estDossier: true),
+      EntreeFsDto(
+          nom: 'archive.zip',
+          taille: 250 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 12)),
+    ],
+    'D:\\Sauvegardes': [
+      EntreeFsDto(
+          nom: 'poste-bureau_2026-06-30.ndr',
+          taille: 921 * 1024 * 1024,
+          estDossier: false,
+          modifieLe: _ilYa(jours: 8)),
+    ],
+  };
+
+  /// Normalise un chemin distant pour la recherche dans l'arborescence
+  /// factice : sépare sur `/` ou `\`, reconstruit avec `\`, et conserve le
+  /// `\` final d'une racine lecteur (« C:\ ») — les chemins bâtis par
+  /// concaténation (« C:\ » + « Windows ») retombent ainsi sur leurs clés.
+  static String _normaliserChemin(String chemin) {
+    final segments = chemin
+        .trim()
+        .split(RegExp(r'[\\/]+'))
+        .where((s) => s.isNotEmpty)
+        .toList();
+    if (segments.isEmpty) return '';
+    if (segments.length == 1 && segments.first.endsWith(':')) {
+      return '${segments.first}\\';
+    }
+    return segments.join('\\');
+  }
+
+  @override
+  Future<List<EntreeFsDto>> sessionListRemoteDir(
+    int sessionId,
+    String chemin,
+  ) async {
+    // Petite latence plausible (aller-retour du canal `Control`).
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    final entrees = _arborescenceDistante[_normaliserChemin(chemin)];
+    if (entrees == null) {
+      // Même esprit que le refus de l'hôte réel, propagé tel quel.
+      throw NovaApiException(
+          'listing distant impossible : « $chemin » est introuvable ou '
+          "n'est pas un dossier");
+    }
+    return List.unmodifiable(entrees);
+  }
+
+  // -------------------------------------------------------------------------
   // Relecture d'enregistrements — lecteur en mémoire (images de synthèse)
   // -------------------------------------------------------------------------
 
@@ -1207,6 +1350,62 @@ class MockNativeApi implements NativeApi {
         ? '255.255.255.255:9'
         : broadcast;
     debugPrint('MockNativeApi.sendWol(mac $mac) → $cible');
+  }
+
+  // -------------------------------------------------------------------------
+  // Découverte LAN — état EN MÉMOIRE : la liste des voisins est démontrable
+  // SANS le cœur natif (aucun socket multicast dans le mock).
+  // -------------------------------------------------------------------------
+
+  /// Nom et port annoncés par la découverte active ; `null` = arrêtée.
+  ({String nom, int port})? _decouverte;
+
+  /// Instant du démarrage de la découverte (le second voisin factice
+  /// n'apparaît qu'après ~2 s : démo d'une liste qui se peuple).
+  DateTime? _debutDecouverte;
+
+  @override
+  Future<void> discoveryStart(String nom, int port) async {
+    // Idempotent, comme le cœur réel : tant qu'une instance vit, les appels
+    // suivants sont sans effet, quels que soient leurs arguments (pour
+    // changer de nom ou de port : [discoveryStop] puis redémarrer).
+    if (_decouverte != null) return;
+    _decouverte = (nom: nom, port: port);
+    _debutDecouverte = DateTime.now();
+    debugPrint('MockNativeApi.discoveryStart(« $nom », port $port)');
+  }
+
+  /// Vide tant que la découverte n'est pas démarrée ; sinon un premier voisin
+  /// factice répond immédiatement, un second après ~2 s. Triés par id
+  /// croissant et le poste local exclu, comme le cœur réel.
+  @override
+  Future<List<DiscoveredPeerDto>> discoveryPeers() async {
+    final debut = _debutDecouverte;
+    if (_decouverte == null || debut == null) return const [];
+    final pairs = <DiscoveredPeerDto>[
+      DiscoveredPeerDto(
+        id: 555240173,
+        idFormate: _formater(555240173),
+        nom: 'pc-marie',
+        adresse: '192.168.1.87:52310',
+      ),
+    ];
+    if (DateTime.now().difference(debut) >= const Duration(seconds: 2)) {
+      pairs.add(DiscoveredPeerDto(
+        id: 730118902,
+        idFormate: _formater(730118902),
+        nom: 'serveur-nas',
+        adresse: '192.168.1.42:49873',
+      ));
+    }
+    return pairs;
+  }
+
+  @override
+  Future<void> discoveryStop() async {
+    // Idempotent : arrêter une découverte déjà arrêtée est sans effet.
+    _decouverte = null;
+    _debutDecouverte = null;
   }
 
   // Barres facon mire télé : blanc, jaune, cyan, vert, magenta, rouge, bleu, noir.

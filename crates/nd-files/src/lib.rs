@@ -1,6 +1,7 @@
 //! `nd-files` — transfert de fichiers (reprise, intégrité BLAKE3), gestionnaire
-//! de fichiers (opérations d'écriture), presse-papiers partagé et impression
-//! distante. Voir `../../plan-technique/09-fichiers-clipboard.md`.
+//! de fichiers (opérations d'écriture), listing de répertoire distant,
+//! presse-papiers partagé et impression distante.
+//! Voir `../../plan-technique/09-fichiers-clipboard.md`.
 
 use std::fs::{File, Metadata};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -30,7 +31,29 @@ pub mod session;
 /// un canal fiable et application du contenu reçu. Voir le module.
 pub mod clipboard_sync;
 
+/// Listing de répertoire distant : requête/réponse binaire compacte + handler
+/// hôte en lecture seule (navigateur de fichiers de l'UI). Voir le module.
+pub mod listing;
+
+/// Récupération de fichier distant à la demande : requête/réponse binaire par
+/// tranches + handler hôte en lecture seule, qui complète le [`listing`]. Voir
+/// le module.
+pub mod download;
+
+/// Contenu réel du presse-papiers « fichiers » : manifeste (nom + taille) des
+/// fichiers annoncés et matérialisation locale de leur contenu par tranches
+/// (bâtie sur [`download`]), au lieu de coller des chemins distants. Voir le module.
+pub mod clipboard_files;
+
+pub use clipboard_files::{
+    chemin_local, chemins_locaux, ecrire_reponse_locale, ecrire_tranche_locale, manifeste_fichiers,
+    FichierPressePapiers, ManifesteFichiers,
+};
 pub use clipboard_sync::{ClipboardContent, ClipboardSync};
+pub use download::{
+    lire_tranche, traiter_requete_fichier, ReponseFichier, RequeteFichier, TAILLE_TRANCHE_MAX,
+};
+pub use listing::{lister_repertoire, traiter_requete_liste, EntreeFs, ReponseListe, RequeteListe};
 pub use session::{SessionProgress, TransferEvent, TransferProgressInfo, TransferSession};
 
 /// Entrée d'un listing de système de fichiers distant.

@@ -43,6 +43,13 @@ pub enum ClipboardContent {
     Image(ImageRgba),
     /// Liste de fichiers copiés (chemins). Sérialisés en UTF-8 (potentiellement
     /// avec perte pour un chemin non-UTF-8, cas rare et documenté).
+    ///
+    /// Ces chemins sont ceux de la machine **émettrice** : les appliquer tels
+    /// quels ([`ClipboardSync::apply`]) colle des chemins qui n'existent pas sur
+    /// le récepteur. Pour coller de **vrais** fichiers, le récepteur matérialise
+    /// leur contenu localement — voir le module
+    /// [`clipboard_files`](crate::clipboard_files) (manifeste nom + taille, puis
+    /// téléchargement par tranches vers un dossier temporaire local).
     Files(Vec<PathBuf>),
 }
 

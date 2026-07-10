@@ -42,7 +42,7 @@ use nd_audio::AudioPacket;
 use nd_capture::Rect;
 use nd_codec::ContentProfile;
 use nd_features::PermissionSet;
-use nd_proto::{ChannelKind, MonitorId};
+use nd_proto::{ChannelKind, MonitorId, NovaId};
 
 use crate::{PeerInfo, RemoteMonitor};
 
@@ -133,6 +133,25 @@ pub(crate) enum SousTypeControle {
     /// **Infos système du pair** (nom d'hôte + OS), hôte → contrôleur (payload =
     /// `[len_hote u16 BE][hôte utf8][os utf8]`, voir [`encoder_infos_pair`]).
     InfosPair = 12,
+    /// **Demande d'admission** d'un hôte non surveillé, contrôleur → hôte,
+    /// émise juste après l'établissement — donc **dans le canal déjà chiffré par
+    /// Noise**. Charge **rétro-compatible** : `[peer_id u64 BE][présence u8]` +
+    /// mot de passe hérité, ou format étendu additif (invitation, nom
+    /// d'affichage, profil demandé) — voir [`encoder_demande_admission`]. L'hôte
+    /// à admission automatique la consomme **avant** ses boucles média ; partout
+    /// ailleurs (session ordinaire, hôte déjà admis), elle est ignorée.
+    DemandeAdmission = 13,
+    /// **Requête de listing de répertoire distant**, contrôleur → hôte
+    /// (payload = [`nd_files::RequeteListe::to_bytes`], chemin vide = racines).
+    /// L'hôte répond **derrière la permission**
+    /// [`nd_features::Capability::FileDownload`] : refus ⇒ réponse dont
+    /// `erreur` vaut « accès refusé », jamais de listing sans droit.
+    RequeteFs = 14,
+    /// **Réponse de listing de répertoire distant**, hôte → contrôleur
+    /// (payload = [`nd_files::ReponseListe::to_bytes`]). Le chemin échoyé sert
+    /// de corrélation côté contrôleur
+    /// ([`crate::SessionHandle::list_remote_dir`]).
+    ReponseFs = 15,
 }
 
 impl SousTypeControle {
@@ -151,6 +170,9 @@ impl SousTypeControle {
             10 => Some(SousTypeControle::MajQualite),
             11 => Some(SousTypeControle::Moniteurs),
             12 => Some(SousTypeControle::InfosPair),
+            13 => Some(SousTypeControle::DemandeAdmission),
+            14 => Some(SousTypeControle::RequeteFs),
+            15 => Some(SousTypeControle::ReponseFs),
             _ => None,
         }
     }
@@ -216,6 +238,13 @@ pub(crate) enum CommandeMedia {
     /// l'hôte **en cours de session**. Sans effet côté contrôleur (l'hôte seul
     /// encode et muxe).
     DefinirEnregistrement(Option<PathBuf>),
+    /// Demander à l'hôte le **listing du répertoire distant** donné (chemin
+    /// vide = racines). Rôle contrôleur uniquement : la requête part sur le
+    /// canal `Control` ([`SousTypeControle::RequeteFs`]) et la réponse revient
+    /// par [`SousTypeControle::ReponseFs`] — attendue, corrélée par chemin,
+    /// dans [`crate::SessionHandle::list_remote_dir`]. Sans effet côté hôte
+    /// (le poste liste ses propres dossiers sans passer par la session).
+    ListerRepertoireDistant(String),
 }
 
 /// Encode une région / cadre d'écran pour le canal `Control` : payload **vide**
@@ -372,6 +401,208 @@ pub(crate) fn decoder_infos_pair(payload: &[u8]) -> Option<PeerInfo> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Admission de l'accès non surveillé (contrôle d'admission dans le canal Noise)
+// ---------------------------------------------------------------------------
+
+/// Champs d'une **demande d'admission** émise par le contrôleur (rôle
+/// contrôleur → hôte), tels qu'ils partent sur le fil. Tout ce qui suit
+/// `peer_id` est **additif** : un contrôleur hérité ne portait que le mot de
+/// passe (voir [`encoder_demande_admission`] pour le format et la rétro-compat).
+#[derive(Debug, Clone)]
+pub(crate) struct DemandeAdmissionSortante<'a> {
+    /// ID que le contrôleur déclare (recoupé côté hôte avec le pair du punch).
+    pub peer_id: NovaId,
+    /// Mot de passe d'admission permanent (clair, canal Noise uniquement).
+    pub mot_de_passe: Option<&'a str>,
+    /// Code d'invitation éphémère présenté (usage unique / TTL / profil).
+    pub invitation: Option<&'a str>,
+    /// Nom d'affichage / alias choisi par le contrôleur (dialogue hôte).
+    pub nom_affichage: Option<&'a str>,
+    /// Profil de permissions demandé par le contrôleur (dialogue hôte).
+    pub permissions_demandees: Option<PermissionSet>,
+}
+
+/// Contenu **décodé** d'une demande d'admission (inverse de
+/// [`encoder_demande_admission`]). Les champs additifs valent `None` pour un
+/// message hérité plus court (rétro-compatibilité).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DemandeAdmissionRecue {
+    /// ID déclaré par le contrôleur.
+    pub declare: NovaId,
+    /// Mot de passe reçu (clair, canal Noise), s'il en porte un.
+    pub mot_de_passe: Option<String>,
+    /// Code d'invitation éphémère présenté, s'il en porte un.
+    pub invitation: Option<String>,
+    /// Nom d'affichage déclaré, s'il en porte un.
+    pub nom_affichage: Option<String>,
+    /// Profil de permissions demandé, s'il en porte un.
+    pub permissions_demandees: Option<PermissionSet>,
+}
+
+impl DemandeAdmissionRecue {
+    /// Demande « simple » (format hérité) : seul un mot de passe éventuel.
+    fn simple(declare: NovaId, mot_de_passe: Option<String>) -> Self {
+        DemandeAdmissionRecue {
+            declare,
+            mot_de_passe,
+            invitation: None,
+            nom_affichage: None,
+            permissions_demandees: None,
+        }
+    }
+}
+
+/// Octet de présence/format (offset 8) d'une demande d'admission, sérialisé :
+/// `0` = héritée sans mot de passe, `1` = héritée avec mot de passe (le mot de
+/// passe est le reste de la trame). Ne jamais renuméroter, seulement en ajouter.
+const DEMANDE_HERITEE_SANS_MDP: u8 = 0;
+const DEMANDE_HERITEE_AVEC_MDP: u8 = 1;
+/// Format **étendu** : `[drapeaux u8]` puis les champs présents (voir
+/// [`encoder_demande_admission`]). Additif — un décodeur hérité, qui ne connaît
+/// que 0/1, l'ignore proprement (présence inconnue ⇒ aucune preuve exploitable).
+const DEMANDE_ETENDUE: u8 = 2;
+
+/// Drapeaux du format étendu : présence de chaque champ additif.
+const DRAPEAU_MDP: u8 = 0b0001;
+const DRAPEAU_INVITATION: u8 = 0b0010;
+const DRAPEAU_NOM: u8 = 0b0100;
+const DRAPEAU_PERMISSIONS: u8 = 0b1000;
+
+/// Encode une **demande d'admission** pour le canal `Control` (sous-type
+/// [`SousTypeControle::DemandeAdmission`]).
+///
+/// Rétro-compatibilité : **sans aucun champ additif** (invitation, nom, profil
+/// demandé), la trame émise est **octet pour octet** celle des contrôleurs
+/// antérieurs — `[peer_id u64 BE][présence u8]` puis, si `présence == 1`, le mot
+/// de passe UTF-8 (le reste). Dès qu'un champ additif est présent, la trame
+/// bascule en **format étendu** (`présence == 2`) : `[peer_id u64 BE][2]
+/// [drapeaux u8]` puis, pour chaque champ **présent et dans l'ordre**, le mot de
+/// passe, l'invitation et le nom (chacun `[len u16 BE][utf8]`), enfin le profil
+/// demandé (`[bits u16 BE]`).
+///
+/// Sécurité : cette trame n'est émise **que sur le canal de session déjà chiffré
+/// et authentifié par Noise** — le clair du mot de passe comme le code
+/// d'invitation ne circulent jamais hors de ce canal, ni journalisés ni
+/// persistés (l'hôte les valide via des closures, voir
+/// [`crate::UnattendedHost::start_with_admission`]).
+pub(crate) fn encoder_demande_admission(demande: &DemandeAdmissionSortante<'_>) -> Vec<u8> {
+    let etendue = demande.invitation.is_some()
+        || demande.nom_affichage.is_some()
+        || demande.permissions_demandees.is_some();
+    let mut trame = Vec::new();
+    trame.extend_from_slice(&demande.peer_id.as_u64().to_be_bytes());
+    if !etendue {
+        // Format hérité (inchangé octet pour octet).
+        match demande.mot_de_passe {
+            Some(mdp) => {
+                trame.push(DEMANDE_HERITEE_AVEC_MDP);
+                trame.extend_from_slice(mdp.as_bytes());
+            }
+            None => trame.push(DEMANDE_HERITEE_SANS_MDP),
+        }
+        return trame;
+    }
+    // Format étendu : drapeaux puis champs présents, longueur-préfixés.
+    trame.push(DEMANDE_ETENDUE);
+    let mut drapeaux = 0u8;
+    if demande.mot_de_passe.is_some() {
+        drapeaux |= DRAPEAU_MDP;
+    }
+    if demande.invitation.is_some() {
+        drapeaux |= DRAPEAU_INVITATION;
+    }
+    if demande.nom_affichage.is_some() {
+        drapeaux |= DRAPEAU_NOM;
+    }
+    if demande.permissions_demandees.is_some() {
+        drapeaux |= DRAPEAU_PERMISSIONS;
+    }
+    trame.push(drapeaux);
+    for valeur in [
+        demande.mot_de_passe,
+        demande.invitation,
+        demande.nom_affichage,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        pousser_chaine(&mut trame, valeur);
+    }
+    if let Some(permissions) = demande.permissions_demandees {
+        trame.extend_from_slice(&permissions.to_bits().to_be_bytes());
+    }
+    trame
+}
+
+/// Ajoute une chaîne longueur-préfixée `[len u16 BE][utf8]` à `trame` (longueur
+/// plafonnée à `u16::MAX`, comme [`encoder_infos_pair`]).
+fn pousser_chaine(trame: &mut Vec<u8>, valeur: &str) {
+    let octets = valeur.as_bytes();
+    let len = u16::try_from(octets.len()).unwrap_or(u16::MAX);
+    trame.extend_from_slice(&len.to_be_bytes());
+    trame.extend_from_slice(&octets[..usize::from(len)]);
+}
+
+/// Décode une demande d'admission (inverse d'[`encoder_demande_admission`]).
+/// Tolérant : un **message hérité plus court** (présence 0/1) se décode avec les
+/// champs additifs à `None` ; toute trame tronquée, présence inconnue, octets
+/// orphelins après un « sans mot de passe » hérité, ou UTF-8 invalide ⇒ `None`
+/// (jamais de panique sur entrée hostile). Des octets résiduels après le format
+/// étendu sont tolérés (champs d'une version ultérieure).
+pub(crate) fn decoder_demande_admission(payload: &[u8]) -> Option<DemandeAdmissionRecue> {
+    let id = NovaId(u64::from_be_bytes(payload.get(0..8)?.try_into().ok()?));
+    let (&presence, reste) = payload.get(8..)?.split_first()?;
+    match presence {
+        DEMANDE_HERITEE_SANS_MDP if reste.is_empty() => {
+            Some(DemandeAdmissionRecue::simple(id, None))
+        }
+        DEMANDE_HERITEE_AVEC_MDP => Some(DemandeAdmissionRecue::simple(
+            id,
+            Some(String::from_utf8(reste.to_vec()).ok()?),
+        )),
+        DEMANDE_ETENDUE => decoder_demande_etendue(id, reste),
+        _ => None,
+    }
+}
+
+/// Décode le corps d'une demande au **format étendu** (après `[id u64][2]`).
+fn decoder_demande_etendue(declare: NovaId, corps: &[u8]) -> Option<DemandeAdmissionRecue> {
+    let (&drapeaux, mut reste) = corps.split_first()?;
+    let mot_de_passe = lire_chaine_optionnelle(&mut reste, drapeaux & DRAPEAU_MDP != 0)?;
+    let invitation = lire_chaine_optionnelle(&mut reste, drapeaux & DRAPEAU_INVITATION != 0)?;
+    let nom_affichage = lire_chaine_optionnelle(&mut reste, drapeaux & DRAPEAU_NOM != 0)?;
+    let permissions_demandees = if drapeaux & DRAPEAU_PERMISSIONS != 0 {
+        let bits = reste.get(0..2)?;
+        Some(PermissionSet::from_bits(u16::from_be_bytes([
+            bits[0], bits[1],
+        ])))
+    } else {
+        None
+    };
+    Some(DemandeAdmissionRecue {
+        declare,
+        mot_de_passe,
+        invitation,
+        nom_affichage,
+        permissions_demandees,
+    })
+}
+
+/// Lit une chaîne longueur-préfixée `[len u16 BE][utf8]` si `present`, en
+/// avançant `reste`. `None` (l'`Option` externe) = trame tronquée ou UTF-8
+/// invalide ; `Some(None)` = champ absent (rien lu).
+fn lire_chaine_optionnelle(reste: &mut &[u8], present: bool) -> Option<Option<String>> {
+    if !present {
+        return Some(None);
+    }
+    let entete = reste.get(0..2)?;
+    let len = usize::from(u16::from_be_bytes([entete[0], entete[1]]));
+    let valeur = String::from_utf8(reste.get(2..2 + len)?.to_vec()).ok()?;
+    *reste = reste.get(2 + len..)?;
+    Some(Some(valeur))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,9 +664,152 @@ mod tests {
             SousTypeControle::MajQualite,
             SousTypeControle::Moniteurs,
             SousTypeControle::InfosPair,
+            SousTypeControle::DemandeAdmission,
+            SousTypeControle::RequeteFs,
+            SousTypeControle::ReponseFs,
         ] {
             assert_eq!(SousTypeControle::depuis_octet(st as u8), Some(st));
         }
+    }
+
+    /// Demande sortante « simple » (seul un mot de passe éventuel) — pour les
+    /// cas hérités.
+    fn sortante_simple(
+        peer_id: NovaId,
+        mot_de_passe: Option<&str>,
+    ) -> DemandeAdmissionSortante<'_> {
+        DemandeAdmissionSortante {
+            peer_id,
+            mot_de_passe,
+            invitation: None,
+            nom_affichage: None,
+            permissions_demandees: None,
+        }
+    }
+
+    #[test]
+    fn roundtrip_demande_admission_heritee() {
+        let pair = NovaId(123_456_789);
+        // Avec mot de passe (y compris vide : la présence est explicite).
+        for mdp in ["sésame-ouvre-toi", ""] {
+            assert_eq!(
+                decoder_demande_admission(&encoder_demande_admission(&sortante_simple(
+                    pair,
+                    Some(mdp)
+                ))),
+                Some(DemandeAdmissionRecue::simple(pair, Some(mdp.to_owned())))
+            );
+        }
+        // Sans mot de passe.
+        assert_eq!(
+            decoder_demande_admission(&encoder_demande_admission(&sortante_simple(pair, None))),
+            Some(DemandeAdmissionRecue::simple(pair, None))
+        );
+        // Sans champ additif, la trame reste au format hérité, octet pour octet :
+        // `[id u64 BE][présence u8]` (+ mot de passe si présent).
+        assert_eq!(
+            encoder_demande_admission(&sortante_simple(pair, None)).len(),
+            9
+        );
+        assert_eq!(
+            encoder_demande_admission(&sortante_simple(pair, Some("abc")))[8],
+            DEMANDE_HERITEE_AVEC_MDP
+        );
+    }
+
+    #[test]
+    fn roundtrip_demande_admission_enrichie() {
+        let pair = NovaId(555_000_111);
+        let profil: PermissionSet = [
+            nd_features::Capability::ViewScreen,
+            nd_features::Capability::ControlMouse,
+        ]
+        .into_iter()
+        .collect();
+        // Tous les champs additifs présents : format étendu, aller-retour exact.
+        let demande = DemandeAdmissionSortante {
+            peer_id: pair,
+            mot_de_passe: Some("mdp"),
+            invitation: Some("ABC-DEF-GHJ"),
+            nom_affichage: Some("Alice — poste d'été"),
+            permissions_demandees: Some(profil),
+        };
+        let trame = encoder_demande_admission(&demande);
+        assert_eq!(
+            trame[8], DEMANDE_ETENDUE,
+            "un champ additif ⇒ format étendu"
+        );
+        assert_eq!(
+            decoder_demande_admission(&trame),
+            Some(DemandeAdmissionRecue {
+                declare: pair,
+                mot_de_passe: Some("mdp".to_owned()),
+                invitation: Some("ABC-DEF-GHJ".to_owned()),
+                nom_affichage: Some("Alice — poste d'été".to_owned()),
+                permissions_demandees: Some(profil),
+            })
+        );
+        // Un seul champ additif à la fois (les autres restent None).
+        let invit_seule = DemandeAdmissionSortante {
+            invitation: Some("ZZZ-ZZZ-ZZZ"),
+            ..sortante_simple(pair, None)
+        };
+        let recue = decoder_demande_admission(&encoder_demande_admission(&invit_seule)).unwrap();
+        assert_eq!(recue.invitation.as_deref(), Some("ZZZ-ZZZ-ZZZ"));
+        assert_eq!(recue.mot_de_passe, None);
+        assert_eq!(recue.nom_affichage, None);
+        assert_eq!(recue.permissions_demandees, None);
+    }
+
+    #[test]
+    fn decodeur_tolere_les_messages_herites_et_hostiles() {
+        let pair = NovaId(42);
+        // Rétro-compat : une trame héritée (présence 0/1) se décode avec tous
+        // les champs additifs à None.
+        let heritee_sans = encoder_demande_admission(&sortante_simple(pair, None));
+        assert_eq!(
+            decoder_demande_admission(&heritee_sans),
+            Some(DemandeAdmissionRecue::simple(pair, None))
+        );
+        // Tolérance en avant : des octets résiduels après le format étendu (champs
+        // d'une version future) sont ignorés, pas rejetés.
+        let mut future = encoder_demande_admission(&DemandeAdmissionSortante {
+            invitation: Some("AAA-BBB-CCC"),
+            ..sortante_simple(pair, None)
+        });
+        future.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            decoder_demande_admission(&future).and_then(|d| d.invitation),
+            Some("AAA-BBB-CCC".to_owned())
+        );
+        // Entrées hostiles : tronquée, présence inconnue, octets orphelins après
+        // « absent » hérité, UTF-8 invalide, chaîne étendue tronquée ⇒ None.
+        assert_eq!(decoder_demande_admission(&[1, 2, 3]), None);
+        let mut presence_inconnue = encoder_demande_admission(&sortante_simple(pair, None));
+        presence_inconnue[8] = 9;
+        assert_eq!(decoder_demande_admission(&presence_inconnue), None);
+        let mut orphelins = encoder_demande_admission(&sortante_simple(pair, None));
+        orphelins.push(b'x');
+        assert_eq!(decoder_demande_admission(&orphelins), None);
+        let mut utf8_invalide = encoder_demande_admission(&sortante_simple(pair, Some("a")));
+        utf8_invalide[9] = 0xFF;
+        assert_eq!(decoder_demande_admission(&utf8_invalide), None);
+        // Format étendu annonçant une invitation mais tronqué avant la longueur.
+        assert_eq!(
+            decoder_demande_admission(&[
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                42,
+                DEMANDE_ETENDUE,
+                DRAPEAU_INVITATION
+            ]),
+            None
+        );
     }
 
     #[test]

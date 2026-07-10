@@ -14,6 +14,34 @@
 //!                  (une session à la fois ; retour à l'attente à la fin)
 //! ```
 //!
+//! # Contrôle d'admission automatique ([`UnattendedHost::start_with_admission`])
+//!
+//! Le démarrage historique ci-dessus soumet **chaque** appelant au crochet
+//! `accept` (le dialogue de l'UI) : l'accès n'est pas réellement « non
+//! surveillé ». La variante additive [`UnattendedHost::start_with_admission`]
+//! déplace la décision **dans le canal chiffré Noise** :
+//!
+//! ```text
+//!   boucle : await_p2p ──► QUIC → Noise (répondeur) → admission :
+//!     1. appareil de confiance (ID du punch)            → admis
+//!     2. DemandeAdmission avec mot de passe validé      → admis
+//!        (mot de passe invalide                         → refusé, sans dialogue)
+//!     3. DemandeAdmission avec invitation valide        → admis (profil de
+//!        l'invitation, code consommé ; invalide         → refusé, sans dialogue)
+//!     4. aucune preuve                                  → crochet accept (repli
+//!        manuel enrichi) ; sans décision → refus à l'expiration côté appelant
+//! ```
+//!
+//! Les étapes 3 (invitations) et l'enrichissement du dialogue manuel (nom
+//! d'affichage + profil demandé) sont portés par la variante additive
+//! [`UnattendedHost::start_with_admission_enrichie`] ; le démarrage
+//! [`UnattendedHost::start_with_admission`] s'arrête aux étapes 1, 2, 4 (aucune
+//! invitation, dialogue nu).
+//!
+//! Rien ne révèle au pair la raison d'une admission ou d'un refus, et le clair
+//! du mot de passe (comme le code d'invitation) ne circule que dans le canal
+//! Noise (voir `session::ControleAdmission`).
+//!
 //! Une erreur de session (capture indisponible, pair disparu pendant le
 //! handshake…) est consignée ([`UnattendedHostHandle::last_error`]) et le
 //! service **retourne à l'attente** : un hôte non surveillé doit survivre à ses
@@ -32,10 +60,13 @@ use std::time::{Duration, Instant};
 use nd_features::PermissionSet;
 use nd_proto::{NovaId, Result};
 use nd_signaling::RendezvousClient;
-use nd_transport::ServerIdentity;
+use nd_transport::{QuicTransport, ServerIdentity};
 
 use crate::p2p::{self, AttenteRendezvous};
-use crate::session::{vivre_epoque_hote, CompteursSession, ParamsEpoqueHote};
+use crate::session::{
+    vivre_epoque_hote, vivre_epoque_hote_avec_admission, CompteursSession, ControleAdmission,
+    DemandeAdmissionManuelle, ParamsEpoqueHote,
+};
 use crate::HostStreamOptions;
 
 /// Délai maximal accordé au thread de service pour se terminer dans
@@ -78,35 +109,100 @@ impl UnattendedHost {
         permissions: PermissionSet,
         accept: impl Fn(NovaId) -> bool + Send + 'static,
     ) -> Result<UnattendedHostHandle> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let compteurs = Arc::new(CompteursSession::default());
-        let sessions_servies = Arc::new(AtomicU64::new(0));
-        let pairs_refuses = Arc::new(AtomicU64::new(0));
-        let derniere_erreur = Arc::new(Mutex::new(None));
+        let service = Service::nouveau(local_id, rendezvous, stun_servers, identity, permissions);
+        service.lancer(move |service| service.boucle(&accept))
+    }
 
-        let service = Service {
-            local_id,
-            rendezvous,
-            stun_servers,
-            identity,
-            permissions,
-            stop: Arc::clone(&stop),
-            compteurs: Arc::clone(&compteurs),
-            sessions_servies: Arc::clone(&sessions_servies),
-            pairs_refuses: Arc::clone(&pairs_refuses),
-            derniere_erreur: Arc::clone(&derniere_erreur),
-        };
-        let thread = thread::Builder::new()
-            .name("nd-hote-non-surveille".to_owned())
-            .spawn(move || service.boucle(&accept))?;
+    /// Démarre le service avec **contrôle d'admission automatique** : chaque
+    /// appelant est jaugé **dans le canal chiffré Noise** (une fois la session
+    /// QUIC + Noise établie), dans l'ordre :
+    ///
+    /// 1. `est_de_confiance(pair)` (appareil de confiance) → **admis** ;
+    /// 2. sinon, mot de passe reçu du contrôleur (message `DemandeAdmission`,
+    ///    émis juste après l'établissement — voir
+    ///    [`SessionOptions::mot_de_passe`](crate::SessionOptions::mot_de_passe))
+    ///    et validé par `verif_mdp` → **admis** ; un mot de passe **invalide
+    ///    refuse immédiatement**, sans solliciter l'UI (pas d'usure de
+    ///    l'utilisateur par essais successifs) ;
+    /// 3. sinon (aucune preuve reçue dans la fenêtre) → **repli sur le crochet
+    ///    `accept`** — le dialogue manuel existant ; sans décision, celui-ci
+    ///    expire en refus côté appelant.
+    ///
+    /// La décision reste muette (rien ne révèle au pair si l'admission vient de
+    /// la confiance ou du mot de passe) et un refus abandonne simplement la
+    /// connexion, sans qu'aucun média ne circule. Le clair du mot de passe ne
+    /// circule que dans le canal Noise : `verif_mdp` le compare côté appelant
+    /// (typiquement à un hachage salé) — il n'est ni stocké ni journalisé ici.
+    ///
+    /// [`UnattendedHost::start`] reste le démarrage historique : tout appelant
+    /// passe alors par `accept`, avant même l'acceptation QUIC.
+    ///
+    /// # Errors
+    /// Mêmes conditions que [`UnattendedHost::start`].
+    // Signature volontairement additive : les deux closures d'admission
+    // s'ajoutent aux paramètres du démarrage historique sans le changer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_admission(
+        local_id: NovaId,
+        rendezvous: SocketAddr,
+        stun_servers: Vec<SocketAddr>,
+        identity: ServerIdentity,
+        permissions: PermissionSet,
+        accept: impl Fn(NovaId) -> bool + Send + 'static,
+        verif_mdp: impl Fn(&str) -> bool + Send + 'static,
+        est_de_confiance: impl Fn(NovaId) -> bool + Send + 'static,
+    ) -> Result<UnattendedHostHandle> {
+        let service = Service::nouveau(local_id, rendezvous, stun_servers, identity, permissions);
+        service.lancer(move |service| {
+            // Adapte le crochet historique (ID seul) au crochet enrichi ; ce mode
+            // n'honore aucune invitation (validateur toujours `None`).
+            let crochet = move |demande: &DemandeAdmissionManuelle| accept(demande.pair);
+            let sans_invitation = |_pair: NovaId, _code: &str| -> Option<PermissionSet> { None };
+            service.boucle_admission(&crochet, &verif_mdp, &est_de_confiance, &sans_invitation);
+        })
+    }
 
-        Ok(UnattendedHostHandle {
-            stop,
-            thread: Some(thread),
-            compteurs,
-            sessions_servies,
-            pairs_refuses,
-            derniere_erreur,
+    /// Démarre le service avec **admission automatique enrichie** : superset
+    /// additif de [`UnattendedHost::start_with_admission`] qui honore en plus les
+    /// **invitations éphémères** et remonte au crochet manuel une **demande
+    /// enrichie** (nom d'affichage + profil demandé). L'ordre de décision, **dans
+    /// le canal chiffré Noise**, est :
+    ///
+    /// 1. `est_de_confiance(pair)` (appareil de confiance) → **admis** ;
+    /// 2. sinon, mot de passe reçu et validé par `verif_mdp` → **admis** ; un mot
+    ///    de passe **invalide refuse immédiatement**, sans solliciter l'UI ;
+    /// 3. sinon, **code d'invitation** présenté et validé par `verif_invitation`
+    ///    (non expiré, non déjà consommé) → **admis avec le profil de
+    ///    l'invitation**, et le code est **consommé** (usage unique) ; une
+    ///    invitation invalide **refuse**, sans dialogue ;
+    /// 4. sinon (aucune preuve) → **repli sur le crochet `accept`** — le dialogue
+    ///    manuel, qui reçoit une [`DemandeAdmissionManuelle`] (ID + nom
+    ///    d'affichage + profil demandé s'ils ont été déclarés) pour un affichage
+    ///    riche ; sans décision, il expire en refus côté appelant.
+    ///
+    /// `verif_invitation(pair, code)` rend `Some(profil)` si le code est valide —
+    /// et le **consomme** alors — ou `None` sinon : l'appelant y branche son
+    /// magasin ([`nd_features::invite::InviteStore`]) et la table code → profil.
+    /// Le clair (mot de passe, code) ne circule que dans le canal Noise ; rien
+    /// n'est honoré avant l'admission.
+    ///
+    /// # Errors
+    /// Mêmes conditions que [`UnattendedHost::start`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_admission_enrichie(
+        local_id: NovaId,
+        rendezvous: SocketAddr,
+        stun_servers: Vec<SocketAddr>,
+        identity: ServerIdentity,
+        permissions: PermissionSet,
+        accept: impl Fn(&DemandeAdmissionManuelle) -> bool + Send + 'static,
+        verif_mdp: impl Fn(&str) -> bool + Send + 'static,
+        est_de_confiance: impl Fn(NovaId) -> bool + Send + 'static,
+        verif_invitation: impl Fn(NovaId, &str) -> Option<PermissionSet> + Send + 'static,
+    ) -> Result<UnattendedHostHandle> {
+        let service = Service::nouveau(local_id, rendezvous, stun_servers, identity, permissions);
+        service.lancer(move |service| {
+            service.boucle_admission(&accept, &verif_mdp, &est_de_confiance, &verif_invitation);
         })
     }
 }
@@ -129,7 +225,10 @@ impl UnattendedHostHandle {
         self.sessions_servies.load(Ordering::Relaxed)
     }
 
-    /// Nombre d'appelants **refusés** par le hook d'acceptation.
+    /// Nombre d'appelants **refusés** : par le hook d'acceptation (démarrage
+    /// historique [`UnattendedHost::start`]), ou par le contrôle d'admission
+    /// automatique ([`UnattendedHost::start_with_admission`] : mot de passe
+    /// invalide, ou aucune preuve et approbation manuelle négative/expirée).
     #[must_use]
     pub fn peers_refused(&self) -> u64 {
         self.pairs_refuses.load(Ordering::Relaxed)
@@ -199,10 +298,54 @@ struct Service {
 }
 
 impl Service {
-    /// Boucle de service : attendre un appelant admis, servir sa session,
-    /// recommencer — jusqu'au signal d'arrêt.
+    /// Construit l'état du service (et les poignées partagées qui iront dans la
+    /// [`UnattendedHostHandle`]).
+    fn nouveau(
+        local_id: NovaId,
+        rendezvous: SocketAddr,
+        stun_servers: Vec<SocketAddr>,
+        identity: ServerIdentity,
+        permissions: PermissionSet,
+    ) -> Service {
+        Service {
+            local_id,
+            rendezvous,
+            stun_servers,
+            identity,
+            permissions,
+            stop: Arc::new(AtomicBool::new(false)),
+            compteurs: Arc::new(CompteursSession::default()),
+            sessions_servies: Arc::new(AtomicU64::new(0)),
+            pairs_refuses: Arc::new(AtomicU64::new(0)),
+            derniere_erreur: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Lance le thread de service avec `corps` (l'une des boucles) et rend la
+    /// poignée d'observation/arrêt.
+    fn lancer(self, corps: impl FnOnce(&Service) + Send + 'static) -> Result<UnattendedHostHandle> {
+        let stop = Arc::clone(&self.stop);
+        let compteurs = Arc::clone(&self.compteurs);
+        let sessions_servies = Arc::clone(&self.sessions_servies);
+        let pairs_refuses = Arc::clone(&self.pairs_refuses);
+        let derniere_erreur = Arc::clone(&self.derniere_erreur);
+        let thread = thread::Builder::new()
+            .name("nd-hote-non-surveille".to_owned())
+            .spawn(move || corps(&self))?;
+
+        Ok(UnattendedHostHandle {
+            stop,
+            thread: Some(thread),
+            compteurs,
+            sessions_servies,
+            pairs_refuses,
+            derniere_erreur,
+        })
+    }
+
+    /// Boucle de service **historique** : le crochet `accept` tranche au moment
+    /// du punch (avant l'acceptation QUIC) ; un admis est servi aussitôt.
     fn boucle(&self, accept: &(impl Fn(NovaId) -> bool + Send + 'static)) {
-        let rv = RendezvousClient::new(self.rendezvous);
         // Admission : hook de l'appelant + compteur de refus.
         let refus = Arc::clone(&self.pairs_refuses);
         let admission = move |pair: NovaId| {
@@ -212,7 +355,53 @@ impl Service {
             }
             admis
         };
+        self.boucle_attente(&admission, &|transport, pair| {
+            self.sessions_servies.fetch_add(1, Ordering::Relaxed);
+            if let Err(erreur) = vivre_epoque_hote(transport, &self.params_epoque(pair)) {
+                self.note_erreur(&format!("session avec {pair} : {erreur}"));
+            }
+        });
+    }
 
+    /// Boucle de service à **admission automatique** : tout appelant atteint le
+    /// canal Noise, la décision se prend **dedans** — appareil de confiance,
+    /// mot de passe prouvé, invitation valide, sinon repli sur le crochet manuel
+    /// enrichi (voir [`UnattendedHost::start_with_admission_enrichie`]). Les
+    /// compteurs `sessions_servies`/`pairs_refuses` sont tenus par l'époque
+    /// d'admission.
+    fn boucle_admission(
+        &self,
+        crochet_manuel: &impl Fn(&DemandeAdmissionManuelle) -> bool,
+        verif_mdp: &impl Fn(&str) -> bool,
+        est_de_confiance: &impl Fn(NovaId) -> bool,
+        verif_invitation: &impl Fn(NovaId, &str) -> Option<PermissionSet>,
+    ) {
+        self.boucle_attente(&|_pair| true, &|transport, pair| {
+            let controle = ControleAdmission {
+                verif_mdp,
+                est_de_confiance,
+                verif_invitation,
+                crochet_manuel,
+                sessions_servies: &self.sessions_servies,
+                pairs_refuses: &self.pairs_refuses,
+            };
+            if let Err(erreur) =
+                vivre_epoque_hote_avec_admission(transport, self.params_epoque(pair), &controle)
+            {
+                self.note_erreur(&format!("session avec {pair} : {erreur}"));
+            }
+        });
+    }
+
+    /// Boucle d'attente commune : publie l'ID au rendez-vous, attend un
+    /// appelant (filtre d'admission au punch fourni) et confie chaque entrant à
+    /// `servir` — une session à la fois, jusqu'au signal d'arrêt.
+    fn boucle_attente(
+        &self,
+        admission: &dyn Fn(NovaId) -> bool,
+        servir: &dyn Fn(QuicTransport, NovaId),
+    ) {
+        let rv = RendezvousClient::new(self.rendezvous);
         while !self.stop.load(Ordering::Relaxed) {
             let attente = AttenteRendezvous {
                 rv: &rv,
@@ -220,7 +409,7 @@ impl Service {
                 identite: &self.identity,
                 stun_servers: &self.stun_servers,
                 relay: None,
-                admission: &admission,
+                admission,
             };
             // Attente bornée par fenêtre : la boucle revient vérifier `stop`
             // (et rafraîchir le heartbeat) entre deux fenêtres.
@@ -238,23 +427,23 @@ impl Service {
                     }
                 };
             let (transport, pair) = entrant;
-            self.sessions_servies.fetch_add(1, Ordering::Relaxed);
+            servir(transport, pair);
+        }
+    }
 
-            let params = ParamsEpoqueHote {
-                permissions: self.permissions,
-                flux: HostStreamOptions::default(),
-                compteurs: &self.compteurs,
-                stop: &self.stop,
-                etats: None,
-                pair,
-                // Raccourcis hôte par défaut ; `Disconnect` ne termine que la
-                // session en cours — le service retourne à l'attente.
-                raccourcis: crate::raccourcis_hote_defaut(),
-                deconnexion_globale: false,
-            };
-            if let Err(erreur) = vivre_epoque_hote(transport, &params) {
-                self.note_erreur(&format!("session avec {pair} : {erreur}"));
-            }
+    /// Paramètres d'une époque hôte du service pour l'appelant `pair`.
+    fn params_epoque(&self, pair: NovaId) -> ParamsEpoqueHote<'_> {
+        ParamsEpoqueHote {
+            permissions: self.permissions,
+            flux: HostStreamOptions::default(),
+            compteurs: &self.compteurs,
+            stop: &self.stop,
+            etats: None,
+            pair,
+            // Raccourcis hôte par défaut ; `Disconnect` ne termine que la
+            // session en cours — le service retourne à l'attente.
+            raccourcis: crate::raccourcis_hote_defaut(),
+            deconnexion_globale: false,
         }
     }
 

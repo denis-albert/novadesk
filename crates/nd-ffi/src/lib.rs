@@ -39,6 +39,19 @@
 //! générés (littéral exhaustif / accès par champ) ont été complétés sur place
 //! (marqués « lot session media »). La régénération les réécrira à l'identique.
 //!
+//! **Lot « admission non surveillée » (blocker B3)** : l'accès non surveillé
+//! devient réellement autonome — `start_unattended_host` câble désormais le
+//! **contrôle d'admission automatique** du moteur
+//! (`nd_core::UnattendedHost::start_with_admission`) : appareil de confiance ou
+//! mot de passe permanent prouvé (vérifié contre le hachage salé du module
+//! [`etat`]) ⇒ accepté sans dialogue ; sinon repli sur le flux
+//! `unattended_incoming_stream`/`approve_incoming` existant. Côté contrôleur,
+//! `SessionOptionsDto` gagne le champ **additif** `mot_de_passe:
+//! Option<String>` (défaut `None`), transmis à l'hôte **dans le canal Noise**.
+//! Stopgap `frb_generated.rs` : seul l'`impl SseDecode` (littéral exhaustif) a
+//! été complété sur place (`mot_de_passe: None`, marqué « admission ») — le
+//! Dart actuel ne transmet pas encore ce champ ; la régénération l'exposera.
+//!
 //! Fonctions exposées au Dart après régénération — **lot 03** : `start_session`,
 //! `session_listen_info`, `session_state_stream` (→ `Stream<SessionStateDto>`),
 //! `session_video_stream` (→ `Stream<VideoFrameDto>`), `wait_session_state`,
@@ -130,6 +143,53 @@
 //! sont **synchrones à DTO plats** (aucun `StreamSink`) — donc **aucun
 //! `pont_provisoire` n'est requis** ; le codegen produira leurs
 //! `SseEncode`/`SseDecode` à la régénération.
+//!
+//! **Lot « listing distant & découverte LAN » (nouvelles)** — deux briques déjà
+//! livrées, mises à portée du Dart :
+//! 1. `session_list_remote_dir(session_id, chemin) -> Vec<EntreeFsDto>` —
+//!    **listing de répertoire distant** (`nd_files`, plan 09) routé **dans la
+//!    session** par `nd-core` (sous-types `Control` additifs
+//!    `RequeteFs`/`ReponseFs`, réponse corrélée par chemin, délai borné) :
+//!    servi par l'hôte **derrière la permission** fichiers/réception
+//!    (`fichiers_reception`) — refus ⇒ `Err("accès refusé …")`, jamais de
+//!    listing sans droit. Chemin vide = racines du poste hôte. L'erreur de
+//!    l'hôte (`ReponseListe::erreur`) est propagée en `Err(String)`.
+//! 2. `discovery_start(nom, port)` / `discovery_peers() ->
+//!    Vec<DiscoveredPeerDto>` / `discovery_stop()` — **découverte LAN**
+//!    (`nd_features::decouverte`) : annonceur de présence (identité locale
+//!    persistante + nom donné ; `port == 0` → port par défaut du parc) et
+//!    écouteur des voisins (id local exclu), **une seule instance vivante par
+//!    processus** (démarrage idempotent), instantané dédupliqué/expiré.
+//!
+//! DTO **neufs** (que la régénération ajoutera) : `EntreeFsDto` (`nom`,
+//! `taille`, `est_dossier`, `modifie_le: Option<u64>`) et `DiscoveredPeerDto`
+//! (`id`, `id_formate` groupé par 3, `nom`, `adresse`). Toutes ces fonctions
+//! sont **synchrones à DTO plats** (aucun `StreamSink`) — donc **aucun
+//! `pont_provisoire` n'est requis** ; le codegen produira leurs
+//! `SseEncode`/`SseDecode` à la régénération.
+//!
+//! **Lot « durcissement du stockage local » (nouvelles)** — trois réglages
+//! réellement effectifs, **sans droits administrateur** (module privé
+//! [`plateforme`], spécifique Windows avec repli documenté hors Windows) :
+//! 1. **Secrets au repos chiffrés (DPAPI)** — la clé privée d'identité
+//!    (`identite.cle`) et le haché du mot de passe d'accès non surveillé sont
+//!    désormais **chiffrés au repos** via `CryptProtectData`/`CryptUnprotectData`
+//!    (portée utilisateur). **Migration transparente** : un ancien fichier en
+//!    clair est déchiffré puis **ré-écrit chiffré** à la première lecture (aucune
+//!    identité ni configuration existante n'est cassée). Interne à [`etat`] —
+//!    aucune nouvelle fonction de façade.
+//! 2. **Démarrage avec le système** — `apply_autostart(actif)` ajoute/retire la
+//!    valeur `NovaDesk` de `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+//!    (chemin de l'exécutable) ; `set_setting("demarrer_avec_systeme", …)`
+//!    l'applique aussi automatiquement quand le réglage change.
+//! 3. **Liste blanche d'admission (ACL)** — `list_admission_allowlist`,
+//!    `add_admission_allowed(id)`, `remove_admission_allowed(id)` persistent une
+//!    liste d'ID admis **sans mot de passe** en accès non surveillé, **branchée
+//!    dans le vérificateur d'admission** (`start_unattended_host`) : la confiance
+//!    à l'admission vaut **liste blanche ∪ appareils de confiance**. Toutes ces
+//!    fonctions sont **synchrones à DTO plats** — donc **aucun `pont_provisoire`
+//!    n'est requis** ; le codegen produira leurs `SseEncode`/`SseDecode` à la
+//!    régénération.
 
 // Binding généré par `flutter_rust_bridge_codegen generate` (config dans
 // `ui/flutter_rust_bridge.yaml`). `unsafe` toléré : code FFI généré, non écrit
@@ -157,6 +217,13 @@ mod etat;
 /// périmètre scanné par le codegen ; la façade [`api`] l'enveloppe en fonctions
 /// plates.
 mod lecture;
+
+/// Intégration plateforme **Windows sans droits administrateur** : chiffrement
+/// des secrets au repos (DPAPI) consommé par [`etat`], et démarrage automatique
+/// via la clé de registre `Run` de l'utilisateur. Repli documenté hors Windows
+/// (`#[cfg]` : secrets en clair, auto-démarrage inerte). Hors du périmètre scanné
+/// par le codegen.
+mod plateforme;
 
 pub use api::*;
 

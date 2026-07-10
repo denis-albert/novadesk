@@ -25,6 +25,12 @@
 /// (`session_set_recording`), liste des **moniteurs réels** de l'hôte
 /// (`session_monitors` → sous-menu écrans) et **infos système du pair**
 /// (`session_peer_info` → panneau d'infos).
+///
+/// Volet de transfert : le côté **distant** est un navigateur réel du poste
+/// hôte (`session_list_remote_dir` — racines/lecteurs, dossiers d'abord,
+/// tailles et dates, fil d'Ariane cliquable, remontée, rechargement) ; le côté
+/// local et l'envoi (`send_files`) sont inchangés, le téléchargement depuis le
+/// distant reste « à venir » (aucune façade ne l'expose).
 library;
 
 import 'dart:async';
@@ -38,6 +44,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart' show LucideIcons;
 
 import '../app_routes.dart';
 import '../bridge/native_api.dart';
@@ -89,6 +96,11 @@ const List<double> _kEpaisseursAnnotation = [2, 4, 7];
 
 /// Accent du mode « cadre d'écran » (rectangle élastique, poignées).
 const Color _kCadreAccent = Color(0xFF5B93F0);
+
+/// Icône « remonter d'un niveau » du navigateur de fichiers distant — glyphe
+/// Lucide pris directement dans la fonte : le catalogue [NovaIcones] (hors du
+/// périmètre de ce lot) n'expose pas encore de flèche vers le haut.
+const IconData _kIconeRemonter = LucideIcons.arrowUp;
 
 /// Arguments de navigation vers la fenêtre de session.
 class SessionScreenArgs {
@@ -155,6 +167,30 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     r'C:\Users\Public\Documents\rapport-Q2.pdf',
     r'C:\Users\Public\Documents\build-9.7.3.zip',
   ];
+
+  // --- Navigateur de fichiers distant (volet droit du transfert) -------------
+
+  /// Entrées du dossier distant affiché (`session_list_remote_dir`), déjà
+  /// triées : dossiers d'abord puis fichiers, chaque groupe par nom.
+  List<EntreeFsDto> _entreesDistantes = const [];
+
+  /// Chemin distant affiché ; vide = racines (lecteurs) du poste hôte.
+  String _cheminDistant = '';
+
+  /// Un listing est en cours (indicateur discret, la liste courante reste
+  /// affichée pendant l'aller-retour).
+  bool _chargementDistant = false;
+
+  /// Erreur inline du dossier **affiché** (échec de son (re)chargement),
+  /// `null` sinon — un échec de navigation vers un enfant passe par un toast.
+  String? _erreurDistant;
+
+  /// Au moins un listing a abouti : la racine n'est alors plus rechargée
+  /// automatiquement (ouverture du volet, retour à l'état actif).
+  bool _listingDistantCharge = false;
+
+  /// Garde anti-course : seul le dernier listing demandé est appliqué.
+  int _generationListingDistant = 0;
 
   /// Trame vidéo courante décodée en `ui.Image`, peinte par [_PeintreVideo].
   final ValueNotifier<ui.Image?> _trameCourante = ValueNotifier<ui.Image?>(null);
@@ -416,6 +452,9 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
       // zéro pour couvrir aussi le retour d'une reconnexion.
       _tentativesPlanControle = 0;
       unawaited(_chargerPlanControle());
+      // Racine du navigateur de fichiers distant : chargée dès l'activation
+      // pour que le volet de transfert s'ouvre déjà peuplé.
+      unawaited(_chargerRacineDistanteSiBesoin());
       if (!_toastConnecte) {
         _toastConnecte = true;
         NovaToast.montrer(context, 'Connecté à ${widget.args.libellePair}');
@@ -941,6 +980,135 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     if (e.kind == 'finished') {
       NovaToast.montrer(context, 'Transfert terminé.');
     }
+    if (e.kind == 'started') {
+      // Le panneau vient d'être révélé : peuple le volet distant si besoin.
+      unawaited(_chargerRacineDistanteSiBesoin());
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Navigateur de fichiers distant réel (`session_list_remote_dir`)
+  // ---------------------------------------------------------------------------
+
+  /// Ouvre/ferme le volet de transfert ; à l'ouverture, charge la racine du
+  /// poste distant si aucun listing n'a encore abouti.
+  void _basculerVoletTransfert() {
+    setState(() => _ftOuvert = !_ftOuvert);
+    if (_ftOuvert) unawaited(_chargerRacineDistanteSiBesoin());
+  }
+
+  /// Charge les racines distantes si rien n'a encore abouti — appelé à
+  /// l'ouverture du volet, au début d'un transfert entrant et au passage en
+  /// session active (le plus précoce gagne, la garde évite les doublons).
+  Future<void> _chargerRacineDistanteSiBesoin() async {
+    if (_listingDistantCharge || _chargementDistant) return;
+    await _chargerRepertoireDistant('');
+  }
+
+  /// Liste [chemin] (vide = racines) via `session_list_remote_dir` puis
+  /// l'affiche, dossiers d'abord puis fichiers, chaque groupe trié par nom.
+  /// Échec sur le dossier **affiché** → message inline avec « Réessayer » ;
+  /// échec d'une navigation (accès refusé…) → toast, on reste sur place.
+  Future<void> _chargerRepertoireDistant(String chemin) async {
+    final id = _sessionId;
+    if (id == null) return; // relancé par le passage en session active
+    final generation = ++_generationListingDistant;
+    setState(() => _chargementDistant = true);
+    try {
+      final entrees = await _api.sessionListRemoteDir(id, chemin);
+      if (!mounted || generation != _generationListingDistant) return;
+      final triees = entrees.toList()..sort(_comparerEntreesDistantes);
+      setState(() {
+        _chargementDistant = false;
+        _listingDistantCharge = true;
+        _cheminDistant = chemin;
+        _entreesDistantes = triees;
+        _erreurDistant = null;
+      });
+    } catch (e) {
+      if (!mounted || generation != _generationListingDistant) return;
+      final message = _messageErreur(e);
+      final dossierAffiche =
+          chemin == _cheminDistant || !_listingDistantCharge;
+      setState(() {
+        _chargementDistant = false;
+        if (dossierAffiche) _erreurDistant = message;
+      });
+      if (!dossierAffiche) _informer('Listing distant : $message');
+    }
+  }
+
+  /// Dossiers avant fichiers, puis alphabétique insensible à la casse — même
+  /// présentation que le rendu de l'hôte réel.
+  static int _comparerEntreesDistantes(EntreeFsDto a, EntreeFsDto b) {
+    if (a.estDossier != b.estDossier) return a.estDossier ? -1 : 1;
+    return a.nom.toLowerCase().compareTo(b.nom.toLowerCase());
+  }
+
+  /// Concatène proprement un chemin distant : parent vide → le nom d'une
+  /// racine (« C:\ ») est déjà un chemin valide ; sinon un seul séparateur,
+  /// dans le style du chemin courant (« C:\ » + « Windows » → « C:\Windows »).
+  static String _joindreCheminDistant(String parent, String nom) {
+    if (parent.isEmpty) return nom;
+    if (parent.endsWith('\\') || parent.endsWith('/')) return '$parent$nom';
+    final separateur =
+        parent.contains('/') && !parent.contains('\\') ? '/' : '\\';
+    return '$parent$separateur$nom';
+  }
+
+  /// Chemin parent : « C:\Windows\System32 » → « C:\Windows », « C:\Windows »
+  /// → « C:\ », « C:\ » → « » (racines). `null` si déjà aux racines.
+  static String? _parentCheminDistant(String chemin) {
+    if (chemin.isEmpty) return null;
+    var reste = chemin;
+    while (reste.isNotEmpty && (reste.endsWith('\\') || reste.endsWith('/'))) {
+      reste = reste.substring(0, reste.length - 1);
+    }
+    final coupe = reste.lastIndexOf(RegExp(r'[\\/]'));
+    if (coupe < 0) return ''; // « C:\ » (réduit à « C: ») → racines
+    if (coupe == 0) return reste.substring(0, 1); // « /home » → « / »
+    final parent = reste.substring(0, coupe);
+    // Un lecteur garde l'antislash de sa racine (« C: » → « C:\ »).
+    return parent.endsWith(':') ? '$parent\\' : parent;
+  }
+
+  /// Segments cliquables du fil d'Ariane : (libellé, chemin à recharger) dans
+  /// l'ordre du chemin courant. Vide quand on est aux racines.
+  List<(String, String)> _segmentsCheminDistant() {
+    final chemin = _cheminDistant;
+    if (chemin.isEmpty) return const [];
+    final parts =
+        chemin.split(RegExp(r'[\\/]+')).where((s) => s.isNotEmpty).toList();
+    final segments = <(String, String)>[];
+    var cumul = '';
+    for (final part in parts) {
+      final libelle = cumul.isEmpty && part.endsWith(':') ? '$part\\' : part;
+      if (cumul.isEmpty) {
+        // Premier segment : racine lecteur (« C:\ ») ou racine POSIX (« /x »).
+        cumul = chemin.startsWith('/') ? '/$part' : libelle;
+      } else {
+        cumul = _joindreCheminDistant(cumul, part);
+      }
+      segments.add((libelle, cumul));
+    }
+    return segments;
+  }
+
+  /// Clic sur une entrée distante : un dossier se liste (navigation), un
+  /// fichier reste honnêtement « à venir » (aucune façade de téléchargement).
+  void _ouvrirEntreeDistante(EntreeFsDto e) {
+    if (e.estDossier) {
+      unawaited(_chargerRepertoireDistant(
+          _joindreCheminDistant(_cheminDistant, e.nom)));
+    } else {
+      _aVenir('Téléchargement depuis le poste distant');
+    }
+  }
+
+  /// Remonte d'un niveau (bouton « ↑ » du volet distant).
+  void _remonterDossierDistant() {
+    final parent = _parentCheminDistant(_cheminDistant);
+    if (parent != null) unawaited(_chargerRepertoireDistant(parent));
   }
 
   // ---------------------------------------------------------------------------
@@ -1557,9 +1725,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
               icone: NovaIcones.dossierSync,
               infobulle: 'Transfert de fichiers',
               actif: _ftOuvert,
-              onTap: _permissions.files
-                  ? () => setState(() => _ftOuvert = !_ftOuvert)
-                  : null,
+              onTap: _permissions.files ? _basculerVoletTransfert : null,
             ),
             _BoutonBarre(
               icone: NovaIcones.discussion,
@@ -2673,12 +2839,9 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                   ]),
                 ),
                 Container(width: 1, color: t.filet),
-                Expanded(
-                  child: _volet(t, NovaIcones.serveur, 'poste-bureau — Bureau', [
-                    (NovaIcones.dossier, 'Livraison', '—'),
-                    (NovaIcones.fichierArchive, 'build-9.7.3.zip', '58 Mo'),
-                  ]),
-                ),
+                // Volet distant : navigateur réel du poste hôte
+                // (`session_list_remote_dir`), plus aucune entrée factice.
+                Expanded(child: _voletDistant(t)),
               ],
             ),
           ),
@@ -2755,6 +2918,242 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
         ),
       ],
     );
+  }
+
+  /// Volet **distant** du transfert : navigation réelle du poste hôte via
+  /// `session_list_remote_dir` — en-tête (pair, remonter, recharger), fil
+  /// d'Ariane cliquable, puis listing trié (dossiers d'abord).
+  Widget _voletDistant(NovaTokens t) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.only(left: 12, right: 5, top: 3, bottom: 3),
+          decoration: BoxDecoration(
+            border: Border(bottom: BorderSide(color: t.filet)),
+          ),
+          child: Row(
+            children: [
+              NovaIcone(NovaIcones.serveur, taille: 13, couleur: t.texte3),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Text(
+                  widget.args.libellePair.toUpperCase(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 11, letterSpacing: 0.4, color: t.texte3),
+                ),
+              ),
+              NovaBoutonAction(
+                icone: _kIconeRemonter,
+                infobulle: "Remonter d'un niveau",
+                taille: 24,
+                tailleIcone: 13,
+                onTap: _cheminDistant.isEmpty ? null : _remonterDossierDistant,
+              ),
+              NovaBoutonAction(
+                icone: NovaIcones.recharger,
+                infobulle: 'Recharger le dossier',
+                taille: 24,
+                tailleIcone: 12,
+                onTap: () =>
+                    unawaited(_chargerRepertoireDistant(_cheminDistant)),
+              ),
+            ],
+          ),
+        ),
+        _filArianeDistant(t),
+        Expanded(child: _corpsVoletDistant(t)),
+      ],
+    );
+  }
+
+  /// Fil d'Ariane du volet distant : « Poste » (racines) puis chaque dossier
+  /// du chemin courant, tous cliquables sauf le dernier. Défile
+  /// horizontalement (fin du chemin visible) quand le chemin est profond.
+  Widget _filArianeDistant(NovaTokens t) {
+    final segments = _segmentsCheminDistant();
+    return Container(
+      height: 26,
+      padding: const EdgeInsets.symmetric(horizontal: 7),
+      decoration: BoxDecoration(
+        border: Border(bottom: BorderSide(color: t.filet)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              reverse: true, // garde le dossier courant (fin du chemin) visible
+              child: Row(
+                children: [
+                  _mietteChemin(
+                    t,
+                    'Poste',
+                    courant: segments.isEmpty,
+                    onTap: () => unawaited(_chargerRepertoireDistant('')),
+                  ),
+                  for (var i = 0; i < segments.length; i++) ...[
+                    NovaIcone(NovaIcones.chevronDroit,
+                        taille: 11, couleur: t.texte3),
+                    _mietteChemin(
+                      t,
+                      segments[i].$1,
+                      courant: i == segments.length - 1,
+                      onTap: () => unawaited(
+                          _chargerRepertoireDistant(segments[i].$2)),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (_chargementDistant) ...[
+            const SizedBox(width: 6),
+            SizedBox(
+              width: 11,
+              height: 11,
+              child: CircularProgressIndicator(
+                  strokeWidth: 1.5, color: t.texte3),
+            ),
+            const SizedBox(width: 2),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Miette du fil d'Ariane (survol thème, rayon 4 px) ; le dossier courant
+  /// n'est pas cliquable et reste en évidence.
+  Widget _mietteChemin(NovaTokens t, String libelle,
+      {required bool courant, required VoidCallback onTap}) {
+    return NovaActivable(
+      onTap: courant ? null : onTap,
+      label: 'Ouvrir $libelle',
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+        decoration: BoxDecoration(
+          color: survole ? t.survol : Colors.transparent,
+          borderRadius: BorderRadius.circular(kNovaRayon),
+        ),
+        child: Text(
+          libelle,
+          style: TextStyle(
+            fontSize: 11,
+            color: courant || survole ? t.texte : t.texte2,
+            fontWeight: courant ? FontWeight.w600 : FontWeight.w400,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Corps du volet distant : erreur inline avec « Réessayer », attente du
+  /// premier listing, dossier vide, ou entrées réelles triées.
+  Widget _corpsVoletDistant(NovaTokens t) {
+    if (_erreurDistant != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              NovaIcone(NovaIcones.avertissement,
+                  taille: 17, couleur: t.texte3),
+              const SizedBox(height: 7),
+              Text(
+                _erreurDistant!,
+                textAlign: TextAlign.center,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11.5, color: t.texte2),
+              ),
+              const SizedBox(height: 9),
+              NovaBoutonSecondaire(
+                libelle: 'Réessayer',
+                icone: NovaIcones.recharger,
+                hauteur: 26,
+                onPressed: () =>
+                    unawaited(_chargerRepertoireDistant(_cheminDistant)),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (!_listingDistantCharge) {
+      return Center(
+        child: _chargementDistant
+            ? Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: t.texte3),
+                  ),
+                  const SizedBox(height: 8),
+                  Text('Chargement du poste distant…',
+                      style: TextStyle(fontSize: 11.5, color: t.texte3)),
+                ],
+              )
+            : Text('En attente de la session…',
+                style: TextStyle(fontSize: 11.5, color: t.texte3)),
+      );
+    }
+    if (_entreesDistantes.isEmpty) {
+      return Center(
+        child: Text(
+          _cheminDistant.isEmpty ? 'Aucun lecteur annoncé' : 'Dossier vide',
+          style: TextStyle(fontSize: 11.5, color: t.texte3),
+        ),
+      );
+    }
+    return ListView(
+      padding: EdgeInsets.zero,
+      children: [
+        for (final e in _entreesDistantes)
+          _ElementFichier(
+            icone: _iconeEntreeDistante(e),
+            nom: e.nom,
+            taille: _detailEntreeDistante(e),
+            onTap: () => _ouvrirEntreeDistante(e),
+          ),
+      ],
+    );
+  }
+
+  /// Icône d'une entrée distante : lecteur aux racines, dossier navigable,
+  /// archive ou fichier générique selon l'extension.
+  IconData _iconeEntreeDistante(EntreeFsDto e) {
+    if (e.estDossier) {
+      return _cheminDistant.isEmpty ? NovaIcones.disque : NovaIcones.dossier;
+    }
+    final nom = e.nom.toLowerCase();
+    const archives = ['.zip', '.7z', '.rar', '.tar', '.gz', '.iso', '.ndr'];
+    return archives.any(nom.endsWith)
+        ? NovaIcones.fichierArchive
+        : NovaIcones.fichierTexte;
+  }
+
+  /// Colonne de droite d'une entrée distante : « — » pour un dossier, sinon
+  /// taille lisible (Ko/Mo/Go) et date de modification quand elle est connue.
+  String _detailEntreeDistante(EntreeFsDto e) {
+    if (e.estDossier) return '—';
+    final date = _formaterDateFs(e.modifieLe);
+    return date.isEmpty
+        ? _formaterOctets(e.taille)
+        : '${_formaterOctets(e.taille)} · $date';
+  }
+
+  /// Date de modification lisible (« 08/07/2026 14:32 »), vide si inconnue.
+  static String _formaterDateFs(int? epochSecondes) {
+    if (epochSecondes == null) return '';
+    final d = DateTime.fromMillisecondsSinceEpoch(epochSecondes * 1000);
+    String deux(int v) => v.toString().padLeft(2, '0');
+    return '${deux(d.day)}/${deux(d.month)}/${d.year} ${deux(d.hour)}:${deux(d.minute)}';
   }
 
   /// File de progression réelle, alimentée par `session_transfer_stream` :
@@ -3252,13 +3651,20 @@ class _PopItemState extends State<_PopItem> {
 }
 
 /// Élément de fichier dans un volet de transfert (maquette `.fitem`).
+/// [onTap] (facultatif) rend la ligne activable — navigation du volet distant
+/// (clic sur un dossier) sans changer le rendu des lignes purement locales.
 class _ElementFichier extends StatefulWidget {
-  const _ElementFichier(
-      {required this.icone, required this.nom, required this.taille});
+  const _ElementFichier({
+    required this.icone,
+    required this.nom,
+    required this.taille,
+    this.onTap,
+  });
 
   final IconData icone;
   final String nom;
   final String taille;
+  final VoidCallback? onTap;
 
   @override
   State<_ElementFichier> createState() => _ElementFichierState();
@@ -3274,20 +3680,26 @@ class _ElementFichierState extends State<_ElementFichier> {
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _survole = true),
       onExit: (_) => setState(() => _survole = false),
-      child: Container(
-        color: _survole ? t.panneau : Colors.transparent,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        child: Row(
-          children: [
-            NovaIcone(widget.icone, taille: 15, couleur: t.texte3),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Text(widget.nom,
-                  style: TextStyle(fontSize: 12.5, color: t.texte)),
-            ),
-            Text(widget.taille,
-                style: TextStyle(fontSize: 11, color: t.texte3)),
-          ],
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onTap,
+        child: Container(
+          color: _survole ? t.panneau : Colors.transparent,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            children: [
+              NovaIcone(widget.icone, taille: 15, couleur: t.texte3),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(widget.nom,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 12.5, color: t.texte)),
+              ),
+              Text(widget.taille,
+                  style: TextStyle(fontSize: 11, color: t.texte3)),
+            ],
+          ),
         ),
       ),
     );

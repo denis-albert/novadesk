@@ -42,8 +42,8 @@ mod unattended;
 
 pub use media::ChatMessage;
 pub use session::{
-    raccourcis_hote_defaut, SessionEndpoint, SessionEngine, SessionHandle, SessionMedia,
-    SessionOptions, SessionStats,
+    raccourcis_hote_defaut, DemandeAdmissionManuelle, ListingDistant, SecretAdmission,
+    SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions, SessionStats,
 };
 pub use tunnel::TunnelHandle;
 pub use unattended::{UnattendedHost, UnattendedHostHandle};

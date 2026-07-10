@@ -163,6 +163,7 @@ fn options_etendues() -> SessionOptionsDto {
         extended_features: true,
         transfer_dir: None,
         transport_reconnect: false,
+        mot_de_passe: None,
     }
 }
 

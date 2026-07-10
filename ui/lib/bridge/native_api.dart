@@ -556,6 +556,7 @@ class SessionOptionsDto {
     this.extendedFeatures = true,
     this.transferDir,
     this.transportReconnect = true,
+    this.motDePasse,
   });
 
   /// Permissions granulaires appliquées avant chaque injection d'entrée
@@ -586,6 +587,14 @@ class SessionOptionsDto {
   /// [SessionEndpointDirect] côté contrôleur. **Vrai par défaut côté UI.**
   final bool transportReconnect;
 
+  /// Mot de passe d'**admission automatique** présenté à un hôte « accès non
+  /// surveillé » (rôle contrôleur) ; `null` (défaut) = pas de mot de passe,
+  /// l'hôte se replie sur son dialogue d'approbation manuel. Le clair est émis
+  /// une seule fois par époque dans le canal `Control` déjà chiffré : jamais
+  /// journalisé ni persisté côté moteur (l'hôte le compare à son hachage salé,
+  /// voir [NativeApi.verifyUnattendedPassword]).
+  final String? motDePasse;
+
   @override
   bool operator ==(Object other) =>
       other is SessionOptionsDto &&
@@ -594,17 +603,20 @@ class SessionOptionsDto {
       other.deltaMode == deltaMode &&
       other.extendedFeatures == extendedFeatures &&
       other.transferDir == transferDir &&
-      other.transportReconnect == transportReconnect;
+      other.transportReconnect == transportReconnect &&
+      other.motDePasse == motDePasse;
 
   @override
   int get hashCode => Object.hash(permissions, recordingPath, deltaMode,
-      extendedFeatures, transferDir, transportReconnect);
+      extendedFeatures, transferDir, transportReconnect, motDePasse);
 
   @override
   String toString() => 'SessionOptionsDto(permissions: $permissions, '
       'recordingPath: $recordingPath, deltaMode: $deltaMode, '
       'extendedFeatures: $extendedFeatures, transferDir: $transferDir, '
-      'transportReconnect: $transportReconnect)';
+      'transportReconnect: $transportReconnect, '
+      // Secret jamais restitué en clair dans les journaux.
+      'motDePasse: ${motDePasse == null ? 'null' : '«masqué»'})';
 }
 
 /// Demande d'accès entrante vers un hôte « accès non surveillé », poussée par
@@ -1243,6 +1255,101 @@ class PeerInfoDto {
 }
 
 // ---------------------------------------------------------------------------
+// Listing de fichiers distant et découverte LAN
+// (lot « listing distant + découverte »).
+//
+// Miroirs des DTO de `nd-ffi`. Comme pour [MonitorInfoDto], l'adaptateur FRB
+// convertit les types générés (`u64` exposés en `BigInt`) vers ces miroirs
+// écrits à la main (`int` Dart).
+// ---------------------------------------------------------------------------
+
+/// Entrée d'un listing de répertoire **distant** (miroir de
+/// `nd_ffi::EntreeFsDto`, lui-même miroir plat de `nd_files::EntreeFs`) : un
+/// fichier ou un dossier du poste hôte, tel que rendu par
+/// [NativeApi.sessionListRemoteDir].
+class EntreeFsDto {
+  const EntreeFsDto({
+    required this.nom,
+    required this.taille,
+    required this.estDossier,
+    this.modifieLe,
+  });
+
+  /// Nom de l'entrée (dernier composant, sans le chemin parent). Pour une
+  /// racine (chemin demandé vide), le nom rendu — ex. « C:\ » — est
+  /// directement utilisable comme chemin de la demande suivante.
+  final String nom;
+
+  /// Taille en octets (0 pour les dossiers et les racines).
+  final int taille;
+
+  /// `true` pour un dossier (navigable), `false` pour un fichier.
+  final bool estDossier;
+
+  /// Horodatage de modification (Unix, secondes), si disponible.
+  final int? modifieLe;
+
+  @override
+  bool operator ==(Object other) =>
+      other is EntreeFsDto &&
+      other.nom == nom &&
+      other.taille == taille &&
+      other.estDossier == estDossier &&
+      other.modifieLe == modifieLe;
+
+  @override
+  int get hashCode => Object.hash(nom, taille, estDossier, modifieLe);
+
+  @override
+  String toString() => 'EntreeFsDto(nom: $nom, taille: $taille, '
+      'estDossier: $estDossier, modifieLe: $modifieLe)';
+}
+
+/// Pair NovaDesk **découvert sur le réseau local** via ses annonces de
+/// présence (miroir de `nd_ffi::DiscoveredPeerDto`, lui-même miroir plat de
+/// `nd_features::decouverte::PairDecouvert`).
+///
+/// ⚠️ Les annonces ne sont ni signées ni chiffrées : [id] et [nom] sont
+/// purement indicatifs (affichage) — l'authentification passe par la poignée
+/// de main chiffrée de la session, jamais par la découverte.
+class DiscoveredPeerDto {
+  const DiscoveredPeerDto({
+    required this.id,
+    required this.idFormate,
+    required this.nom,
+    required this.adresse,
+  });
+
+  /// Identifiant NovaDesk annoncé (brut, à passer aux fonctions de session).
+  final int id;
+
+  /// ID au format groupé par 3 (« 123 456 789 »), prêt à afficher.
+  final String idFormate;
+
+  /// Nom d'affichage annoncé par le pair.
+  final String nom;
+
+  /// Adresse source de la dernière annonce (« ip:port » ; l'IP identifie la
+  /// machine, le port est celui, éphémère, de son annonceur).
+  final String adresse;
+
+  @override
+  bool operator ==(Object other) =>
+      other is DiscoveredPeerDto &&
+      other.id == id &&
+      other.idFormate == idFormate &&
+      other.nom == nom &&
+      other.adresse == adresse;
+
+  @override
+  int get hashCode => Object.hash(id, idFormate, nom, adresse);
+
+  @override
+  String toString() => 'DiscoveredPeerDto(id: $id, idFormate: $idFormate, '
+      'nom: $nom, adresse: $adresse)';
+}
+
+// ---------------------------------------------------------------------------
 // Interface de la façade
 // ---------------------------------------------------------------------------
 
@@ -1667,6 +1774,24 @@ abstract interface class NativeApi {
   /// `nd_ffi::session_peer_info`.
   Future<PeerInfoDto> sessionPeerInfo(int sessionId);
 
+  /// Liste le **répertoire distant** [chemin] à travers la session (rôle
+  /// contrôleur, mode étendu) : la requête part sur le canal `Control`
+  /// chiffré, l'hôte la sert derrière la permission `fichiers_reception`
+  /// ([sessionSetPermission]) et la réponse corrélée est attendue dans un
+  /// délai borné (~10 s) sans bloquer les autres appels de session.
+  ///
+  /// Chemin **vide** = racines du poste hôte (lettres de lecteur Windows —
+  /// chaque nom rendu, ex. « C:\ », est directement utilisable comme chemin de
+  /// la demande suivante —, `/` ailleurs) : l'amorce du navigateur de
+  /// fichiers. Dossiers d'abord, puis fichiers, chaque groupe trié par nom.
+  ///
+  /// Lève [NovaApiException] si la session est inconnue ou terminée, sans
+  /// réponse dans le délai (session non étendue, pair injoignable), ou sur
+  /// **refus de l'hôte** (accès refusé sans la permission, dossier inexistant,
+  /// chemin qui n'est pas un dossier…) — jamais de liste partielle trompeuse.
+  /// Miroir de `nd_ffi::session_list_remote_dir`.
+  Future<List<EntreeFsDto>> sessionListRemoteDir(int sessionId, String chemin);
+
   // -------------------------------------------------------------------------
   // Réseau annexe : Wake-on-LAN
   // -------------------------------------------------------------------------
@@ -1678,4 +1803,32 @@ abstract interface class NativeApi {
   /// [NovaApiException] si la MAC ou l'adresse de diffusion est invalide, ou si
   /// l'émission UDP échoue. Miroir de `nd_ffi::send_wol`.
   Future<void> sendWol(String mac, {String? broadcast});
+
+  // -------------------------------------------------------------------------
+  // Découverte LAN (annonces de présence sur le réseau local)
+  // -------------------------------------------------------------------------
+
+  /// Démarre la **découverte LAN** : annonce la présence du poste (identité
+  /// locale persistante [localIdentity] + [nom] d'affichage) sur le groupe
+  /// multicast et collecte les annonces des voisins sur [port] (`0` = port
+  /// par défaut du parc). **Idempotent** : une seule instance vivante par
+  /// processus — tant qu'elle vit, les appels suivants sont sans effet, quels
+  /// que soient leurs arguments (pour changer de nom ou de port :
+  /// [discoveryStop] puis redémarrer). Lève [NovaApiException] si l'identité
+  /// locale est indisponible, si le port d'écoute est déjà occupé ou si le
+  /// socket d'annonce ne peut s'ouvrir. Miroir de `nd_ffi::discovery_start`.
+  Future<void> discoveryStart(String nom, int port);
+
+  /// Instantané des pairs NovaDesk vus sur le réseau local : **dédupliqués par
+  /// id** (une annonce plus récente rafraîchit l'entrée), **expirés** après
+  /// ~10 s sans nouvelle annonce, le poste local exclu, triés par id
+  /// croissant. Liste **vide** si la découverte n'est pas démarrée
+  /// ([discoveryStart]). Miroir de `nd_ffi::discovery_peers`.
+  Future<List<DiscoveredPeerDto>> discoveryPeers();
+
+  /// Arrête la **découverte LAN** : cesse d'annoncer la présence du poste et
+  /// de collecter les voisins. Idempotent : arrêter une découverte déjà
+  /// arrêtée (ou jamais démarrée) est sans effet et sans erreur ; un
+  /// [discoveryStart] ultérieur redémarre. Miroir de `nd_ffi::discovery_stop`.
+  Future<void> discoveryStop();
 }

@@ -7,6 +7,9 @@ description = "Client de rendez-vous, ICE/STUN/TURN, mise en relation P2P (voir 
 
 [dependencies]
 nd-proto = { workspace = true }
+# Signature Ed25519 de la preuve de possession d'ID au `register` authentifié
+# (src/auth.rs) : même primitive et même version que nd-api / nd-transport.
+ed25519-dalek = "2"
 
 # Serveur de rendez-vous local exécutable : registre « nu » (non authentifié)
 # que `establish_p2p`/`await_p2p` consomment via `RendezvousClient`. Mince
@@ -21,6 +24,14 @@ path = "src/bin/nd-registre.rs"
 # qui assemble connecteur (ici) et transport (nd-transport).
 [dev-dependencies]
 nd-transport = { workspace = true }
+# Test d'intégration tests/register_authentifie.rs : monte la vraie façade
+# authentifiée (server/nd-rendezvous) et l'autorité d'émission des jetons
+# (nd-api) en process, pour prouver que la trame construite par src/auth.rs
+# est identique à la référence serveur et acceptée par elle. Cycle
+# nd-rendezvous → nd-signaling toléré : les dépendances de dev peuvent être
+# cycliques et ne pèsent pas sur le graphe d'exécution.
+nd-rendezvous = { path = "../../server/nd-rendezvous" }
+nd-api = { path = "../../server/nd-api" }
 
 [lints]
 workspace = true

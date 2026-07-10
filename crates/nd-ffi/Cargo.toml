@@ -39,6 +39,20 @@ blake3 = "1"
 # doivent partager la même version.
 flutter_rust_bridge = "=2.12.0"
 
+# Durcissement du stockage local **sans droits administrateur** (module `plateforme`) :
+#   * chiffrement des secrets au repos via DPAPI (`CryptProtectData`/`CryptUnprotectData`,
+#     portée utilisateur) — clé privée d'identité et haché du mot de passe non surveillé ;
+#   * démarrage automatique via la clé `Run` de l'utilisateur courant
+#     (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
+# Spécifique à Windows (repli documenté « clair » hors Windows, cf. `plateforme`).
+# Version alignée sur nd-capture (0.58) pour ne pas dédoubler la dépendance.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Registry",
+] }
+
 [dev-dependencies]
 # Répertoires temporaires uniques pour les tests de persistance (round-trips,
 # réouverture depuis disque).

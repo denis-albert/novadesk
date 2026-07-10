@@ -25,11 +25,11 @@ use std::path::PathBuf;
 
 use nd_codec::DecodedFrame;
 use nd_core::{
-    ChatMessage, PeerInfo, RemoteMonitor, SessionConfig, SessionOptions, SessionRole, SessionState,
-    SessionStats,
+    ChatMessage, PeerInfo, RemoteMonitor, SecretAdmission, SessionConfig, SessionOptions,
+    SessionRole, SessionState, SessionStats,
 };
 use nd_features::{AnnotationLayer, MacAddr, PermissionSet, Permissions, Stroke};
-use nd_files::TransferEvent;
+use nd_files::{EntreeFs, TransferEvent};
 use nd_proto::{InputEvent, NdError, NovaId};
 use serde::{Deserialize, Serialize};
 
@@ -365,6 +365,16 @@ pub struct SessionOptionsDto {
     /// [`SessionEndpointDto::Direct`] côté contrôleur (voir
     /// [`nd_core::SessionOptions::transport_reconnect`]). `false` par défaut.
     pub transport_reconnect: bool,
+    /// Mot de passe d'**admission automatique** présenté à un hôte « accès non
+    /// surveillé » (rôle contrôleur) — champ **additif**, `None` par défaut.
+    /// Quand il est fourni, le moteur l'émet une fois par époque, juste après
+    /// l'établissement, **dans le canal `Control` déjà chiffré par Noise**
+    /// (message `DemandeAdmission`) : le clair ne circule jamais hors du canal
+    /// sûr, n'est ni journalisé ni persisté côté moteur, et l'hôte le compare à
+    /// son hachage salé ([`verify_unattended_password`]). Sans mot de passe,
+    /// l'hôte non surveillé se replie sur son dialogue manuel (comportement
+    /// historique) ; un hôte classique ignore le message.
+    pub mot_de_passe: Option<String>,
 }
 
 impl From<SessionOptionsDto> for SessionOptions {
@@ -376,6 +386,9 @@ impl From<SessionOptionsDto> for SessionOptions {
             extended_features: dto.extended_features,
             transfer_dir: dto.transfer_dir.map(PathBuf::from),
             transport_reconnect: dto.transport_reconnect,
+            // Enveloppe opaque : le secret ne fuit ni par `Debug` ni dans les
+            // journaux du moteur (voir `nd_core::SecretAdmission`).
+            mot_de_passe: dto.mot_de_passe.map(SecretAdmission::new),
             // Profil ABR et politique de reconnexion : défauts du moteur.
             ..SessionOptions::default()
         }
@@ -908,11 +921,20 @@ pub struct IncomingRequestDto {
 /// identité TLS et attend les appelants en continu. Renvoie un **identifiant
 /// opaque** d'hôte (distinct des identifiants de session).
 ///
-/// Chaque appelant est soumis à **approbation pilotée par le Dart** : l'`accept`
-/// du moteur bloque jusqu'à ce que l'UI réponde via [`approve_incoming`], borné
-/// par un délai au-delà duquel l'appelant est **refusé par défaut** (jamais de
-/// blocage indéfini). Abonnez-vous à [`unattended_incoming_stream`] pour recevoir
-/// les demandes.
+/// # Admission automatique (accès réellement autonome)
+///
+/// Chaque appelant est d'abord jaugé **dans le canal chiffré Noise**, dans
+/// l'ordre : appareil de **confiance** (liste persistée, voir
+/// [`add_trusted_device`]) → accepté sans dialogue ; sinon **mot de passe
+/// permanent** prouvé (transmis par le contrôleur via
+/// [`SessionOptionsDto::mot_de_passe`], vérifié contre le hachage salé persisté
+/// — voir [`set_unattended_password`]) → accepté sans dialogue, un mot de passe
+/// invalide étant refusé immédiatement ; sinon → **repli sur l'approbation
+/// pilotée par le Dart** : l'`accept` du moteur bloque jusqu'à ce que l'UI
+/// réponde via [`approve_incoming`], borné par un délai au-delà duquel
+/// l'appelant est **refusé par défaut** (jamais de blocage indéfini).
+/// Abonnez-vous à [`unattended_incoming_stream`] pour recevoir ces demandes de
+/// repli.
 ///
 /// `stun_servers` (adresses « ip:port », liste éventuellement vide) alimente les
 /// candidats de hole punching. `permissions` s'applique aux entrées reçues
@@ -1106,8 +1128,30 @@ pub fn get_setting(cle: String) -> Result<Option<String>, String> {
 }
 
 /// Définit (persiste) la valeur d'un réglage. Erreur si la clé est vide.
+///
+/// Effet de bord : quand la clé est `demarrer_avec_systeme`, le réglage est rendu
+/// **réellement effectif** — l'entrée d'auto-démarrage de l'utilisateur (clé de
+/// registre `Run`, sans droits administrateur) est ajoutée/retirée via
+/// [`apply_autostart`] après la persistance. Un échec d'application est remonté à
+/// l'UI (le réglage reste persisté ; l'UI peut réappliquer via [`apply_autostart`]).
 pub fn set_setting(cle: String, valeur: String) -> Result<(), String> {
-    crate::etat::magasin().definir_reglage(cle, valeur)
+    // Détecte l'auto-démarrage AVANT le déplacement de `cle`/`valeur` dans l'appel.
+    let autostart = (cle == crate::etat::CLE_DEMARRER_AVEC_SYSTEME).then(|| valeur == "true");
+    crate::etat::magasin().definir_reglage(cle, valeur)?;
+    if let Some(actif) = autostart {
+        crate::plateforme::appliquer_demarrage_auto(actif)?;
+    }
+    Ok(())
+}
+
+/// Applique le réglage « **démarrer avec le système** » **sans droits
+/// administrateur** : ajoute (si `actif`) ou retire la valeur `NovaDesk` de la clé
+/// de registre `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pointant sur
+/// l'exécutable courant. À appeler par l'UI quand l'utilisateur bascule le réglage
+/// (c'est aussi fait automatiquement par [`set_setting`] quand la clé
+/// `demarrer_avec_systeme` change). Hors Windows : sans effet (`Ok(())`).
+pub fn apply_autostart(actif: bool) -> Result<(), String> {
+    crate::plateforme::appliquer_demarrage_auto(actif)
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1271,34 @@ pub fn record_access(peer_id: u64, accepte: bool) -> Result<(), String> {
 /// Renvoie le journal des accès, du plus récent au plus ancien.
 pub fn access_log() -> Result<Vec<AccessLogEntryDto>, String> {
     crate::etat::magasin().journal_acces()
+}
+
+// ---------------------------------------------------------------------------
+// 7. Liste blanche d'admission (ACL)
+// ---------------------------------------------------------------------------
+//
+// Liste d'ID **admis sans mot de passe** en accès non surveillé. Elle est
+// consultée par le vérificateur d'admission de l'hôte non surveillé
+// ([`start_unattended_host`]) en **union** avec les appareils de confiance :
+// la confiance à l'admission vaut *liste blanche ∪ appareils de confiance*.
+// Distincte des appareils de confiance ([`add_trusted_device`]) : deux listes
+// que l'admission réunit.
+
+/// Renvoie la liste blanche d'admission (ID admis sans mot de passe), dans
+/// l'ordre d'ajout.
+pub fn list_admission_allowlist() -> Result<Vec<u64>, String> {
+    crate::etat::magasin().admission_liste()
+}
+
+/// Ajoute un ID à la liste blanche d'admission (sans effet s'il y figure déjà).
+/// Cet ID sera dès lors admis **sans mot de passe** en accès non surveillé.
+pub fn add_admission_allowed(id: u64) -> Result<(), String> {
+    crate::etat::magasin().admission_ajouter(id)
+}
+
+/// Retire un ID de la liste blanche d'admission. Erreur s'il n'y figure pas.
+pub fn remove_admission_allowed(id: u64) -> Result<(), String> {
+    crate::etat::magasin().admission_retirer(id)
 }
 
 // ===========================================================================
@@ -2023,6 +2095,127 @@ impl From<PeerInfo> for PeerInfoDto {
 /// pas encore arrivée (ou si la session est inconnue).
 pub fn session_peer_info(session_id: u64) -> Result<PeerInfoDto, String> {
     crate::flux::infos_pair(session_id)
+}
+
+// ===========================================================================
+// Listing de fichiers distant & découverte LAN
+// ===========================================================================
+//
+// Deux briques déjà livrées, mises à portée du Dart : le **listing de
+// répertoire distant** (`nd_files`, plan 09) routé DANS la session par
+// `nd-core` (canal `Control` chiffré, gardé par la permission
+// fichiers/réception), et la **découverte de pairs sur le réseau local**
+// (`nd_features::decouverte`, beacon multicast UDP). Toutes **synchrones à
+// DTO plats** (aucun `StreamSink`) : aucun `pont_provisoire` requis — le
+// codegen produira leurs `SseEncode`/`SseDecode` à la régénération.
+
+/// Entrée d'un listing de répertoire **distant** (miroir plat de
+/// `nd_files::EntreeFs`) : un fichier ou un dossier du poste hôte, tel que
+/// rendu par [`session_list_remote_dir`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntreeFsDto {
+    /// Nom de l'entrée (dernier composant, sans le chemin parent).
+    pub nom: String,
+    /// Taille en octets (0 pour les dossiers et les racines).
+    pub taille: u64,
+    /// `true` pour un dossier (navigable), `false` pour un fichier.
+    pub est_dossier: bool,
+    /// Horodatage de modification (secondes epoch), si disponible.
+    pub modifie_le: Option<u64>,
+}
+
+impl From<EntreeFs> for EntreeFsDto {
+    fn from(entree: EntreeFs) -> Self {
+        EntreeFsDto {
+            nom: entree.nom,
+            taille: entree.taille,
+            est_dossier: entree.est_dossier,
+            modifie_le: entree.modifie_le,
+        }
+    }
+}
+
+/// Liste le **répertoire distant** `chemin` à travers la session `session_id`
+/// (rôle contrôleur, mode étendu [`SessionOptionsDto::extended_features`]) :
+/// la requête part sur le canal `Control` chiffré, l'hôte la sert **derrière
+/// la permission** fichiers/réception (`fichiers_reception`,
+/// [`session_set_permission`]), et la réponse corrélée est attendue dans un
+/// délai borné (~10 s) **sans bloquer les autres appels de session**.
+///
+/// Chemin **vide** = racines du poste hôte (lettres de lecteur Windows —
+/// chaque nom rendu, ex. « C:\ », est directement utilisable comme chemin de
+/// la demande suivante —, `/` ailleurs) : l'amorce du navigateur de fichiers.
+/// Les dossiers viennent d'abord, puis les fichiers, chaque groupe trié par
+/// nom.
+///
+/// # Errors
+/// Session inconnue, session terminée, aucune réponse dans le délai (session
+/// non étendue, pair injoignable), **ou refus de l'hôte** : l'erreur renvoyée
+/// par lui (« accès refusé » sans la permission, dossier inexistant, chemin
+/// qui n'est pas un dossier…) est propagée telle quelle — jamais de liste
+/// partielle trompeuse.
+pub fn session_list_remote_dir(
+    session_id: u64,
+    chemin: String,
+) -> Result<Vec<EntreeFsDto>, String> {
+    crate::flux::lister_repertoire_distant(session_id, chemin)
+}
+
+/// Pair NovaDesk **découvert sur le réseau local** via ses annonces de présence
+/// (miroir plat de `nd_features::decouverte::PairDecouvert`). ⚠️ Les annonces ne
+/// sont ni signées ni chiffrées : `id` et `nom` sont purement indicatifs
+/// (affichage) — l'authentification passe par la poignée de main chiffrée de la
+/// session, jamais par la découverte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPeerDto {
+    /// Identifiant NovaDesk annoncé (brut, à passer aux fonctions de session).
+    pub id: u64,
+    /// ID au format groupé par 3 (« 123 456 789 »), prêt à afficher.
+    pub id_formate: String,
+    /// Nom d'affichage annoncé par le pair.
+    pub nom: String,
+    /// Adresse source de la dernière annonce (« ip:port » ; l'IP identifie la
+    /// machine, le port est celui, éphémère, de son annonceur).
+    pub adresse: String,
+}
+
+/// Démarre la **découverte LAN** : annonce la présence du poste (identité
+/// locale persistante [`local_identity`] + `nom` d'affichage) sur le groupe
+/// multicast et collecte les annonces des voisins sur le même `port`
+/// (`port == 0` → port par défaut du parc,
+/// `nd_features::decouverte::PORT_DECOUVERTE_DEFAUT`).
+///
+/// **Idempotent** : une seule instance vivante par processus — tant qu'elle
+/// vit, les appels suivants sont sans effet (et sans erreur), quels que soient
+/// leurs arguments. Pour changer de nom ou de port : [`discovery_stop`] puis
+/// redémarrer. Sa propre annonce, entendue en boucle, est exclue de
+/// [`discovery_peers`].
+///
+/// # Errors
+/// Identité locale indisponible, port d'écoute déjà occupé (autre instance sur
+/// la machine), ou socket d'annonce impossible à ouvrir — message français
+/// affichable. Les échecs d'émission **ultérieurs** (réseau absent, multicast
+/// filtré) ne sont pas fatals : le beacon retente à chaque tick.
+pub fn discovery_start(nom: String, port: u16) -> Result<(), String> {
+    crate::flux::demarrer_decouverte(&nom, port)
+}
+
+/// Instantané des pairs NovaDesk vus sur le réseau local : **dédupliqués par
+/// id** (une annonce plus récente rafraîchit l'entrée), **expirés** après ~10 s
+/// sans nouvelle annonce, le poste local exclu, triés par id croissant. Liste
+/// vide si la découverte n'est pas démarrée ([`discovery_start`]).
+#[must_use]
+pub fn discovery_peers() -> Vec<DiscoveredPeerDto> {
+    crate::flux::pairs_decouverts()
+}
+
+/// Arrête la **découverte LAN** : cesse d'annoncer la présence du poste et de
+/// collecter les voisins (les fils du beacon et de l'écoute sont joints).
+/// Idempotent : arrêter une découverte déjà arrêtée (ou jamais démarrée) est
+/// sans effet et sans erreur. Un [`discovery_start`] ultérieur redémarre.
+pub fn discovery_stop() -> Result<(), String> {
+    crate::flux::arreter_decouverte();
+    Ok(())
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! commun avec la vidéo. Détails par OS (WASAPI/CoreAudio/PipeWire) :
 //! `../../plan-technique/08-audio.md`.
 
+pub mod capture_mixte;
 pub mod codec;
 pub mod convert;
 pub mod jitter;
@@ -25,6 +26,7 @@ mod winplay;
 use nd_proto::NdError;
 use nd_proto::Result;
 
+pub use capture_mixte::{CapteurMixte, GAIN_MICRO, GAIN_SYSTEME};
 pub use codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus, TRAME_MS};
 pub use jitter::{JitterBuffer, SortieJitter, StatsJitter};
 pub use level::{dbfs, est_silence, peak, rms, LevelMeter, DBFS_PLANCHER};
@@ -33,7 +35,9 @@ pub use linux::{PulseLoopbackCapturer, PulseMicCapturer, PulsePlayer};
 #[cfg(target_os = "macos")]
 pub use macos::{CoreAudioPlayer, SckSystemCapturer};
 pub use mixing::{mix, mix_into, soft_clip, Mixer, SEUIL_SOFT_CLIP};
-pub use session::{AudioSession, EmetteurAudio, EvenementLecture, RecepteurAudio, SourceAudio};
+pub use session::{
+    AudioSession, EmetteurAudio, EvenementLecture, RecepteurAudio, SourceAudio, SourceEmission,
+};
 #[cfg(windows)]
 pub use win::WasapiLoopbackCapturer;
 #[cfg(windows)]

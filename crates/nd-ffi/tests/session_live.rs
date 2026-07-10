@@ -194,6 +194,7 @@ fn start_session_with_options_refuse_une_adresse_illisible() {
         extended_features: false,
         transfer_dir: None,
         transport_reconnect: false,
+        mot_de_passe: None,
     };
     let erreur = start_session_with_options(
         config,

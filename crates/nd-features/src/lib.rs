@@ -25,6 +25,11 @@
 //! - **Reconnexion** : [`ReconnectController`] (`on_disconnect` /
 //!   `next_delay` / `reset`) pilote le backoff sans dormir. Contrat en tête
 //!   de [`reconnect`].
+//! - **Découverte LAN** : [`AnnonceurPresence`] annonce la présence du poste
+//!   en multicast UDP et [`EcouteurPresence`] tient la liste des pairs vus
+//!   sur le réseau local ([`EcouteurPresence::pairs`] → [`PairDecouvert`],
+//!   dédupliqués par id, expirés après [`TTL_PAIR`]) — de quoi remplir
+//!   l'onglet « Découverts » de l'UI. Contrat en tête de [`decouverte`].
 //! - **Tunnel** : [`LocalForwarder`] relaie une redirection de port TCP réelle
 //!   et [`TunnelStats`] compte les octets relayés dans chaque sens ainsi que
 //!   les connexions. Contrat en tête de [`tunnel`].
@@ -37,6 +42,7 @@
 //! d'événements de l'UI) — voir leurs docs de module respectives.
 
 pub mod annotation;
+pub mod decouverte;
 pub mod hotkeys;
 pub mod invite;
 pub mod permissions;
@@ -48,6 +54,11 @@ pub mod tunnel;
 pub mod wol;
 
 pub use annotation::{AnnotationLayer, RgbaCanvas, Stroke};
+pub use decouverte::{
+    decoder_presence, encoder_presence, AnnonceurPresence, EcouteurPresence, OptionsEcoute,
+    PairDecouvert, GROUPE_MULTICAST, MAX_PAIRS, NOM_MAX_OCTETS, PERIODE_ANNONCE,
+    PORT_DECOUVERTE_DEFAUT, TTL_PAIR,
+};
 pub use hotkeys::{ActionCodec, HostAction, Hotkey, HotkeyMap, KeyEvent, KeyState};
 pub use invite::{generate_invite, InviteStore, RedeemResult, SessionInvite};
 pub use permissions::{

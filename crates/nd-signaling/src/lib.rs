@@ -32,6 +32,12 @@
 //! registre (défaut : [`DEFAULT_TTL`]) est considérée hors-ligne : `lookup` la
 //! renvoie « introuvable » et [`Registry::sweep_expired`] (ou le balayeur lancé
 //! via [`Registry::spawn_sweeper`]) la retire de la table.
+//!
+//! **Enregistrement authentifié (plan 11)** : le serveur de production
+//! (`server/nd-rendezvous`) refuse le `Register` nu et exige une preuve de
+//! possession d'ID (jeton d'attribution + signature Ed25519) — voir [`auth`]
+//! et [`RendezvousClient::register_authentifie`]. Le registre nu de ce crate
+//! ([`serve`], binaire `nd-registre`) reste le rendez-vous de développement.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -41,6 +47,9 @@ use std::time::{Duration, Instant};
 
 use nd_proto::{NdError, NovaId, Result};
 
+/// Enregistrement authentifié (jeton + signature Ed25519) auprès du
+/// rendez-vous de production (plan 11).
+pub mod auth;
 /// Connecteur P2P de bout en bout : STUN + candidats + punch coordonnés.
 pub mod connect;
 /// Détection best-effort du type de NAT (comparaison de deux serveurs STUN).
@@ -732,14 +741,26 @@ impl RendezvousClient {
     }
 
     fn round_trip(&self, req: &Request) -> Result<Response> {
+        self.round_trip_brut(&req.to_bytes())
+    }
+
+    /// Envoie une trame déjà encodée (une connexion par échange) et décode la
+    /// réponse du serveur. Sert aussi aux trames hors protocole nu (tag 8,
+    /// [`auth`]) : le serveur répond avec les mêmes réponses dans tous les cas.
+    fn round_trip_brut(&self, trame: &[u8]) -> Result<Response> {
         let mut stream = TcpStream::connect(self.server)?;
-        write_frame(&mut stream, &req.to_bytes())?;
+        write_frame(&mut stream, trame)?;
         let resp = read_frame(&mut stream)?;
         Response::from_bytes(&resp)
             .ok_or_else(|| NdError::Protocol("réponse rendez-vous invalide".into()))
     }
 
     /// Publie l'ID local avec son adresse (UDP/QUIC) et son certificat.
+    ///
+    /// Enregistrement **nu** (sans preuve de possession) : accepté par le
+    /// registre de développement de ce crate ([`serve`], binaire
+    /// `nd-registre`), mais **refusé** par le rendez-vous de production —
+    /// utiliser alors [`RendezvousClient::register_authentifie`].
     pub fn register(&self, id: NovaId, addr: SocketAddr, cert_der: &[u8]) -> Result<()> {
         let req = Request::Register {
             id: id.as_u64(),
@@ -749,6 +770,51 @@ impl RendezvousClient {
         match self.round_trip(&req)? {
             Response::Registered => Ok(()),
             _ => Err(NdError::Protocol("échec d'enregistrement".into())),
+        }
+    }
+
+    /// Publie l'ID local auprès du **rendez-vous de production** (façade
+    /// authentifiée `server/nd-rendezvous`) : trame [`auth::RegisterAuthentifie`]
+    /// (tag 8) portant l'adresse et le certificat publiés, un horodatage frais
+    /// (anti-rejeu), le `jeton` d'enregistrement émis par l'autorité du
+    /// déploiement (opaque ici, obtenu à l'attribution de l'ID) et la signature
+    /// Ed25519 de possession produite avec `cle_signature` — la clé statique du
+    /// client, celle que le jeton lie à `id`.
+    ///
+    /// Après acceptation, la présence se maintient comme pour un
+    /// [`RendezvousClient::register`] : mêmes [`RendezvousClient::heartbeat`],
+    /// candidats et punch, que la façade de production transmet sans exiger de
+    /// signature (voir [`auth`], « Pourquoi le heartbeat reste nu »).
+    ///
+    /// # Errors
+    /// Erreur si le serveur refuse l'enregistrement (jeton invalide ou pour un
+    /// autre ID, signature fausse, horodatage hors de la fenêtre de tolérance),
+    /// ou en cas d'erreur réseau/protocole.
+    pub fn register_authentifie(
+        &self,
+        id: NovaId,
+        addr: SocketAddr,
+        cert_der: &[u8],
+        jeton: &[u8],
+        cle_signature: &auth::SigningKey,
+    ) -> Result<()> {
+        let trame = auth::RegisterAuthentifie::signer(
+            id.as_u64(),
+            &addr.to_string(),
+            cert_der,
+            auth::maintenant_unix(),
+            jeton,
+            cle_signature,
+        )
+        .to_bytes();
+        match self.round_trip_brut(&trame)? {
+            Response::Registered => Ok(()),
+            Response::NotFound => Err(NdError::Protocol(
+                "enregistrement authentifié refusé par le rendez-vous \
+                 (jeton, signature ou horodatage invalides)"
+                    .into(),
+            )),
+            _ => Err(NdError::Protocol("réponse inattendue".into())),
         }
     }
 

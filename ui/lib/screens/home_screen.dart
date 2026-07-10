@@ -10,10 +10,17 @@
 /// **mise en relation par rendez-vous** ([SessionEndpointByRendezvous]).
 /// « Wake-on-LAN » demande l'adresse MAC (le carnet n'en stocke pas) puis émet
 /// le paquet magique **réel** via la façade (`send_wol`).
+///
+/// L'onglet « Découverts » affiche les **pairs LAN réels** : `discovery_peers`
+/// est sondé (~2 s) tant que l'onglet est actif — la découverte elle-même est
+/// démarrée au niveau application (coquille, `main.dart`). Un **mot de passe
+/// optionnel** (hôte en accès non surveillé), déplié par la puce cadenas sous
+/// le champ d'adresse, est transmis via [SessionOptionsDto.motDePasse].
 library;
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -75,6 +82,14 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   final TextEditingController _adresseController = TextEditingController();
   final FocusNode _adresseFocus = FocusNode(debugLabel: 'champ-adresse');
 
+  /// Mot de passe **optionnel** présenté à un hôte en accès non surveillé
+  /// (admission automatique) ; champ déplié à la demande par la puce cadenas.
+  final TextEditingController _mdpController = TextEditingController();
+  final FocusNode _mdpFocus = FocusNode(debugLabel: 'champ-mot-de-passe');
+  bool _mdpDeplie = false;
+  bool _mdpEnFocus = false;
+  bool _mdpRenseigne = false;
+
   ModeConnexion _mode = ModeConnexion.controle;
   bool _connexionEnCours = false;
   bool _adresseEnFocus = false;
@@ -85,6 +100,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   /// Squelette de chargement de la liste (~780 ms comme la maquette).
   bool _chargement = true;
   Timer? _minuteurChargement;
+
+  /// Instantané des pairs découverts sur le réseau local (`discovery_peers`),
+  /// sondé par [_minuteurDecouverte] tant que l'onglet « Découverts » est actif.
+  List<DiscoveredPeerDto> _pairsDecouverts = const [];
+  Timer? _minuteurDecouverte;
+  bool _sondeDecouverteEnCours = false;
 
   /// Adresses MAC saisies pour le Wake-on-LAN pendant la session, par ID de
   /// contact : le carnet ne stocke pas de MAC, on pré-remplit donc le dialogue
@@ -97,6 +118,17 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     _adresseFocus.addListener(
       () => setState(() => _adresseEnFocus = _adresseFocus.hasFocus),
     );
+    _mdpFocus.addListener(
+      () => setState(() => _mdpEnFocus = _mdpFocus.hasFocus),
+    );
+    // La puce cadenas reste « active » tant qu'un mot de passe est saisi (même
+    // champ replié) : on ne rebâtit que sur la transition vide ↔ renseigné.
+    _mdpController.addListener(() {
+      final renseigne = _mdpController.text.isNotEmpty;
+      if (renseigne != _mdpRenseigne && mounted) {
+        setState(() => _mdpRenseigne = renseigne);
+      }
+    });
     _minuteurChargement = Timer(const Duration(milliseconds: 780), () {
       if (mounted) setState(() => _chargement = false);
     });
@@ -106,9 +138,65 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   void dispose() {
     _minuteurCopie?.cancel();
     _minuteurChargement?.cancel();
+    _minuteurDecouverte?.cancel();
     _adresseController.dispose();
     _adresseFocus.dispose();
+    _mdpController.dispose();
+    _mdpFocus.dispose();
     super.dispose();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Découverte LAN (onglet « Découverts ») — sonde périodique de l'instantané
+  // ---------------------------------------------------------------------------
+
+  /// Bascule d'onglet : (dés)arme la sonde de découverte selon l'onglet visé —
+  /// le minuteur ne vit que tant que « Découverts » est actif.
+  void _changerOnglet(_OngletAccueil onglet) {
+    if (_onglet == onglet) return;
+    setState(() => _onglet = onglet);
+    if (onglet == _OngletAccueil.decouverts) {
+      _demarrerSondeDecouverte();
+    } else {
+      _arreterSondeDecouverte();
+    }
+  }
+
+  /// Arme la sonde périodique (~2 s) des pairs découverts, avec un relevé
+  /// immédiat pour peupler la liste sans attendre le premier tic. La découverte
+  /// elle-même tourne au niveau application (démarrée par la coquille au
+  /// lancement) : ici on ne fait que **lire** l'instantané des voisins.
+  void _demarrerSondeDecouverte() {
+    if (_minuteurDecouverte != null) return;
+    unawaited(_sonderPairsDecouverts());
+    _minuteurDecouverte = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_sonderPairsDecouverts()),
+    );
+  }
+
+  void _arreterSondeDecouverte() {
+    _minuteurDecouverte?.cancel();
+    _minuteurDecouverte = null;
+  }
+
+  /// Relève l'instantané `discovery_peers` et rafraîchit la liste si elle a
+  /// changé. Silencieux en cas d'échec (le prochain tic retentera) : une sonde
+  /// de fond ne produit jamais de toast.
+  Future<void> _sonderPairsDecouverts() async {
+    if (_sondeDecouverteEnCours) return;
+    _sondeDecouverteEnCours = true;
+    try {
+      final pairs = await ref.read(nativeApiProvider).discoveryPeers();
+      if (!mounted) return;
+      if (!listEquals(pairs, _pairsDecouverts)) {
+        setState(() => _pairsDecouverts = pairs);
+      }
+    } catch (_) {
+      // Best-effort : liste inchangée, nouvelle tentative au prochain tic.
+    } finally {
+      _sondeDecouverteEnCours = false;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -149,7 +237,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         stunServers: ref.read(stunServersProvider),
         relay: ref.read(relayProvider),
       );
-      final options = SessionOptionsDto(permissions: mode.permissions);
+      // Mot de passe optionnel (hôte en accès non surveillé) : transmis tel
+      // quel s'il est saisi — vide → `null`, l'hôte garde son dialogue manuel.
+      final motDePasse = _mdpController.text;
+      final options = SessionOptionsDto(
+        permissions: mode.permissions,
+        motDePasse: motDePasse.isEmpty ? null : motDePasse,
+      );
       // Journalise la session au démarrage (historique + dernière connexion du
       // contact) puis rafraîchit les vues concernées.
       await api.recordSession(id: idPair, alias: alias ?? idFormate);
@@ -461,9 +555,103 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           runSpacing: 6,
           children: [
             for (final mode in ModeConnexion.values) _puceMode(t, mode),
+            _puceMotDePasse(t),
           ],
         ),
+        if (_mdpDeplie) ...[
+          const SizedBox(height: 10),
+          _champMotDePasse(t),
+        ],
       ],
+    );
+  }
+
+  /// Puce « Mot de passe » (cadenas) : déplie/replie le champ de mot de passe
+  /// d'accès non surveillé sous le champ d'adresse. Reste « active » (bleue)
+  /// tant qu'un mot de passe est saisi — la saisie est transmise même champ
+  /// replié.
+  Widget _puceMotDePasse(NovaTokens t) {
+    final actif = _mdpDeplie || _mdpRenseigne;
+    return NovaActivable(
+      onTap: () {
+        setState(() => _mdpDeplie = !_mdpDeplie);
+        // Saisie immédiate au dépliage (la demande de focus est honorée quand
+        // le champ s'attache à l'arbre, au frame suivant).
+        if (_mdpDeplie) _mdpFocus.requestFocus();
+      },
+      label: 'Mot de passe (hôte en accès non surveillé)',
+      builder: (context, survole, focus) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+        decoration: BoxDecoration(
+          color: actif ? t.selection : Colors.transparent,
+          border: Border.all(color: actif ? t.bleu : t.champBordure),
+          borderRadius: BorderRadius.circular(kNovaRayon),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            NovaIcone(NovaIcones.cadenas,
+                taille: 13, couleur: actif ? t.bleu : t.texte2),
+            const SizedBox(width: 6),
+            Text(
+              'Mot de passe',
+              style:
+                  TextStyle(fontSize: 11.5, color: actif ? t.bleu : t.texte2),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Champ **mot de passe optionnel** (accès non surveillé), déplié sous le
+  /// champ d'adresse par la puce cadenas. Sa valeur non vide part dans
+  /// [SessionOptionsDto.motDePasse] à la connexion ([_seConnecter]) ; vide →
+  /// `null` (l'hôte se replie sur son dialogue d'approbation manuel).
+  Widget _champMotDePasse(NovaTokens t) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 120),
+      height: 34,
+      padding: const EdgeInsets.symmetric(horizontal: 11),
+      decoration: BoxDecoration(
+        color: t.fenetre,
+        borderRadius: BorderRadius.circular(kNovaRayon),
+        border: Border.all(color: _mdpEnFocus ? kNovaRouge : t.champBordure),
+        boxShadow: _mdpEnFocus
+            ? [
+                BoxShadow(
+                  color: t.bleu.withValues(alpha: 0.13),
+                  spreadRadius: 3,
+                ),
+              ]
+            : null,
+      ),
+      child: Row(
+        children: [
+          NovaIcone(NovaIcones.cadenas, taille: 14, couleur: t.texte3),
+          const SizedBox(width: 9),
+          Expanded(
+            child: TextField(
+              controller: _mdpController,
+              focusNode: _mdpFocus,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              style: TextStyle(fontSize: 13.5, color: t.texte),
+              decoration: InputDecoration(
+                isCollapsed: true,
+                filled: false,
+                border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
+                hintText: 'Optionnel — pour un hôte en accès non surveillé',
+                hintStyle: TextStyle(fontSize: 12.5, color: t.texte3),
+              ),
+              onSubmitted: (_) => unawaited(_seConnecter()),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -708,7 +896,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         children: [
           _onglets(t, _OngletAccueil.recentes, 'Sessions récentes', null),
           _onglets(t, _OngletAccueil.favoris, 'Favoris', favoris),
-          _onglets(t, _OngletAccueil.decouverts, 'Découverts', 0),
+          _onglets(
+              t, _OngletAccueil.decouverts, 'Découverts', _pairsDecouverts.length),
         ],
       ),
     );
@@ -717,7 +906,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget _onglets(NovaTokens t, _OngletAccueil onglet, String libelle, int? n) {
     final actif = _onglet == onglet;
     return NovaActivable(
-      onTap: () => setState(() => _onglet = onglet),
+      onTap: () => _changerOnglet(onglet),
       rayonFocus: 3,
       label: libelle,
       builder: (context, survole, focus) => Container(
@@ -763,23 +952,30 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // --- Liste d'appareils ----------------------------------------------------
 
   Widget _liste() {
-    if (_onglet == _OngletAccueil.decouverts) {
-      return const NovaEmptyState(
-        icone: NovaIcones.radar,
-        titre: 'Aucun appareil découvert',
-        sousTitre:
-            'Aucun poste NovaDesk détecté sur votre réseau local.',
-      );
-    }
-    if (_chargement) {
-      return ListView(
-        children: [for (var i = 0; i < 4; i++) const _LigneSquelette()],
-      );
-    }
     final carnet =
         ref.watch(carnetProvider).valueOrNull ?? const <EntreeCarnet>[];
     final List<EntreeCarnet> entrees;
-    if (_onglet == _OngletAccueil.favoris) {
+    if (_onglet == _OngletAccueil.decouverts) {
+      // Liste **vivante** des pairs LAN (instantané `discovery_peers`, sondé
+      // par minuteur tant que l'onglet est actif) — pas de squelette : une
+      // liste vide est un résultat honnête, pas un chargement.
+      if (_pairsDecouverts.isEmpty) {
+        return const NovaEmptyState(
+          icone: NovaIcones.radar,
+          titre: 'Aucun appareil découvert',
+          sousTitre:
+              'Aucun appareil NovaDesk détecté sur le réseau local.',
+        );
+      }
+      entrees = [
+        for (final pair in _pairsDecouverts)
+          _entreeDepuisPairDecouvert(pair, carnet),
+      ];
+    } else if (_chargement) {
+      return ListView(
+        children: [for (var i = 0; i < 4; i++) const _LigneSquelette()],
+      );
+    } else if (_onglet == _OngletAccueil.favoris) {
       entrees = carnet.where((e) => e.favori).toList();
       if (entrees.isEmpty) {
         return const NovaEmptyState(
@@ -810,6 +1006,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         onFavori: () => unawaited(_basculerFavori(entrees[i])),
         onMenu: (pos) => unawaited(_menuContextuel(entrees[i], pos)),
       ),
+    );
+  }
+
+  /// Convertit un pair découvert sur le LAN en entrée d'affichage : nom
+  /// annoncé, adresse « ip:port » en libellé de droite et pastille **verte**
+  /// (il vient d'annoncer sa présence, il est en ligne). L'étoile reflète le
+  /// carnet si le pair y figure.
+  ///
+  /// ⚠️ Les annonces ne sont ni signées ni chiffrées : nom et ID sont purement
+  /// indicatifs — l'authentification passe par la poignée de main de session.
+  EntreeCarnet _entreeDepuisPairDecouvert(
+      DiscoveredPeerDto pair, List<EntreeCarnet> carnet) {
+    final corr = carnet.where((e) => e.id == pair.id).firstOrNull;
+    return EntreeCarnet(
+      id: pair.id,
+      alias: pair.nom,
+      derniereConnexion: pair.adresse,
+      favori: corr?.favori ?? false,
+      enLigne: true,
+      groupe: 'Découverts',
     );
   }
 

@@ -34,15 +34,19 @@ use nd_core::{
     ChatMessage, SessionEndpoint, SessionEngine, SessionHandle, SessionMedia, SessionOptions,
     SessionState, TunnelHandle, UnattendedHost, UnattendedHostHandle,
 };
+use nd_features::decouverte::{
+    AnnonceurPresence, EcouteurPresence, OptionsEcoute, PORT_DECOUVERTE_DEFAUT,
+};
 use nd_features::{AnnotationLayer, Capability, PermissionSet, Permissions};
 use nd_files::{ClipboardSync, TransferEvent};
 use nd_proto::{InputEvent, NovaId};
 use nd_transport::ServerIdentity;
 
 use crate::api::{
-    AnnotationDto, ChatMessageDto, IncomingRequestDto, ListenInfoDto, MonitorInfoDto, PeerInfoDto,
-    PermissionsDto, SessionConfigDto, SessionEndpointDto, SessionOptionsDto, SessionStateDto,
-    SessionStatsDto, TransferEventDto, TunnelOuvertDto, VideoFrameDto,
+    AnnotationDto, ChatMessageDto, DiscoveredPeerDto, EntreeFsDto, IncomingRequestDto,
+    ListenInfoDto, MonitorInfoDto, PeerInfoDto, PermissionsDto, SessionConfigDto,
+    SessionEndpointDto, SessionOptionsDto, SessionStateDto, SessionStatsDto, TransferEventDto,
+    TunnelOuvertDto, VideoFrameDto,
 };
 use crate::frb_generated::{SseEncode, StreamSink};
 
@@ -529,6 +533,34 @@ pub(crate) fn infos_pair(id: u64) -> Result<PeerInfoDto, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Listing de répertoire distant (brique `nd_files` routée DANS la session)
+// ---------------------------------------------------------------------------
+
+/// Liste le répertoire distant `chemin` via la session `id` (rôle contrôleur,
+/// mode étendu) et aplatit les entrées en DTO. L'erreur applicative de l'hôte
+/// (accès refusé sans la permission fichiers/réception, dossier inexistant…)
+/// est propagée en `Err(String)` — jamais de liste partielle trompeuse.
+pub(crate) fn lister_repertoire_distant(
+    id: u64,
+    chemin: String,
+) -> Result<Vec<EntreeFsDto>, String> {
+    // 1. Sous verrou : détache le client de listing de la poignée. La table
+    //    des sessions n'est PAS retenue pendant l'attente de la réponse —
+    //    `send_input`, les statistiques… restent fluides pendant ce temps.
+    let client = avec_entree(id, |entree| entree.poignee.remote_fs())?;
+    // 2. Hors verrou : requête sur le canal `Control` chiffré + attente de la
+    //    réponse corrélée (délai borné par le moteur, ~10 s).
+    let reponse = client
+        .lister(chemin)
+        .map_err(|e| format!("listing distant impossible : {e}"))?;
+    // 3. Le refus ou l'échec côté hôte se propage tel quel (message lisible).
+    if let Some(erreur) = reponse.erreur {
+        return Err(erreur);
+    }
+    Ok(reponse.entrees.into_iter().map(EntreeFsDto::from).collect())
+}
+
 // --- Table des tunnels TCP par session --------------------------------------
 
 /// Tunnels TCP ouverts par session : la [`TunnelHandle`] doit vivre aussi
@@ -738,9 +770,12 @@ fn restituer(id: u64, rendre: impl FnOnce(&mut EntreeSession)) {
 // # Design de l'approbation entrante (bloquant + garde-fous)
 //
 // Le hook `accept` du moteur ([`nd_core::UnattendedHost`]) est **synchrone** : il
-// est consulté sur le thread de service, une connexion à la fois, avant tout octet
-// applicatif. On implémente donc une **file d'approbation bloquante** pilotée par
-// le Dart :
+// est consulté sur le thread de service, une connexion à la fois. Avec
+// l'admission automatique ([`UnattendedHost::start_with_admission`]), il n'est
+// plus que le **repli** : seuls les appelants sans preuve (ni appareil de
+// confiance, ni mot de passe — auquel cas rien n'a encore été honoré dans le
+// canal chiffré) y aboutissent. On implémente donc une **file d'approbation
+// bloquante** pilotée par le Dart :
 //
 // * `accept(pair)` enregistre l'attente, pousse une [`IncomingRequestDto`] vers le
 //   Dart (best-effort via le sink), puis **bloque** sur une [`Condvar`] ;
@@ -909,7 +944,16 @@ fn avec_hote<R>(host_id: u64, action: impl FnOnce(&mut EntreeHote) -> R) -> Resu
 }
 
 /// Démarre un hôte « accès non surveillé » et l'enregistre dans la table.
-/// L'`accept` du moteur consulte la file d'approbation pilotée par le Dart.
+///
+/// L'admission est **automatique** ([`UnattendedHost::start_with_admission`]) :
+/// le vérificateur du mot de passe permanent et la confiance de l'appelant
+/// viennent de l'état persistant ([`crate::etat`]). La **confiance à l'admission**
+/// vaut **liste blanche d'admission ∪ appareils de confiance** (un ID de l'une ou
+/// l'autre liste est accepté sans mot de passe). Le clair reçu du canal Noise
+/// n'est comparé qu'au **hachage salé** stocké (déchiffré au repos à la volée),
+/// jamais conservé ni journalisé, et toute erreur de lecture vaut refus (fermé
+/// par défaut). Sans preuve, l'`accept` du moteur se replie sur la file
+/// d'approbation pilotée par le Dart (le dialogue manuel existant).
 pub(crate) fn demarrer_hote_non_surveille(
     local_id: u64,
     rendezvous: String,
@@ -924,13 +968,31 @@ pub(crate) fn demarrer_hote_non_surveille(
 
     let approbation = Arc::new(ApprobationHote::new());
     let approbation_accept = Arc::clone(&approbation);
-    let poignee = UnattendedHost::start(
+    let poignee = UnattendedHost::start_with_admission(
         NovaId(local_id),
         serveur,
         stun,
         identite,
         permissions_moteur,
+        // Repli manuel : dialogue de l'UI (refus par défaut à l'expiration).
         move |pair| approbation_accept.attendre_approbation(pair),
+        // Vérificateur du mot de passe permanent : recalcul BLAKE3 salé contre
+        // le hachage persisté (déchiffré au repos à la volée — `etat`).
+        |mdp: &str| {
+            crate::etat::magasin()
+                .verifier_mot_de_passe_non_surveille(mdp.to_owned())
+                .unwrap_or(false)
+        },
+        // Confiance à l'admission = **liste blanche d'admission ∪ appareils de
+        // confiance** : un ID de l'une OU l'autre liste persistée (`etat`) est
+        // traité comme appareil de confiance (accepté sans mot de passe). Toute
+        // erreur de lecture vaut refus (fermé par défaut).
+        |pair: NovaId| {
+            let magasin = crate::etat::magasin();
+            let id = pair.as_u64();
+            magasin.appareil_de_confiance(id).unwrap_or(false)
+                || magasin.admission_contient(id).unwrap_or(false)
+        },
     )
     .map_err(|e| format!("démarrage de l'hôte non surveillé impossible : {e}"))?;
 
@@ -977,6 +1039,108 @@ pub(crate) fn arreter_hote_non_surveille(host_id: u64) -> Result<(), String> {
     entree.approbation.demander_arret();
     entree.poignee.stop();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Découverte LAN (`nd_features::decouverte`) : instance unique du processus
+// ---------------------------------------------------------------------------
+//
+// Comme les sessions et les hôtes non surveillés, la découverte vit dans un
+// état statique — mais **au plus une** instance (le beacon annonce l'identité
+// du poste, l'écouteur tient la table des voisins) : un `Option` sous mutex
+// plutôt qu'une table. `discovery_start` est idempotent tant qu'elle vit ;
+// `discovery_stop` la retire puis joint ses fils **hors verrou**.
+
+/// Découverte LAN vivante : le beacon d'annonce et l'écouteur des voisins.
+struct EtatDecouverte {
+    /// Annonce périodique `(id local, nom)` — arrêtée en la consommant.
+    annonceur: AnnonceurPresence,
+    /// Collecte des annonces des voisins (dédupliqués, expirés, id local exclu).
+    ecouteur: EcouteurPresence,
+}
+
+/// Instance de découverte du processus (`None` = arrêtée).
+static DECOUVERTE: OnceLock<Mutex<Option<EtatDecouverte>>> = OnceLock::new();
+
+/// Verrouille l'instance de découverte (empoisonnement absorbé, cf. [`verrou`]).
+fn verrou_decouverte() -> MutexGuard<'static, Option<EtatDecouverte>> {
+    DECOUVERTE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Démarre la découverte LAN : annonceur (identité locale persistante + `nom`)
+/// et écouteur (id local exclu) sur `port` (`0` → [`PORT_DECOUVERTE_DEFAUT`]).
+/// **Idempotent** : si une instance vit déjà, l'appel est sans effet — les
+/// arguments d'un second appel ne la reconfigurent pas ([`arreter_decouverte`]
+/// d'abord pour changer de nom ou de port).
+pub(crate) fn demarrer_decouverte(nom: &str, port: u16) -> Result<(), String> {
+    let port = if port == 0 {
+        PORT_DECOUVERTE_DEFAUT
+    } else {
+        port
+    };
+    let mut garde = verrou_decouverte();
+    if garde.is_some() {
+        return Ok(());
+    }
+    // Identité locale stable (créée et persistée au premier lancement) : l'id
+    // annoncé aux voisins est celui que le pair composera pour se connecter.
+    let id = NovaId(crate::etat::magasin().identite_locale()?.id);
+    // L'écouteur d'abord : c'est lui qui lie le port partagé du parc (l'échec
+    // le plus probable — port déjà occupé — survient avant d'annoncer quoi que
+    // ce soit). L'annonceur, lui, émet depuis un port éphémère.
+    let ecouteur = EcouteurPresence::demarrer_avec(
+        port,
+        OptionsEcoute {
+            exclure: Some(id),
+            ..OptionsEcoute::default()
+        },
+    )
+    .map_err(|e| format!("écoute de découverte impossible sur le port {port} : {e}"))?;
+    let annonceur = AnnonceurPresence::demarrer(id, nom, port)
+        .map_err(|e| format!("annonce de présence impossible : {e}"))?;
+    *garde = Some(EtatDecouverte {
+        annonceur,
+        ecouteur,
+    });
+    Ok(())
+}
+
+/// Instantané des pairs découverts, aplati en DTO : dédupliqués par id, expirés
+/// au-delà du TTL, le poste local exclu, triés par id croissant (garanties de
+/// [`EcouteurPresence::pairs`]). Liste vide si la découverte n'est pas démarrée.
+pub(crate) fn pairs_decouverts() -> Vec<DiscoveredPeerDto> {
+    let garde = verrou_decouverte();
+    let Some(etat) = garde.as_ref() else {
+        return Vec::new();
+    };
+    etat.ecouteur
+        .pairs()
+        .into_iter()
+        .map(|pair| DiscoveredPeerDto {
+            id: pair.id.as_u64(),
+            // Format groupé par 3 (« 123 456 789 »), celui de l'affichage.
+            id_formate: pair.id.to_string(),
+            nom: pair.nom,
+            adresse: pair.adresse.to_string(),
+        })
+        .collect()
+}
+
+/// Arrête la découverte LAN (idempotent : sans effet si elle ne vit pas).
+/// Les fils sont joints **hors verrou** (annonce ≤ une période, écoute ≤ 200 ms).
+pub(crate) fn arreter_decouverte() {
+    let etat = verrou_decouverte().take();
+    if let Some(EtatDecouverte {
+        annonceur,
+        ecouteur,
+    }) = etat
+    {
+        annonceur.arreter();
+        ecouteur.arreter();
+    }
 }
 
 // ---------------------------------------------------------------------------

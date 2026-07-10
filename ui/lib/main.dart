@@ -211,6 +211,11 @@ class NovaDeskApp extends ConsumerWidget {
 /// l'hôte non surveillé : démarrage automatique au lancement quand un mot de
 /// passe permanent est configuré (parité AnyDesk), toasts des erreurs de fond
 /// et arrêt best-effort à la sortie — voir [hoteNonSurveilleProvider].
+///
+/// Même logique pour la **découverte LAN** : annonce du poste et collecte des
+/// voisins démarrées au lancement (best-effort, jamais bloquant) et arrêtées
+/// à la sortie — l'onglet « Découverts » de l'accueil ne fait que lire
+/// l'instantané des pairs via `discovery_peers`.
 class NovaCoquille extends ConsumerStatefulWidget {
   const NovaCoquille({super.key});
 
@@ -232,7 +237,11 @@ class _NovaCoquilleState extends ConsumerState<NovaCoquille> {
     // mot de passe permanent est configuré — recevoir ne dépend plus de
     // l'ouverture de l'onglet « Non surveillé ».
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(_demarrageAutomatiqueHote());
+      if (!mounted) return;
+      unawaited(_demarrageAutomatiqueHote());
+      // Découverte LAN : annonce ce poste et collecte les voisins dès le
+      // lancement — l'onglet « Découverts » se peuple sans action préalable.
+      unawaited(_demarrerDecouverte());
     });
   }
 
@@ -248,6 +257,13 @@ class _NovaCoquilleState extends ConsumerState<NovaCoquille> {
     } catch (_) {
       // Ne bloque jamais la sortie.
     }
+    // Découverte LAN : cesse d'annoncer la présence du poste — même filet
+    // best-effort que l'hôte (tout meurt de toute façon avec le processus).
+    try {
+      await ref.read(nativeApiProvider).discoveryStop();
+    } catch (_) {
+      // Ne bloque jamais la sortie.
+    }
     return AppExitResponse.exit;
   }
 
@@ -256,6 +272,25 @@ class _NovaCoquilleState extends ConsumerState<NovaCoquille> {
         await ref.read(hoteNonSurveilleProvider.notifier).activerSiMotDePasse();
     if (active && mounted) {
       NovaToast.montrer(context, 'Accès non surveillé activé automatiquement');
+    }
+  }
+
+  /// Démarre la **découverte LAN** (annonce du poste sous son nom d'hôte
+  /// système + collecte des voisins, port par défaut du parc). Best-effort :
+  /// si le premier essai échoue (nom d'hôte indisponible, démarrage refusé…),
+  /// nouvelle tentative sous le nom générique « NovaDesk », puis abandon
+  /// silencieux — la découverte est un confort, elle ne casse jamais le
+  /// lancement (l'onglet « Découverts » restera simplement vide).
+  Future<void> _demarrerDecouverte() async {
+    final api = ref.read(nativeApiProvider);
+    try {
+      await api.discoveryStart(Platform.localHostname, 0);
+    } catch (_) {
+      try {
+        await api.discoveryStart('NovaDesk', 0);
+      } catch (_) {
+        // Abandon silencieux (best-effort).
+      }
     }
   }
 

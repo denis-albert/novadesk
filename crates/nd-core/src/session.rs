@@ -46,7 +46,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -61,7 +61,10 @@ use nd_features::{
     AnnotationLayer, Capability, HostAction, Hotkey, HotkeyMap, KeyEvent, KeyState,
     PermissionBroker, PermissionSet, ReconnectController, ReconnectPolicy,
 };
-use nd_files::{ClipboardSync, TransferEvent, TransferSession};
+use nd_files::{
+    traiter_requete_liste, ClipboardSync, ReponseListe, RequeteListe, TransferEvent,
+    TransferSession,
+};
 use nd_input::{create_injector, InputInjector};
 use nd_proto::{ChannelKind, InputEvent, MonitorId, NdError, NovaId, Reliability, Result};
 use nd_signaling::RendezvousClient;
@@ -71,10 +74,11 @@ use nd_transport::{
 };
 
 use crate::media::{
-    decoder_audio, decoder_controle, decoder_infos_pair, decoder_moniteurs, decoder_permissions,
-    decoder_qualite, decoder_region, encoder_audio, encoder_controle, encoder_infos_pair,
-    encoder_moniteurs, encoder_permissions, encoder_qualite, encoder_region, Categorie,
-    ChatMessage, CommandeMedia, SousTypeControle, MONITEURS_MAX,
+    decoder_audio, decoder_controle, decoder_demande_admission, decoder_infos_pair,
+    decoder_moniteurs, decoder_permissions, decoder_qualite, decoder_region, encoder_audio,
+    encoder_controle, encoder_demande_admission, encoder_infos_pair, encoder_moniteurs,
+    encoder_permissions, encoder_qualite, encoder_region, Categorie, ChatMessage, CommandeMedia,
+    DemandeAdmissionRecue, DemandeAdmissionSortante, SousTypeControle, MONITEURS_MAX,
 };
 use crate::p2p::{self, AttenteRendezvous};
 use crate::tunnel::{EtatTunnels, TunnelHandle};
@@ -111,6 +115,16 @@ const DELAI_TENTATIVE_RECONNEXION: Duration = Duration::from_secs(8);
 
 /// Période de scrutation du pont d'arrêt d'époque (« nd-session-garde »).
 const PERIODE_GARDE: Duration = Duration::from_millis(10);
+
+/// Délai maximal d'attente d'une réponse de **listing distant**
+/// ([`SessionHandle::list_remote_dir`]) : borne l'appel bloquant même quand
+/// l'hôte ne répond jamais (session non étendue, lien mou, pair parti).
+const DELAI_LISTING_DISTANT: Duration = Duration::from_secs(10);
+
+/// Plafond de réponses de listing **non réclamées** conservées (demandes
+/// expirées dont la réponse arrive trop tard) : au-delà, les plus anciennes
+/// sont oubliées — jamais d'accumulation sans borne.
+const REPONSES_LISTING_MAX: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Point de contact réseau
@@ -152,6 +166,41 @@ pub enum SessionEndpoint {
 // ---------------------------------------------------------------------------
 // Options du moteur
 // ---------------------------------------------------------------------------
+
+/// Mot de passe d'**admission automatique** (accès non surveillé), côté
+/// contrôleur — enveloppe volontairement opaque d'un secret en mémoire.
+///
+/// Garanties :
+/// * son `Debug` ne révèle **jamais** le clair (aucune fuite dans les journaux
+///   ni les messages d'erreur, y compris via le `Debug` dérivé de
+///   [`SessionOptions`]) ;
+/// * le moteur ne lit la valeur qu'à l'instant d'émettre la demande
+///   d'admission, **dans le canal déjà chiffré par Noise** — le clair ne
+///   circule jamais hors du canal sûr et n'est jamais persisté (l'hôte ne
+///   détient qu'un hachage salé, comparé via la closure de
+///   [`crate::UnattendedHost::start_with_admission`]).
+#[derive(Clone)]
+pub struct SecretAdmission(String);
+
+impl SecretAdmission {
+    /// Enveloppe un mot de passe en clair saisi par l'utilisateur.
+    #[must_use]
+    pub fn new(clair: impl Into<String>) -> Self {
+        SecretAdmission(clair.into())
+    }
+
+    /// Lit le clair — réservé au moteur, au moment de l'émission chiffrée.
+    pub(crate) fn clair(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretAdmission {
+    /// N'affiche jamais le secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretAdmission(«…»)")
+    }
+}
 
 /// Options additionnelles du moteur — **additif** : [`SessionEngine::start`]
 /// applique les défauts, [`SessionEngine::start_with_options`] les expose.
@@ -202,13 +251,41 @@ pub struct SessionOptions {
     /// défaut ([`raccourcis_hote_defaut`]) ; `Some(HotkeyMap::new())` (table
     /// vide) coupe la fonction.
     pub hotkeys: Option<HotkeyMap<HostAction>>,
+    /// Mot de passe d'**admission automatique** présenté à un hôte « accès non
+    /// surveillé » (rôle contrôleur) : émis une fois par époque, juste après
+    /// l'établissement, en **premier message du canal `Control` déjà chiffré
+    /// par Noise** (sous-type additif `DemandeAdmission`). `None` (défaut) =
+    /// aucune preuve envoyée — un hôte à admission automatique se replie alors
+    /// sur son dialogue manuel, exactement comme aujourd'hui. Sans effet sur un
+    /// hôte classique (le message y est ignoré).
+    pub mot_de_passe: Option<SecretAdmission>,
+    /// **Code d'invitation éphémère** présenté à un hôte « accès non surveillé »
+    /// (rôle contrôleur), porté dans la `DemandeAdmission` (champ additif, canal
+    /// Noise). L'hôte le valide via son magasin d'invitations
+    /// ([`nd_features::invite::InviteStore`]) : s'il est valide (non expiré, non
+    /// déjà consommé), la session est admise **avec le profil de l'invitation**,
+    /// puis le code est **consommé** (usage unique). Une invitation invalide est
+    /// refusée sans solliciter le dialogue manuel. `None` (défaut) = aucune
+    /// invitation présentée. Sans effet sur un hôte classique (message ignoré).
+    pub invitation: Option<String>,
+    /// **Nom d'affichage** (alias) déclaré par le contrôleur, remonté au dialogue
+    /// d'approbation **manuel** de l'hôte (repli) pour un affichage riche.
+    /// Purement informatif. `None` (défaut) = non déclaré.
+    pub nom_affichage: Option<String>,
+    /// **Profil de permissions demandé** par le contrôleur, remonté au dialogue
+    /// d'approbation **manuel** de l'hôte (repli) : l'hôte reste libre de
+    /// l'accorder, le restreindre ou le refuser. Purement informatif (n'accorde
+    /// rien par lui-même). `None` (défaut) = non déclaré.
+    pub permissions_demandees: Option<PermissionSet>,
 }
 
 impl Default for SessionOptions {
     /// Permissions dérivées de la configuration, pas d'enregistrement, ABR en
     /// profil bureautique, delta **actif**, reconnexion par défaut, canaux
     /// annexes **coupés** (session vidéo + entrées historique), raccourcis
-    /// clavier hôte par défaut ([`raccourcis_hote_defaut`]).
+    /// clavier hôte par défaut ([`raccourcis_hote_defaut`]), aucun mot de passe
+    /// d'admission, aucune invitation ni enrichissement de la demande
+    /// d'admission (nom d'affichage / profil demandé).
     fn default() -> Self {
         SessionOptions {
             permissions: None,
@@ -220,6 +297,10 @@ impl Default for SessionOptions {
             transfer_dir: None,
             transport_reconnect: false,
             hotkeys: None,
+            mot_de_passe: None,
+            invitation: None,
+            nom_affichage: None,
+            permissions_demandees: None,
         }
     }
 }
@@ -850,6 +931,132 @@ impl Transport for TransportPartage {
 }
 
 // ---------------------------------------------------------------------------
+// Listing de répertoire distant DANS la session (brique `nd_files` routée)
+// ---------------------------------------------------------------------------
+
+/// Réponses de **listing distant** reçues du pair (rôle contrôleur), en attente
+/// de leur demandeur : le récepteur média les dépose
+/// ([`SousTypeControle::ReponseFs`]), [`ListingDistant::lister`] attend puis
+/// réclame la sienne — la **corrélation** se fait par le chemin, que l'hôte
+/// échoie tel quel dans la réponse ([`ReponseListe::chemin`]).
+struct ReponsesListing {
+    /// Réponses non encore réclamées, bornées à [`REPONSES_LISTING_MAX`].
+    recues: Mutex<Vec<ReponseListe>>,
+    /// Réveille les attentes bloquantes dès qu'une réponse est déposée.
+    reveil: Condvar,
+}
+
+impl ReponsesListing {
+    fn new() -> Self {
+        ReponsesListing {
+            recues: Mutex::new(Vec::new()),
+            reveil: Condvar::new(),
+        }
+    }
+
+    /// Dépose une réponse reçue du pair et réveille les attentes. Table pleine,
+    /// la plus ancienne réponse non réclamée est oubliée (demande expirée).
+    fn deposer(&self, reponse: ReponseListe) {
+        {
+            let mut recues = self.recues.lock().expect("verrou des réponses de listing");
+            if recues.len() >= REPONSES_LISTING_MAX {
+                recues.remove(0);
+            }
+            recues.push(reponse);
+        }
+        self.reveil.notify_all();
+    }
+
+    /// Retire toute réponse en attente pour `chemin` : appelé **avant** chaque
+    /// nouvelle demande, pour que la réponse rendue soit bien celle de cette
+    /// demande (pas celle, périmée, d'une demande précédente expirée).
+    fn purger_chemin(&self, chemin: &str) {
+        self.recues
+            .lock()
+            .expect("verrou des réponses de listing")
+            .retain(|reponse| reponse.chemin != chemin);
+    }
+
+    /// Attend (au plus `delai`) puis réclame la réponse corrélée à `chemin` ;
+    /// `None` si rien n'arrive dans le délai.
+    fn attendre(&self, chemin: &str, delai: Duration) -> Option<ReponseListe> {
+        let echeance = Instant::now() + delai;
+        let mut recues = self.recues.lock().expect("verrou des réponses de listing");
+        loop {
+            if let Some(position) = recues.iter().position(|r| r.chemin == chemin) {
+                return Some(recues.swap_remove(position));
+            }
+            let restant = echeance.saturating_duration_since(Instant::now());
+            if restant.is_zero() {
+                return None;
+            }
+            let (garde, _delai) = self
+                .reveil
+                .wait_timeout(recues, restant)
+                .expect("verrou des réponses de listing");
+            recues = garde;
+        }
+    }
+}
+
+/// Client de **listing de répertoire distant**, détaché d'une session vivante
+/// (voir [`SessionHandle::remote_fs`]) : envoie la requête sur le canal
+/// `Control` chiffré et attend la réponse corrélée **sans retenir la
+/// poignée** — les façades qui gardent leurs [`SessionHandle`] dans une table
+/// verrouillée (ex. `nd-ffi`) détachent ce client puis attendent hors verrou.
+///
+/// Rôle **contrôleur**, mode étendu ([`SessionOptions::extended_features`])
+/// requis ; ailleurs, la demande n'est jamais servie et l'attente expire
+/// proprement dans le délai borné.
+#[derive(Clone)]
+pub struct ListingDistant {
+    /// File de commandes des threads média (la requête part par l'émetteur).
+    commandes: Sender<CommandeMedia>,
+    /// Réponses déposées par le récepteur média (corrélation par chemin).
+    recues: Arc<ReponsesListing>,
+}
+
+impl ListingDistant {
+    /// Liste le répertoire distant `chemin` (vide = racines du poste hôte),
+    /// avec le délai d'attente par défaut ([`DELAI_LISTING_DISTANT`]).
+    ///
+    /// # Errors
+    /// Session terminée, ou aucune réponse dans le délai. Un échec **côté
+    /// hôte** (accès refusé, dossier inexistant…) n'est pas une erreur ici :
+    /// il est rendu dans [`ReponseListe::erreur`].
+    pub fn lister(&self, chemin: impl Into<String>) -> Result<ReponseListe> {
+        self.lister_avec_delai(chemin, DELAI_LISTING_DISTANT)
+    }
+
+    /// Variante de [`ListingDistant::lister`] à délai d'attente choisi.
+    ///
+    /// # Errors
+    /// Voir [`ListingDistant::lister`].
+    pub fn lister_avec_delai(
+        &self,
+        chemin: impl Into<String>,
+        delai: Duration,
+    ) -> Result<ReponseListe> {
+        let chemin = chemin.into();
+        // Purge des réponses périmées du même chemin (demande précédente
+        // expirée) : la réponse rendue est celle de CETTE demande.
+        self.recues.purger_chemin(&chemin);
+        self.commandes
+            .send(CommandeMedia::ListerRepertoireDistant(chemin.clone()))
+            .map_err(|_| {
+                NdError::Protocol("session terminée : listing distant impossible".to_owned())
+            })?;
+        self.recues.attendre(&chemin, delai).ok_or_else(|| {
+            NdError::Protocol(format!(
+                "listing distant de « {chemin} » sans réponse dans le délai \
+                 ({} s) — session non étendue, pair injoignable ou parti",
+                delai.as_secs()
+            ))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Poignée de session
 // ---------------------------------------------------------------------------
 
@@ -909,6 +1116,10 @@ pub struct SessionHandle {
     moniteurs_recus: Arc<Mutex<Option<Vec<RemoteMonitor>>>>,
     /// Infos système du pair (contrôleur). Lu par [`SessionHandle::peer_info`].
     infos_pair_recues: Arc<Mutex<Option<PeerInfo>>>,
+    /// Réponses de listing distant reçues (contrôleur), partagées avec le
+    /// récepteur média — corrélation par chemin. Consommées par
+    /// [`SessionHandle::list_remote_dir`] / [`SessionHandle::remote_fs`].
+    listing_recu: Arc<ReponsesListing>,
     compteurs: Arc<CompteursSession>,
     stop: Arc<AtomicBool>,
     pilote: Option<JoinHandle<()>>,
@@ -1101,6 +1312,34 @@ impl SessionHandle {
             .clone()
     }
 
+    /// Liste le **répertoire distant** `chemin` via la session (rôle
+    /// **contrôleur**, mode étendu) : la requête part sur le canal `Control`
+    /// chiffré ([`SousTypeControle::RequeteFs`]), l'hôte la sert **derrière la
+    /// permission** [`Capability::FileDownload`] (refus ⇒
+    /// [`ReponseListe::erreur`] « accès refusé », jamais de listing sans
+    /// droit), et la réponse **corrélée par chemin** est attendue au plus
+    /// [`DELAI_LISTING_DISTANT`]. Chemin vide = racines du poste hôte
+    /// (lettres de lecteur Windows, `/` ailleurs).
+    ///
+    /// # Errors
+    /// Session terminée, ou aucune réponse dans le délai (session non étendue,
+    /// pair injoignable). Un échec **côté hôte** (accès refusé, dossier
+    /// inexistant…) est rendu dans [`ReponseListe::erreur`], pas en `Err`.
+    pub fn list_remote_dir(&self, chemin: impl Into<String>) -> Result<ReponseListe> {
+        self.remote_fs().lister(chemin)
+    }
+
+    /// Client de listing distant **détachable** ([`ListingDistant`]) : mêmes
+    /// effets que [`SessionHandle::list_remote_dir`], mais utilisable sans
+    /// retenir la poignée pendant l'attente (façades à table verrouillée).
+    #[must_use]
+    pub fn remote_fs(&self) -> ListingDistant {
+        ListingDistant {
+            commandes: self.commandes_tx.clone(),
+            recues: Arc::clone(&self.listing_recu),
+        }
+    }
+
     /// Ouvre un **tunnel TCP de session** : écoute sur `127.0.0.1:port_local`
     /// (port `0` = éphémère) et relaie chaque connexion locale vers
     /// `cible_distante` **à travers le canal fiable de la session** (l'hôte
@@ -1247,6 +1486,7 @@ impl SessionEngine {
         let enregistrement: EnregistrementPartage = Arc::new(EtatEnregistrement::default());
         let moniteurs_recus = Arc::new(Mutex::new(None));
         let infos_pair_recues = Arc::new(Mutex::new(None));
+        let listing_recu = Arc::new(ReponsesListing::new());
 
         let media = Arc::new(EtatMedia {
             role: config.role,
@@ -1274,6 +1514,8 @@ impl SessionEngine {
             enregistrement: Arc::clone(&enregistrement),
             moniteurs_recus: Arc::clone(&moniteurs_recus),
             infos_pair_recues: Arc::clone(&infos_pair_recues),
+            listing_recu: Arc::clone(&listing_recu),
+            listing_a_emettre: Mutex::new(Vec::new()),
         });
 
         let ctx = ContextePilote {
@@ -1307,6 +1549,7 @@ impl SessionEngine {
             qualite,
             moniteurs_recus,
             infos_pair_recues,
+            listing_recu,
             compteurs,
             stop,
             pilote: Some(pilote),
@@ -1385,6 +1628,14 @@ struct EtatMedia {
     /// **Infos système du pair** reçues (contrôleur) — `None` tant qu'inconnues.
     /// Partagées avec la [`SessionHandle`].
     infos_pair_recues: Arc<Mutex<Option<PeerInfo>>>,
+    /// Réponses de **listing distant** reçues (contrôleur), partagées avec la
+    /// [`SessionHandle`] — corrélation par chemin (voir [`ReponsesListing`]).
+    listing_recu: Arc<ReponsesListing>,
+    /// Réponses de listing **encodées** à émettre (hôte) : produites par le
+    /// récepteur (requête → permission → `nd_files`), drainées par le thread
+    /// émetteur ([`envoyer_listings_en_attente`]) — un seul émetteur par côté,
+    /// l'ordre des nonces Noise est préservé.
+    listing_a_emettre: Mutex<Vec<Vec<u8>>>,
 }
 
 impl EtatMedia {
@@ -1657,6 +1908,7 @@ fn vivre_direct_reconnectant(
         frame_tx: &ctx.frame_tx,
         entrees: &ctx.input_rx,
         epoque: 1,
+        demande_admission: trame_demande_admission(&ctx.config, &ctx.options),
     };
     if ctx.options.extended_features {
         executer_controleur_ext(partage, &params, &ctx.media, &ctx.stop)
@@ -1771,6 +2023,7 @@ fn vivre_epoque_avec_pair(
                 frame_tx: &ctx.frame_tx,
                 entrees: &ctx.input_rx,
                 epoque,
+                demande_admission: trame_demande_admission(&ctx.config, &ctx.options),
             };
             if ctx.options.extended_features {
                 vivre_epoque_controleur_ext(transport, &params, &ctx.media)
@@ -1810,6 +2063,51 @@ struct ParamsEpoqueControleur<'a> {
     frame_tx: &'a SyncSender<DecodedFrame>,
     entrees: &'a EntreesPartagees,
     epoque: u32,
+    /// Trame `DemandeAdmission` (pré-encodée) à émettre en **premier message
+    /// chiffré** de l'époque — la preuve d'admission d'un hôte non surveillé
+    /// (voir [`SessionOptions::mot_de_passe`]). `None` = rien à émettre.
+    /// Ré-émise à chaque époque : une reconnexion vers un hôte à admission
+    /// automatique se ré-admet ainsi sans dialogue.
+    demande_admission: Option<Vec<u8>>,
+}
+
+/// Trame `DemandeAdmission` d'une époque contrôleur : encodée une fois par
+/// époque dès qu'il y a **quelque chose à porter** — une preuve (mot de passe ou
+/// invitation) ou un enrichissement du dialogue manuel (nom d'affichage, profil
+/// demandé). `None` sinon (aucune preuve ni enrichissement → l'hôte non
+/// surveillé se replie sur son dialogue manuel nu, exactement comme avant).
+fn trame_demande_admission(config: &SessionConfig, options: &SessionOptions) -> Option<Vec<u8>> {
+    let demande = DemandeAdmissionSortante {
+        peer_id: config.local_id,
+        mot_de_passe: options.mot_de_passe.as_ref().map(SecretAdmission::clair),
+        invitation: options.invitation.as_deref(),
+        nom_affichage: options.nom_affichage.as_deref(),
+        permissions_demandees: options.permissions_demandees,
+    };
+    if demande.mot_de_passe.is_none()
+        && demande.invitation.is_none()
+        && demande.nom_affichage.is_none()
+        && demande.permissions_demandees.is_none()
+    {
+        return None;
+    }
+    Some(encoder_controle(
+        SousTypeControle::DemandeAdmission,
+        &encoder_demande_admission(&demande),
+    ))
+}
+
+/// Émet la trame `DemandeAdmission` pré-encodée (si l'époque en porte une) sur
+/// le canal `Control` chiffré. Appelée en tête des boucles contrôleur, **avant**
+/// le lancement de tout thread émetteur : un seul émetteur à la fois, l'ordre
+/// des nonces Noise est préservé.
+fn envoyer_demande_admission(transport: &TransportPartage, trame: &Option<Vec<u8>>) -> Result<()> {
+    let Some(trame) = trame else {
+        return Ok(());
+    };
+    let mut emetteur = transport.clone();
+    let canal = emetteur.open_channel(ChannelKind::Control);
+    emetteur.send(canal, trame.clone(), Reliability::Reliable)
 }
 
 /// Époque complète du contrôleur : garde + Noise (initiateur) + média.
@@ -1850,6 +2148,9 @@ fn executer_controleur(
     arret: &Arc<AtomicBool>,
 ) -> Result<()> {
     let decodeur = create_decoder(CodecKind::H264)?;
+    // Admission automatique (hôte non surveillé) : la preuve part en premier
+    // message chiffré de l'époque, avant toute entrée.
+    envoyer_demande_admission(&transport, &params.demande_admission)?;
 
     // Reprise : purge des entrées accumulées pendant la coupure (mouvements
     // souris périmés — les rejouer téléporterait le curseur du pair).
@@ -1963,6 +2264,297 @@ fn derouler_epoque_hote(
 
     let partage = TransportPartage::new(Box::new(securise), Arc::clone(params.compteurs));
     executer_hote(&partage, params, arret)
+}
+
+// ---------------------------------------------------------------------------
+// Contrôle d'admission de l'hôte non surveillé — la décision se prend DANS le
+// canal chiffré Noise (voir [`crate::UnattendedHost::start_with_admission`])
+// ---------------------------------------------------------------------------
+
+/// Fenêtre d'attente de la `DemandeAdmission` après l'établissement Noise : un
+/// contrôleur qui porte une preuve l'émet immédiatement (l'attente réelle est
+/// de l'ordre d'un aller-retour réseau) ; passé ce délai, l'appelant est réputé
+/// **sans preuve** (contrôleur historique) et le crochet manuel tranche.
+const DELAI_DEMANDE_ADMISSION: Duration = Duration::from_secs(3);
+
+/// Informations d'un appelant remontées au **crochet d'approbation manuel**
+/// (repli) d'un hôte à admission automatique, pour un dialogue riche côté UI.
+///
+/// Au-delà de l'ID de l'appelant (identité authentifiée par le punch), elle
+/// porte — **si** le contrôleur les a déclarés dans sa `DemandeAdmission` — son
+/// **nom d'affichage** (alias) et le **profil de permissions demandé**. Ces
+/// champs sont purement informatifs : l'hôte reste souverain (il accorde,
+/// restreint ou refuse). Le crochet historique
+/// ([`crate::UnattendedHost::start_with_admission`]) n'en lit que le `pair` ; le
+/// crochet enrichi ([`crate::UnattendedHost::start_with_admission_enrichie`]) en
+/// affiche le détail.
+#[derive(Debug, Clone)]
+pub struct DemandeAdmissionManuelle {
+    /// ID NovaDesk de l'appelant (identité authentifiée par le punch).
+    pub pair: NovaId,
+    /// Alias choisi par le contrôleur, s'il en a déclaré un.
+    pub nom_affichage: Option<String>,
+    /// Profil de permissions que le contrôleur demande, s'il l'a déclaré.
+    pub permissions_demandees: Option<PermissionSet>,
+}
+
+/// Contrôle d'admission **dans le canal chiffré** d'une époque hôte, fourni par
+/// l'appelant ([`crate::UnattendedHost::start_with_admission`]) : `nd-core` ne
+/// voit que des closures — le hachage salé du mot de passe, la liste de
+/// confiance et le magasin d'invitations vivent chez l'appelant, jamais ici.
+pub(crate) struct ControleAdmission<'a> {
+    /// Vérificateur du mot de passe permanent : compare le clair reçu (du canal
+    /// Noise uniquement) au secret de l'appelant — typiquement un recalcul de
+    /// hachage salé. Le clair n'est ni stocké ni journalisé par le moteur.
+    pub verif_mdp: &'a dyn Fn(&str) -> bool,
+    /// L'ID appelant est-il un **appareil de confiance** ?
+    pub est_de_confiance: &'a dyn Fn(NovaId) -> bool,
+    /// Valide un **code d'invitation éphémère** présenté par l'appelant (ID du
+    /// punch + code, tous deux issus du seul canal Noise). Rend `Some(profil)`
+    /// si le code est valide (non expiré, non déjà consommé) — l'appel
+    /// **consomme** alors le code (usage unique) et le profil de l'invitation
+    /// prime pour la session — ou `None` sinon. Le mode historique
+    /// [`crate::UnattendedHost::start_with_admission`] n'honore aucune invitation
+    /// (closure toujours `None`).
+    pub verif_invitation: &'a dyn Fn(NovaId, &str) -> Option<PermissionSet>,
+    /// Crochet d'approbation **manuel** (repli) : le dialogue existant de l'UI,
+    /// bloquant jusqu'à la décision — sans décision, il expire en refus côté
+    /// appelant. Reçoit la demande enrichie ([`DemandeAdmissionManuelle`]).
+    pub crochet_manuel: &'a dyn Fn(&DemandeAdmissionManuelle) -> bool,
+    /// Compteur des sessions admises, incrémenté **à l'admission** (la session
+    /// démarre), comme le mode historique compte à l'acceptation du punch.
+    pub sessions_servies: &'a AtomicU64,
+    /// Compteur des appelants refusés par le contrôle d'admission.
+    pub pairs_refuses: &'a AtomicU64,
+}
+
+/// Issue de l'attente de la `DemandeAdmission` dans le canal chiffré.
+enum AttenteDemande {
+    /// Demande décodée (ID déclaré + preuves/enrichissements éventuels).
+    Recue(DemandeAdmissionRecue),
+    /// Aucune preuve exploitable dans la fenêtre (pas de message, ou message
+    /// illisible) : c'est le cas des contrôleurs historiques.
+    Aucune,
+    /// Lien coupé ou arrêt du service pendant l'attente : ne pas solliciter
+    /// l'UI ni compter de refus.
+    Interrompue,
+}
+
+/// Décision du contrôle d'admission pour un appelant.
+enum DecisionAdmission {
+    /// Admis (confiance, mot de passe valide, invitation valide, ou approbation
+    /// manuelle) : le transport chiffré est prêt pour l'époque média. `profil`,
+    /// s'il est présent (cas d'une invitation), **remplace** les permissions par
+    /// défaut du service pour cette session.
+    Admise {
+        transport: TransportPartage,
+        profil: Option<PermissionSet>,
+    },
+    /// Refusé : la connexion sera abandonnée sans qu'aucun média ne circule.
+    Refusee,
+    /// Ni admis ni refusé : négociation interrompue (lien coupé, arrêt).
+    Interrompue,
+}
+
+/// Attend la `DemandeAdmission` du contrôleur sur le canal `Control` chiffré,
+/// au plus [`DELAI_DEMANDE_ADMISSION`]. **Rien n'est honoré avant la
+/// décision** : toute autre trame reçue pendant la fenêtre est jetée (aucune
+/// entrée, aucun message média d'un pair non encore admis).
+fn attendre_demande_admission(
+    transport: &mut TransportPartage,
+    arret: &Arc<AtomicBool>,
+) -> AttenteDemande {
+    let canal_controle = transport.open_channel(ChannelKind::Control);
+    let echeance = Instant::now() + DELAI_DEMANDE_ADMISSION;
+    while Instant::now() < echeance {
+        if arret.load(Ordering::Relaxed) {
+            return AttenteDemande::Interrompue;
+        }
+        match transport.poll_recv() {
+            Ok(Some((canal, donnees))) if canal == canal_controle => {
+                // Tout autre message de contrôle arrivé avant la décision est jeté.
+                if let Some((SousTypeControle::DemandeAdmission, charge)) =
+                    decoder_controle(&donnees)
+                {
+                    return match decoder_demande_admission(charge) {
+                        Some(demande) => AttenteDemande::Recue(demande),
+                        // Demande illisible : aucune preuve exploitable.
+                        None => AttenteDemande::Aucune,
+                    };
+                }
+            }
+            // Trame hors canal de contrôle (entrée précoce…) : jetée.
+            Ok(Some(_)) => {}
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            // Lien coupé pendant l'attente.
+            Err(_) => return AttenteDemande::Interrompue,
+        }
+    }
+    AttenteDemande::Aucune
+}
+
+/// Négocie l'admission d'un appelant : handshake Noise (répondeur) puis
+/// décision, **dans l'ordre** :
+///
+/// 1. appareil de confiance ([`ControleAdmission::est_de_confiance`] sur l'ID
+///    du punch) → admis, sans attendre de message ;
+/// 2. sinon, `DemandeAdmission` reçue **avec** mot de passe : elle tranche
+///    seule — ID déclaré cohérent avec le pair du punch **et** mot de passe
+///    validé ⇒ admis ; sinon ⇒ **refus immédiat**, sans repli vers le dialogue
+///    (pas d'usure de l'utilisateur par essais successifs) ;
+/// 3. sinon, **code d'invitation** présenté : validé (non expiré, non consommé)
+///    par [`ControleAdmission::verif_invitation`] ⇒ admis **avec le profil de
+///    l'invitation** (et le code est consommé) ; invalide ⇒ **refus** (une
+///    preuve présentée qui échoue ne rouvre pas le dialogue) ;
+/// 4. sinon (aucune preuve) → repli sur le crochet d'approbation manuel, enrichi
+///    du nom d'affichage et du profil demandé s'ils ont été déclarés.
+///
+/// La décision reste muette : rien n'indique au pair d'où vient l'admission, ni
+/// pourquoi un refus est survenu (la connexion est simplement abandonnée).
+fn negocier_admission_hote(
+    transport: QuicTransport,
+    params: &ParamsEpoqueHote<'_>,
+    controle: &ControleAdmission<'_>,
+    arret: &Arc<AtomicBool>,
+) -> Result<DecisionAdmission> {
+    let cles = generate_static_keypair()?;
+    let securise = establish(Box::new(transport), HandshakeRole::Responder, &cles.private)?;
+    let mut partage = TransportPartage::new(Box::new(securise), Arc::clone(params.compteurs));
+
+    // 1. Appareil de confiance : admis sans autre preuve (profil de session).
+    if (controle.est_de_confiance)(params.pair) {
+        return Ok(DecisionAdmission::Admise {
+            transport: partage,
+            profil: None,
+        });
+    }
+    match attendre_demande_admission(&mut partage, arret) {
+        AttenteDemande::Recue(demande) => {
+            Ok(decider_selon_preuve(partage, params, controle, demande))
+        }
+        // Aucune preuve exploitable : repli manuel, dialogue nu (ID seul).
+        AttenteDemande::Aucune => Ok(decision_manuelle(
+            partage,
+            controle,
+            &DemandeAdmissionManuelle {
+                pair: params.pair,
+                nom_affichage: None,
+                permissions_demandees: None,
+            },
+        )),
+        AttenteDemande::Interrompue => Ok(DecisionAdmission::Interrompue),
+    }
+}
+
+/// Tranche selon la preuve reçue (étapes 2 → 4 de [`negocier_admission_hote`]).
+/// Une preuve (mot de passe, invitation) est **liée à l'identité du punch** : un
+/// ID déclaré incohérent invalide la preuve (message suspect) et ne consomme
+/// aucune invitation.
+fn decider_selon_preuve(
+    partage: TransportPartage,
+    params: &ParamsEpoqueHote<'_>,
+    controle: &ControleAdmission<'_>,
+    demande: DemandeAdmissionRecue,
+) -> DecisionAdmission {
+    let coherent = demande.declare == params.pair;
+
+    // 2. Mot de passe : tranche seul (comportement historique inchangé).
+    if let Some(mot_de_passe) = demande.mot_de_passe.as_deref() {
+        return if coherent && (controle.verif_mdp)(mot_de_passe) {
+            DecisionAdmission::Admise {
+                transport: partage,
+                profil: None,
+            }
+        } else {
+            DecisionAdmission::Refusee
+        };
+    }
+
+    // 3. Invitation éphémère : validée et consommée par l'appelant ⇒ admis avec
+    //    le profil de l'invitation ; sinon refus (sans consommer sur un ID
+    //    incohérent). L'ID est vérifié **avant** l'appel pour ne pas brûler un
+    //    code valide sur un message suspect.
+    if let Some(code) = demande.invitation.as_deref() {
+        return match coherent
+            .then(|| (controle.verif_invitation)(params.pair, code))
+            .flatten()
+        {
+            Some(profil) => DecisionAdmission::Admise {
+                transport: partage,
+                profil: Some(profil),
+            },
+            None => DecisionAdmission::Refusee,
+        };
+    }
+
+    // 4. Aucune preuve, mais demande possiblement enrichie (nom, profil demandé)
+    //    pour un dialogue manuel riche.
+    decision_manuelle(
+        partage,
+        controle,
+        &DemandeAdmissionManuelle {
+            pair: params.pair,
+            nom_affichage: demande.nom_affichage,
+            permissions_demandees: demande.permissions_demandees,
+        },
+    )
+}
+
+/// Repli sur le crochet d'approbation **manuel** : sa décision (positive ⇒
+/// admis sans profil imposé, négative ⇒ refus) est honorée telle quelle.
+fn decision_manuelle(
+    partage: TransportPartage,
+    controle: &ControleAdmission<'_>,
+    infos: &DemandeAdmissionManuelle,
+) -> DecisionAdmission {
+    if (controle.crochet_manuel)(infos) {
+        DecisionAdmission::Admise {
+            transport: partage,
+            profil: None,
+        }
+    } else {
+        DecisionAdmission::Refusee
+    }
+}
+
+/// Époque complète de l'hôte **avec contrôle d'admission dans le canal
+/// chiffré** : garde + Noise (répondeur) + admission ([`ControleAdmission`]) +
+/// média piloté si admis. Un appelant refusé voit sa connexion abandonnée sans
+/// qu'aucun octet média ne circule ; les compteurs de [`ControleAdmission`]
+/// sont tenus ici (admission ⇒ `sessions_servies`, refus ⇒ `pairs_refuses`,
+/// interruption ⇒ rien).
+pub(crate) fn vivre_epoque_hote_avec_admission(
+    transport: QuicTransport,
+    mut params: ParamsEpoqueHote<'_>,
+    controle: &ControleAdmission<'_>,
+) -> Result<()> {
+    let garde = GardeEpoque::armer(&transport, params.stop)?;
+    let arret = garde.arret();
+    let resultat = match negocier_admission_hote(transport, &params, controle, &arret) {
+        Ok(DecisionAdmission::Admise {
+            transport: partage,
+            profil,
+        }) => {
+            controle.sessions_servies.fetch_add(1, Ordering::Relaxed);
+            // Invitation : le profil de l'invitation prime sur les permissions
+            // par défaut du service pour cette session.
+            if let Some(profil) = profil {
+                params.permissions = profil;
+            }
+            executer_hote(&partage, &params, &arret)
+        }
+        Ok(DecisionAdmission::Refusee) => {
+            controle.pairs_refuses.fetch_add(1, Ordering::Relaxed);
+            // Le transport chiffré a déjà été lâché : la connexion se ferme
+            // sans servir de média (et sans motiver le refus auprès du pair).
+            Ok(())
+        }
+        Ok(DecisionAdmission::Interrompue) => Ok(()),
+        Err(erreur) => Err(erreur),
+    };
+    // La garde reclasse en fin d'époque normale les erreurs symptômes d'un
+    // lien coupé, comme pour les époques hôtes ordinaires.
+    garde.conclure(resultat, params.stop).map(|_fin| ())
 }
 
 /// Encodeur du flux hôte : **matériel d'abord** (NVENC via le MFT asynchrone,
@@ -2238,6 +2830,58 @@ fn traiter_controle(media: &EtatMedia, data: &[u8]) {
                 }
             }
         }
+        SousTypeControle::DemandeAdmission => {
+            // Preuve d'admission d'un hôte non surveillé : consommée **avant**
+            // les boucles média par l'hôte à admission automatique (voir
+            // [`vivre_epoque_hote_avec_admission`]). Reçue ici — session
+            // ordinaire, ou hôte déjà admis — elle est ignorée : l'admission
+            // d'une session établie est acquise, et le secret n'est ni relu ni
+            // journalisé.
+        }
+        SousTypeControle::RequeteFs => {
+            // Requête de listing du contrôleur : l'hôte répond **derrière la
+            // permission vivante** [`Capability::FileDownload`] — refus ⇒
+            // réponse en erreur « accès refusé », **jamais** de lecture du
+            // disque sans droit. La réponse encodée est mise en file, émise
+            // par le thread émetteur (un seul émetteur par côté : l'ordre des
+            // nonces Noise est préservé).
+            if media.role == SessionRole::Controlled {
+                let octets = if media.perms().allows(Capability::FileDownload) {
+                    traiter_requete_liste(payload)
+                } else {
+                    reponse_listing_refuse(payload).to_bytes()
+                };
+                media
+                    .listing_a_emettre
+                    .lock()
+                    .expect("verrou du listing à émettre")
+                    .push(octets);
+            }
+        }
+        SousTypeControle::ReponseFs => {
+            // Réponse de listing de l'hôte : déposée pour l'attente corrélée
+            // ([`SessionHandle::list_remote_dir`]). Une réponse illisible
+            // (trame hostile ou tronquée) est ignorée sans paniquer.
+            if media.role == SessionRole::Controller {
+                if let Ok(reponse) = ReponseListe::from_bytes(payload) {
+                    media.listing_recu.deposer(reponse);
+                }
+            }
+        }
+    }
+}
+
+/// Réponse de listing « accès refusé » : le chemin de la requête est échoyé tel
+/// quel (corrélation côté contrôleur) mais **aucun** répertoire n'est lu — le
+/// refus de [`Capability::FileDownload`] ne laisse rien fuiter du disque.
+fn reponse_listing_refuse(requete: &[u8]) -> ReponseListe {
+    let chemin = RequeteListe::from_bytes(requete)
+        .map(|r| r.chemin)
+        .unwrap_or_default();
+    ReponseListe {
+        chemin,
+        entrees: Vec::new(),
+        erreur: Some("accès refusé (capacité « récupérer des fichiers » non accordée)".to_owned()),
     }
 }
 
@@ -2427,6 +3071,20 @@ fn traiter_commandes(
                     appliquer_enregistrement(media, chemin);
                 }
             }
+            CommandeMedia::ListerRepertoireDistant(chemin) => {
+                // Rôle contrôleur : la requête de listing part sur le canal
+                // `Control` fiable ; la réponse reviendra par le récepteur
+                // ([`SousTypeControle::ReponseFs`] → [`ReponsesListing`]).
+                // Côté hôte, la commande est sans objet (le poste liste ses
+                // propres dossiers sans passer par la session).
+                if media.role == SessionRole::Controller {
+                    let trame = encoder_controle(
+                        SousTypeControle::RequeteFs,
+                        &RequeteListe { chemin }.to_bytes(),
+                    );
+                    let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+                }
+            }
         }
     }
 }
@@ -2501,6 +3159,32 @@ fn envoyer_annotations_en_attente(
         if let Ok(octets) = couche.to_bytes() {
             let trame = encoder_controle(SousTypeControle::Annotation, &octets);
             let _ = transport.send(canal_controle, trame, Reliability::Reliable);
+        }
+    }
+}
+
+/// Émet les réponses de **listing distant** en attente (canal `Control`,
+/// sous-type [`SousTypeControle::ReponseFs`]), produites par le récepteur hôte
+/// derrière la permission ([`SousTypeControle::RequeteFs`]).
+fn envoyer_listings_en_attente(
+    transport: &mut TransportPartage,
+    canal_controle: ChannelHandle,
+    media: &EtatMedia,
+) {
+    let reponses: Vec<Vec<u8>> = {
+        let mut garde = media
+            .listing_a_emettre
+            .lock()
+            .expect("verrou du listing à émettre");
+        std::mem::take(&mut *garde)
+    };
+    for octets in reponses {
+        let trame = encoder_controle(SousTypeControle::ReponseFs, &octets);
+        if transport
+            .send(canal_controle, trame, Reliability::Reliable)
+            .is_err()
+        {
+            break;
         }
     }
 }
@@ -2739,6 +3423,7 @@ fn emetteur_features_hote(
         envoyer_chat_en_attente(&mut transport, canal_controle, media);
         envoyer_annotations_en_attente(&mut transport, canal_controle, media);
         envoyer_tunnels_en_attente(&mut transport, canal_controle, media);
+        envoyer_listings_en_attente(&mut transport, canal_controle, media);
         annoncer_confidentialite(
             &mut transport,
             canal_controle,
@@ -2791,6 +3476,9 @@ fn executer_controleur_ext(
     arret: &Arc<AtomicBool>,
 ) -> Result<()> {
     let decodeur = create_decoder(CodecKind::H264)?;
+    // Admission automatique (hôte non surveillé) : la preuve part en premier
+    // message chiffré de l'époque, avant le thread émetteur de fonctions.
+    envoyer_demande_admission(&partage, &params.demande_admission)?;
     assurer_audio(media);
     // Reprise : purge des entrées périmées accumulées pendant la coupure.
     if params.epoque > 1 {
@@ -2954,6 +3642,61 @@ mod tests {
             peer_id: peer,
             permissions: Permissions::default(),
         }
+    }
+
+    /// Le `Debug` du secret d'admission — direct ou à travers celui, dérivé,
+    /// des [`SessionOptions`] — ne révèle jamais le clair (aucun secret dans
+    /// les journaux).
+    #[test]
+    fn secret_admission_jamais_revele_par_debug() {
+        let secret = SecretAdmission::new("mdp-tres-secret");
+        assert!(!format!("{secret:?}").contains("mdp-tres-secret"));
+        let options = SessionOptions {
+            mot_de_passe: Some(secret),
+            ..SessionOptions::default()
+        };
+        assert!(!format!("{options:?}").contains("mdp-tres-secret"));
+    }
+
+    /// La trame d'admission n'existe qu'en présence d'une preuve ou d'un
+    /// enrichissement, et son contenu (dans le canal chiffré) porte l'ID local +
+    /// les champs déclarés.
+    #[test]
+    fn trame_demande_admission_selon_les_options() {
+        let config = config(SessionRole::Controller, Some(NovaId(2)));
+        // Sans rien : aucune trame (comportement historique intact).
+        assert!(trame_demande_admission(&config, &SessionOptions::default()).is_none());
+        // Avec mot de passe : sous-type DemandeAdmission + ID local + clair.
+        let options = SessionOptions {
+            mot_de_passe: Some(SecretAdmission::new("sésame")),
+            ..SessionOptions::default()
+        };
+        let trame = trame_demande_admission(&config, &options).expect("trame d'admission");
+        let (sous_type, charge) = decoder_controle(&trame).expect("trame de contrôle");
+        assert_eq!(sous_type, SousTypeControle::DemandeAdmission);
+        let recue = decoder_demande_admission(charge).expect("demande décodée");
+        assert_eq!(recue.declare, config.local_id);
+        assert_eq!(recue.mot_de_passe.as_deref(), Some("sésame"));
+        assert_eq!(recue.invitation, None);
+
+        // Enrichissement seul (nom + profil demandé, sans mot de passe) : une
+        // trame est émise et remonte ces champs pour le dialogue manuel.
+        let enrichies = SessionOptions {
+            nom_affichage: Some("Alice".to_owned()),
+            permissions_demandees: Some(PermissionSet::view_only()),
+            invitation: Some("ABC-DEF-GHJ".to_owned()),
+            ..SessionOptions::default()
+        };
+        let trame = trame_demande_admission(&config, &enrichies).expect("trame enrichie");
+        let (_, charge) = decoder_controle(&trame).expect("trame de contrôle");
+        let recue = decoder_demande_admission(charge).expect("demande décodée");
+        assert_eq!(recue.mot_de_passe, None);
+        assert_eq!(recue.invitation.as_deref(), Some("ABC-DEF-GHJ"));
+        assert_eq!(recue.nom_affichage.as_deref(), Some("Alice"));
+        assert_eq!(
+            recue.permissions_demandees,
+            Some(PermissionSet::view_only())
+        );
     }
 
     /// Démarre un serveur de rendez-vous éphémère et rend son adresse.

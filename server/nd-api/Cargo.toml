@@ -20,5 +20,16 @@ getrandom = { version = "0.3", features = ["std"] }
 # Fonction de ronde (PRF) de la permutation d'IDs (allocation.rs) — pur Rust.
 sha2 = "0.10"
 
+# Test d'intégration bout-en-bout (tests/chaine_rendezvous.rs) : monte le vrai
+# serveur de rendez-vous de production (server/nd-rendezvous) et son client
+# (nd-signaling) en process, pour prouver que le jeton d'enregistrement émis par
+# l'attribution d'ID de nd-api est accepté par la façade authentifiée. Le cycle
+# nd-rendezvous → nd-api est toléré : une dépendance de dev peut être cyclique
+# (elle ne pèse pas sur le graphe d'exécution) — même motif que
+# crates/nd-signaling/tests/register_authentifie.rs.
+[dev-dependencies]
+nd-rendezvous = { path = "../nd-rendezvous" }
+nd-signaling = { workspace = true }
+
 [lints]
 workspace = true

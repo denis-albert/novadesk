@@ -28,6 +28,7 @@
 
 use nd_proto::Result;
 
+use crate::capture_mixte::CapteurMixte;
 use crate::codec::DecodeurOpus;
 use crate::jitter::{JitterBuffer, SortieJitter, StatsJitter};
 use crate::level::LevelMeter;
@@ -63,6 +64,52 @@ impl SourceAudio {
         match self {
             SourceAudio::Systeme => "systeme",
             SourceAudio::Micro => "micro",
+        }
+    }
+}
+
+/// **Source d'émission commutable** d'une session (ce que l'hôte transmet).
+///
+/// À la différence de [`SourceAudio`], qui décrit *un* périphérique de capture,
+/// `SourceEmission` décrit le **mode** d'émission de la session, que
+/// [`AudioSession::definir_source_emission`] fait basculer à chaud :
+///
+/// - [`SourceEmission::SystemeSeul`] : seul l'audio système (loopback) part —
+///   le comportement historique ;
+/// - [`SourceEmission::MicroSeul`] : seul le microphone part (voix) ;
+/// - [`SourceEmission::SystemeEtMicro`] : les deux **mélangés** en une piste
+///   stéréo bornée (voir [`crate::CapteurMixte`]).
+///
+/// Le mélange et le micro seul reposent sur les capteurs existants
+/// ([`crate::create_microphone_capturer`]) : rien n'est ré-implémenté.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceEmission {
+    /// Audio système seul (loopback) — mode par défaut, format stéréo.
+    SystemeSeul,
+    /// Microphone seul (voix) — format mono.
+    MicroSeul,
+    /// Système **et** micro mélangés (borné, anti-saturation) — format stéréo.
+    SystemeEtMicro,
+}
+
+impl SourceEmission {
+    /// Vrai si ce mode sollicite le microphone ([`Self::MicroSeul`] ou
+    /// [`Self::SystemeEtMicro`]).
+    #[must_use]
+    pub fn utilise_micro(self) -> bool {
+        matches!(
+            self,
+            SourceEmission::MicroSeul | SourceEmission::SystemeEtMicro
+        )
+    }
+
+    /// Nom court et stable du mode (journal, diagnostic).
+    #[must_use]
+    pub fn nom(self) -> &'static str {
+        match self {
+            SourceEmission::SystemeSeul => "systeme",
+            SourceEmission::MicroSeul => "micro",
+            SourceEmission::SystemeEtMicro => "systeme+micro",
         }
     }
 }
@@ -380,14 +427,36 @@ impl RecepteurAudio {
 pub struct AudioSession {
     emission: Option<EmetteurAudio>,
     lecture: Option<RecepteurAudio>,
+    /// Mode d'émission courant, maintenu par
+    /// [`AudioSession::definir_source_emission`] (et déduit de l'émetteur
+    /// injecté à la construction).
+    source_emission: SourceEmission,
+    /// Résultat de la dernière tentative d'activation du micro par
+    /// [`AudioSession::definir_source_emission`] : `true` si le micro a bien été
+    /// ouvert, `false` s'il était absent (repli système) ou jamais sollicité.
+    micro_disponible: bool,
 }
 
 impl AudioSession {
     /// Construit une session à partir de demi-flux **injectés** (testable sans
     /// matériel). Chacun est optionnel : `None` désactive la direction.
+    ///
+    /// Le mode d'émission ([`SourceEmission`]) est déduit de la source de
+    /// l'émetteur injecté (micro → [`SourceEmission::MicroSeul`], sinon
+    /// [`SourceEmission::SystemeSeul`]) ; `micro_disponible()` démarre à `false`
+    /// tant qu'aucune bascule matérielle n'a sondé le micro.
     #[must_use]
     pub fn nouvelle(emission: Option<EmetteurAudio>, lecture: Option<RecepteurAudio>) -> Self {
-        AudioSession { emission, lecture }
+        let source_emission = match emission.as_ref().map(EmetteurAudio::source) {
+            Some(SourceAudio::Micro) => SourceEmission::MicroSeul,
+            _ => SourceEmission::SystemeSeul,
+        };
+        AudioSession {
+            emission,
+            lecture,
+            source_emission,
+            micro_disponible: false,
+        }
     }
 
     /// Session duplex « système » via les fabriques matérielles : capture de
@@ -466,9 +535,130 @@ impl AudioSession {
     }
 
     /// Source d'émission courante, le cas échéant.
+    ///
+    /// Décrit le **capteur** sous-jacent de l'émetteur ([`SourceAudio`], à deux
+    /// états). Pour le mélange système+micro, il vaut [`SourceAudio::Systeme`]
+    /// (la sortie est stéréo, au format système) ; le mode d'émission complet à
+    /// trois états s'obtient par [`Self::source_emission_courante`].
     #[must_use]
     pub fn source_emission(&self) -> Option<SourceAudio> {
         self.emission.as_ref().map(EmetteurAudio::source)
+    }
+
+    /// **Mode d'émission courant** (à trois états, [`SourceEmission`]).
+    ///
+    /// Reflète le dernier [`Self::definir_source_emission`] réussi (ou son repli
+    /// effectif si le micro était absent), ou la source déduite à la
+    /// construction.
+    #[must_use]
+    pub fn source_emission_courante(&self) -> SourceEmission {
+        self.source_emission
+    }
+
+    /// Vrai si la dernière bascule de source a réellement ouvert le micro.
+    ///
+    /// `false` si le micro était absent (repli système effectué), si la
+    /// plateforme ne sait pas le capturer, ou si aucune bascule sollicitant le
+    /// micro n'a encore eu lieu. Statut **interrogeable** du repli dégradé.
+    #[must_use]
+    pub fn micro_disponible(&self) -> bool {
+        self.micro_disponible
+    }
+
+    /// **Commute la source d'émission** à chaud en fabriquant les capteurs
+    /// matériels via les fabriques de la racine du crate
+    /// ([`crate::create_system_capturer`] / [`crate::create_microphone_capturer`]).
+    ///
+    /// Repli **sûr** : si un mode réclame le micro mais qu'il est absent
+    /// (périphérique manquant, plateforme sans capture micro), la session
+    /// bascule sur [`SourceEmission::SystemeSeul`] au lieu d'échouer, et
+    /// [`Self::micro_disponible`] renvoie `false`. L'état actif/coupé et la
+    /// mesure de niveau de l'émetteur précédent sont **préservés** au travers de
+    /// la bascule (pas de coupure perceptible).
+    ///
+    /// N'échoue que si le capteur **système** — le plancher garanti — ne peut
+    /// être ouvert (`Err`, l'émission précédente est alors laissée en place).
+    ///
+    /// C'est le point d'entrée que `nd-core` appelle pour « transmettre le
+    /// micro » : `audio.definir_source_emission(SourceEmission::SystemeEtMicro)`.
+    pub fn definir_source_emission(&mut self, source: SourceEmission) -> Result<()> {
+        self.definir_source_emission_avec(
+            source,
+            crate::create_system_capturer,
+            crate::create_microphone_capturer,
+        )
+    }
+
+    /// Variante **injectable** de [`Self::definir_source_emission`] : les
+    /// capteurs sont fabriqués par `fabrique_systeme` / `fabrique_micro` plutôt
+    /// que par les fabriques matérielles. Même logique de repli et de
+    /// préservation d'état — testable sans périphérique réel.
+    ///
+    /// `fabrique_micro` renvoyant `Err` **simule un micro absent** : la bascule
+    /// se replie alors sur le système sans propager l'erreur (repli dégradé).
+    /// Une `fabrique_systeme` en échec, elle, est propagée (aucun repli possible
+    /// pour le plancher système).
+    pub fn definir_source_emission_avec<FabSys, FabMic>(
+        &mut self,
+        source: SourceEmission,
+        fabrique_systeme: FabSys,
+        fabrique_micro: FabMic,
+    ) -> Result<()>
+    where
+        FabSys: FnOnce() -> Result<Box<dyn AudioCapturer>>,
+        FabMic: FnOnce() -> Result<Box<dyn AudioCapturer>>,
+    {
+        // État à reporter sur le nouvel émetteur (bascule transparente).
+        let (etait_actif, mesurait) = self
+            .emission
+            .as_ref()
+            .map_or((true, false), |e| (e.actif(), e.mesurer_niveau));
+
+        // Fabrique le capteur voulu, avec repli système si le micro manque.
+        // `capteur` = capteur final ; `mode` = mode réellement atteint ;
+        // `micro_ok` = le micro a-t-il bien été ouvert ?
+        let (capteur, mode, micro_ok): (Box<dyn AudioCapturer>, SourceEmission, bool) = match source
+        {
+            SourceEmission::SystemeSeul => {
+                (fabrique_systeme()?, SourceEmission::SystemeSeul, false)
+            }
+            SourceEmission::MicroSeul => match fabrique_micro() {
+                Ok(micro) => (micro, SourceEmission::MicroSeul, true),
+                // Micro absent : repli sur le système seul.
+                Err(_) => (fabrique_systeme()?, SourceEmission::SystemeSeul, false),
+            },
+            SourceEmission::SystemeEtMicro => {
+                // Le système est requis dans tous les cas (plancher + repli).
+                let systeme = fabrique_systeme()?;
+                match fabrique_micro() {
+                    Ok(micro) => (
+                        Box::new(CapteurMixte::nouveau(systeme, micro)?),
+                        SourceEmission::SystemeEtMicro,
+                        true,
+                    ),
+                    // Micro absent : on émet le système seul (déjà fabriqué).
+                    Err(_) => (systeme, SourceEmission::SystemeSeul, false),
+                }
+            }
+        };
+
+        // Le capteur mixte comme le loopback produisent du stéréo au format
+        // système ; le micro seul, du mono. On étiquette l'émetteur d'après le
+        // mode atteint (le mélange reste étiqueté « système » car stéréo).
+        let source_capteur = match mode {
+            SourceEmission::MicroSeul => SourceAudio::Micro,
+            _ => SourceAudio::Systeme,
+        };
+        let mut emetteur = EmetteurAudio::nouveau(source_capteur, capteur);
+        emetteur.definir_actif(etait_actif);
+        if mesurait {
+            emetteur.activer_mesure_niveau(true)?;
+        }
+
+        self.emission = Some(emetteur);
+        self.source_emission = mode;
+        self.micro_disponible = micro_ok;
+        Ok(())
     }
 
     /// Active/désactive la mesure de niveau sur les deux directions présentes.
@@ -504,6 +694,8 @@ impl AudioSession {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    use nd_proto::NdError;
 
     use super::*;
     use crate::codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus};
@@ -821,5 +1013,204 @@ mod tests {
         assert_send::<AudioSession>();
         assert_send::<EmetteurAudio>();
         assert_send::<RecepteurAudio>();
+    }
+
+    /// Format mono du micro synthétique de test.
+    const FORMAT_MICRO: AudioFormat = AudioFormat {
+        sample_rate: 48_000,
+        channels: 1,
+    };
+
+    /// Fabrique un capteur **système** synthétique (stéréo 48 kHz).
+    fn fabrique_systeme_ok() -> Result<Box<dyn AudioCapturer>> {
+        Ok(Box::new(
+            CapteurSynthetique::nouveau(AudioFormat::default(), 440.0).expect("capteur"),
+        ))
+    }
+
+    /// Fabrique un capteur **micro** synthétique (mono 48 kHz).
+    fn fabrique_micro_ok() -> Result<Box<dyn AudioCapturer>> {
+        Ok(Box::new(
+            CapteurSynthetique::nouveau(FORMAT_MICRO, 220.0).expect("capteur"),
+        ))
+    }
+
+    /// Simule un micro **absent** (fabrique en échec).
+    fn fabrique_micro_absent() -> Result<Box<dyn AudioCapturer>> {
+        Err(NdError::NotImplemented("micro simulé absent"))
+    }
+
+    /// Décode un paquet et renvoie le nombre de valeurs `f32` (échantillons ×
+    /// canaux) — sert à distinguer une trame stéréo (1920) d'une mono (960).
+    fn valeurs_decodees(paquet: &AudioPacket, format: AudioFormat) -> usize {
+        DecodeurOpus::new(format)
+            .expect("décodeur")
+            .decoder(&paquet.data)
+            .expect("décodage")
+            .len()
+    }
+
+    #[test]
+    fn nouvelle_deduit_le_mode_depuis_l_emetteur() {
+        let sys = AudioSession::nouvelle(
+            Some(emetteur_synthetique(AudioFormat::default(), 440.0)),
+            None,
+        );
+        assert_eq!(sys.source_emission_courante(), SourceEmission::SystemeSeul);
+        assert!(!sys.micro_disponible());
+
+        let capteur = Box::new(CapteurSynthetique::nouveau(FORMAT_MICRO, 220.0).expect("capteur"));
+        let mic = AudioSession::nouvelle(
+            Some(EmetteurAudio::nouveau(SourceAudio::Micro, capteur)),
+            None,
+        );
+        assert_eq!(mic.source_emission_courante(), SourceEmission::MicroSeul);
+    }
+
+    #[test]
+    fn commutation_source_emission_les_trois_modes() {
+        let mut session = AudioSession::nouvelle(None, None);
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::SystemeSeul
+        );
+        assert!(!session.micro_disponible());
+
+        // Micro seul : mono, micro disponible.
+        session
+            .definir_source_emission_avec(
+                SourceEmission::MicroSeul,
+                fabrique_systeme_ok,
+                fabrique_micro_ok,
+            )
+            .expect("bascule micro");
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::MicroSeul
+        );
+        assert!(session.micro_disponible());
+        assert_eq!(session.source_emission(), Some(SourceAudio::Micro));
+        let p = session.produire().expect("produire").expect("actif");
+        assert_eq!(valeurs_decodees(&p, FORMAT_MICRO), 960);
+
+        // Système + micro : mélange stéréo, micro disponible.
+        session
+            .definir_source_emission_avec(
+                SourceEmission::SystemeEtMicro,
+                fabrique_systeme_ok,
+                fabrique_micro_ok,
+            )
+            .expect("bascule mixte");
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::SystemeEtMicro
+        );
+        assert!(session.micro_disponible());
+        // Le mélange est étiqueté « système » (sortie stéréo).
+        assert_eq!(session.source_emission(), Some(SourceAudio::Systeme));
+        let p = session.produire().expect("produire").expect("actif");
+        assert_eq!(valeurs_decodees(&p, AudioFormat::default()), 1920);
+
+        // Retour au système seul.
+        session
+            .definir_source_emission_avec(
+                SourceEmission::SystemeSeul,
+                fabrique_systeme_ok,
+                fabrique_micro_ok,
+            )
+            .expect("bascule système");
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::SystemeSeul
+        );
+        assert!(!session.micro_disponible());
+        let p = session.produire().expect("produire").expect("actif");
+        assert_eq!(valeurs_decodees(&p, AudioFormat::default()), 1920);
+    }
+
+    #[test]
+    fn repli_systeme_si_micro_absent() {
+        let mut session = AudioSession::nouvelle(None, None);
+
+        // Micro seul demandé, micro absent → repli système sans erreur.
+        session
+            .definir_source_emission_avec(
+                SourceEmission::MicroSeul,
+                fabrique_systeme_ok,
+                fabrique_micro_absent,
+            )
+            .expect("repli sans erreur");
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::SystemeSeul
+        );
+        assert!(!session.micro_disponible());
+        let p = session.produire().expect("produire").expect("actif");
+        assert_eq!(valeurs_decodees(&p, AudioFormat::default()), 1920);
+
+        // Système + micro demandé, micro absent → système seul émis.
+        session
+            .definir_source_emission_avec(
+                SourceEmission::SystemeEtMicro,
+                fabrique_systeme_ok,
+                fabrique_micro_absent,
+            )
+            .expect("repli sans erreur");
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::SystemeSeul
+        );
+        assert!(!session.micro_disponible());
+        let p = session.produire().expect("produire").expect("actif");
+        assert_eq!(valeurs_decodees(&p, AudioFormat::default()), 1920);
+    }
+
+    #[test]
+    fn bascule_source_preserve_l_etat_actif() {
+        let mut session = AudioSession::nouvelle(None, None);
+        session
+            .definir_source_emission_avec(
+                SourceEmission::SystemeSeul,
+                fabrique_systeme_ok,
+                fabrique_micro_ok,
+            )
+            .expect("bascule système");
+        // On coupe l'émission…
+        session.definir_emission_active(false);
+        assert!(!session.emission_active());
+        // …et la bascule de source conserve l'état coupé.
+        session
+            .definir_source_emission_avec(
+                SourceEmission::MicroSeul,
+                fabrique_systeme_ok,
+                fabrique_micro_ok,
+            )
+            .expect("bascule micro");
+        assert_eq!(
+            session.source_emission_courante(),
+            SourceEmission::MicroSeul
+        );
+        assert!(!session.emission_active());
+        assert!(session.produire().expect("produire").is_none()); // toujours coupée
+    }
+
+    #[test]
+    fn echec_systeme_propage_et_laisse_l_emission() {
+        fn fabrique_systeme_ko() -> Result<Box<dyn AudioCapturer>> {
+            Err(NdError::NotImplemented("système simulé absent"))
+        }
+        let mut session = AudioSession::nouvelle(
+            Some(emetteur_synthetique(AudioFormat::default(), 440.0)),
+            None,
+        );
+        // Le plancher système ne peut être ouvert : erreur propagée…
+        let r = session.definir_source_emission_avec(
+            SourceEmission::SystemeEtMicro,
+            fabrique_systeme_ko,
+            fabrique_micro_ok,
+        );
+        assert!(r.is_err());
+        // …et l'émetteur précédent reste opérationnel.
+        assert!(session.produire().expect("produire").is_some());
     }
 }

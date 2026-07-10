@@ -33,10 +33,20 @@
 //! Le mot de passe permanent n'est **jamais** stocké en clair : on conserve un
 //! **hachage BLAKE3 salé** (sel aléatoire de 16 octets + `BLAKE3(sel || mot de
 //! passe)`), vérifié par recalcul. NOTE (comme `nd_crypto::identity`) : BLAKE3
-//! est rapide, ce n'est pas une KDF lente ; le durcissement (Argon2, coffre-fort
-//! de l'OS — DPAPI/Keychain/Secret Service) viendra plus tard. Le hachage sert à
-//! ne jamais écrire le secret en clair, pas à résister à une attaque hors-ligne
-//! massive.
+//! est rapide, ce n'est pas une KDF lente ; le durcissement par KDF (Argon2)
+//! viendra plus tard. Le hachage sert à ne jamais écrire le secret en clair, pas
+//! à résister à une attaque hors-ligne massive.
+//!
+//! # Secrets chiffrés au repos (DPAPI, sans administrateur)
+//!
+//! Deux secrets sensibles sont en outre **chiffrés au repos** via le coffre-fort
+//! de l'OS à portée utilisateur (DPAPI sous Windows, [`crate::plateforme`]) : la
+//! **clé privée d'identité** (`identite.cle`) et le **haché du mot de passe**
+//! d'accès non surveillé. La **migration est transparente** : un ancien fichier
+//! en clair est déchiffré puis **ré-écrit chiffré** à la première lecture, sans
+//! jamais casser une identité ni une configuration existante. Hors Windows, repli
+//! documenté (stockage en clair comme historiquement, `#[cfg]` dans
+//! [`crate::plateforme`]).
 //!
 //! Ce module est **privé** : il n'est pas scanné par le codegen
 //! (`rust_input: crate::api`) et ne fait pas partie du contrat FFI ; la façade
@@ -53,7 +63,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use nd_crypto::{IdentityStore, PeerFingerprint};
+use nd_crypto::{IdentityStore, PeerFingerprint, StaticKeypair};
 use nd_features::Mp4Reader;
 use nd_proto::NovaId;
 
@@ -79,8 +89,20 @@ const FICHIER_REGLAGES: &str = "reglages.json";
 const FICHIER_HISTORIQUE: &str = "historique.json";
 const FICHIER_NON_SURVEILLE: &str = "non_surveille.json";
 
+/// Préfixe (ASCII) d'un fichier de **clé d'identité chiffrée au repos** (DPAPI
+/// sous Windows), suivi immédiatement du blob binaire protégé. Un fichier sans ce
+/// préfixe est l'ancien format en clair (`novadesk-identite v1` d'`IdentityStore`),
+/// migré à la lecture (déchiffré puis ré-écrit chiffré).
+const ENTETE_CLE_CHIFFREE: &[u8] = b"novadesk-cle-chiffree v1\n";
+
 /// Clé de réglage du dossier d'enregistrement (résolu par [`Magasin::lister_enregistrements`]).
 const CLE_DOSSIER_ENREGISTREMENT: &str = "dossier_enregistrement";
+
+/// Clé de réglage du **démarrage automatique avec le système**. Rendue réellement
+/// effective via la clé de registre `Run` de l'utilisateur (voir
+/// [`crate::plateforme::appliquer_demarrage_auto`], appliquée par la façade quand
+/// le réglage change).
+pub(crate) const CLE_DEMARRER_AVEC_SYSTEME: &str = "demarrer_avec_systeme";
 
 // ---------------------------------------------------------------------------
 // Répertoire de données de l'application
@@ -176,15 +198,21 @@ impl Magasin {
     /// Sérialise `valeur` en JSON et l'écrit **atomiquement** (fichier temporaire
     /// renommé sur la cible).
     fn ecrire_json<T: Serialize>(&self, fichier: &str, valeur: &T) -> Result<(), String> {
-        self.assurer_repertoire()?;
         let contenu = serde_json::to_vec_pretty(valeur)
             .map_err(|e| format!("sérialisation de « {fichier} » impossible : {e}"))?;
+        self.ecrire_octets_atomique(fichier, &contenu)
+    }
 
+    /// Écrit `contenu` **atomiquement** (fichier temporaire renommé sur la cible :
+    /// jamais de fichier à moitié écrit). Base commune de [`Magasin::ecrire_json`]
+    /// et de l'écriture de la clé d'identité chiffrée (blob binaire, hors JSON).
+    fn ecrire_octets_atomique(&self, fichier: &str, contenu: &[u8]) -> Result<(), String> {
+        self.assurer_repertoire()?;
         static COMPTEUR_TMP: AtomicU64 = AtomicU64::new(0);
         let unique = COMPTEUR_TMP.fetch_add(1, Ordering::Relaxed);
         let tmp = self.chemin(&format!("{fichier}.tmp-{}-{unique}", std::process::id()));
 
-        fs::write(&tmp, &contenu)
+        fs::write(&tmp, contenu)
             .map_err(|e| format!("écriture de « {fichier} » impossible : {e}"))?;
         fs::rename(&tmp, self.chemin(fichier)).map_err(|e| {
             let _ = fs::remove_file(&tmp);
@@ -206,9 +234,9 @@ impl Magasin {
         let _garde = self.verrouiller();
         self.assurer_repertoire()?;
 
-        // Paire de clés statiques (identité cryptographique stable, TOFU).
-        let paire = IdentityStore::load_or_create(&self.chemin(FICHIER_IDENTITE_CLE))
-            .map_err(|e| format!("identité cryptographique locale indisponible : {e}"))?;
+        // Paire de clés statiques (identité cryptographique stable, TOFU), chiffrée
+        // au repos (DPAPI) avec migration transparente de l'ancien format en clair.
+        let paire = self.charger_ou_creer_cle_identite()?;
         let empreinte = PeerFingerprint::from_public_key(&paire.public);
 
         // NovaId à 9 chiffres : dérivé de l'empreinte au premier lancement, puis
@@ -224,6 +252,83 @@ impl Magasin {
             id_formate: NovaId(ident.id).to_string(),
             empreinte: hex_minuscule(&empreinte.0),
         })
+    }
+
+    /// Charge la paire de clés d'identité en la **chiffrant au repos** (DPAPI) et
+    /// en **migrant** l'ancien format en clair de façon transparente :
+    ///
+    /// * fichier **absent** (premier lancement) → [`IdentityStore::load_or_create`]
+    ///   génère la paire (fichier clair), aussitôt chiffré au repos ;
+    /// * fichier au **nouveau format chiffré** (préfixe [`ENTETE_CLE_CHIFFREE`]) →
+    ///   déchiffré en mémoire puis parsé (le contrôle d'intégrité d'`IdentityStore`
+    ///   est réutilisé via un fichier clair temporaire supprimé aussitôt) ;
+    /// * fichier à l'**ancien format en clair** → chargé tel quel, puis **ré-écrit
+    ///   chiffré** (migration). Les clés sont conservées à l'identique — aucune
+    ///   identité existante n'est cassée.
+    fn charger_ou_creer_cle_identite(&self) -> Result<StaticKeypair, String> {
+        let chemin = self.chemin(FICHIER_IDENTITE_CLE);
+        match fs::read(&chemin) {
+            // Premier lancement : génère (en clair) puis chiffre au repos.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let paire = IdentityStore::load_or_create(&chemin)
+                    .map_err(|e| format!("identité cryptographique locale indisponible : {e}"))?;
+                self.chiffrer_cle_au_repos(&chemin)?;
+                Ok(paire)
+            }
+            Err(e) => Err(format!(
+                "lecture de « {FICHIER_IDENTITE_CLE} » impossible : {e}"
+            )),
+            Ok(octets) => match octets.strip_prefix(ENTETE_CLE_CHIFFREE) {
+                // Nouveau format : déprotège puis parse via un fichier clair éphémère.
+                Some(corps) => {
+                    let clair = crate::plateforme::deproteger(corps)?;
+                    self.paire_depuis_clair(&clair)
+                }
+                // Ancien format en clair : charge, puis migre (chiffre au repos).
+                None => {
+                    let paire = IdentityStore::load_or_create(&chemin).map_err(|e| {
+                        format!("identité cryptographique locale indisponible : {e}")
+                    })?;
+                    self.chiffrer_cle_au_repos(&chemin)?;
+                    Ok(paire)
+                }
+            },
+        }
+    }
+
+    /// Chiffre au repos le fichier de clé d'identité **présent en clair** : lit son
+    /// contenu (les trois lignes texte d'`IdentityStore`), le protège (DPAPI) et le
+    /// ré-écrit atomiquement, préfixé par [`ENTETE_CLE_CHIFFREE`]. Idempotent : un
+    /// fichier déjà chiffré est laissé tel quel.
+    fn chiffrer_cle_au_repos(&self, chemin: &Path) -> Result<(), String> {
+        let clair = fs::read(chemin)
+            .map_err(|e| format!("lecture de la clé d'identité impossible : {e}"))?;
+        if clair.starts_with(ENTETE_CLE_CHIFFREE) {
+            return Ok(());
+        }
+        let protege = crate::plateforme::proteger(&clair)?;
+        let mut contenu = ENTETE_CLE_CHIFFREE.to_vec();
+        contenu.extend_from_slice(&protege);
+        self.ecrire_octets_atomique(FICHIER_IDENTITE_CLE, &contenu)
+    }
+
+    /// Reconstruit la paire de clés depuis le **contenu clair** (trois lignes) en
+    /// réutilisant le parseur et le **contrôle d'intégrité** d'[`IdentityStore`] :
+    /// écrit un fichier clair temporaire à nom unique, le charge, puis le supprime
+    /// aussitôt (exposition en clair minimale, sous le verrou du magasin).
+    fn paire_depuis_clair(&self, clair: &[u8]) -> Result<StaticKeypair, String> {
+        static COMPTEUR_TMP: AtomicU64 = AtomicU64::new(0);
+        let unique = COMPTEUR_TMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.chemin(&format!(
+            "{FICHIER_IDENTITE_CLE}.clair-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&tmp, clair)
+            .map_err(|e| format!("écriture temporaire de la clé impossible : {e}"))?;
+        let paire = IdentityStore::load_or_create(&tmp)
+            .map_err(|e| format!("identité cryptographique locale indisponible : {e}"));
+        let _ = fs::remove_file(&tmp);
+        paire
     }
 
     // --- 2. Carnet d'adresses ----------------------------------------------
@@ -471,39 +576,67 @@ impl Magasin {
 
     // --- 6. Accès non surveillé -------------------------------------------
 
+    /// Lit l'état non surveillé en **migrant de façon transparente** un éventuel
+    /// mot de passe encore en clair (ancien format `mot_de_passe`) vers sa forme
+    /// **protégée au repos** (DPAPI) : dès qu'un tel champ est détecté, l'état est
+    /// ré-écrit chiffré. Appelée sous le verrou du magasin (les appelants le
+    /// détiennent déjà).
+    fn lire_non_surveille(&self) -> Result<NonSurveilleStocke, String> {
+        let mut etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
+        if etat.mot_de_passe.is_some() {
+            let ancien = etat.mot_de_passe.take();
+            etat.definir_mot_de_passe(ancien)?;
+            self.ecrire_json(FICHIER_NON_SURVEILLE, &etat)?;
+        }
+        Ok(etat)
+    }
+
     pub(crate) fn config_non_surveille(&self) -> Result<UnattendedConfigDto, String> {
         let _garde = self.verrouiller();
-        let etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
+        let etat = self.lire_non_surveille()?;
         Ok(UnattendedConfigDto {
-            a_mot_de_passe: etat.mot_de_passe.is_some(),
+            a_mot_de_passe: etat.a_mot_de_passe(),
             appareils_de_confiance: etat.appareils,
         })
     }
 
     /// Définit (ou efface, si `pwd` est vide) le mot de passe permanent d'accès
-    /// non surveillé. Seul un **hachage salé** est persisté — jamais le clair.
+    /// non surveillé. Seul un **hachage salé**, en outre **chiffré au repos**
+    /// (DPAPI), est persisté — jamais le clair.
     pub(crate) fn definir_mot_de_passe_non_surveille(&self, pwd: String) -> Result<(), String> {
         let _garde = self.verrouiller();
-        let mut etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
-        etat.mot_de_passe = if pwd.is_empty() {
+        let mut etat = self.lire_non_surveille()?;
+        let hache = if pwd.is_empty() {
             None
         } else {
             Some(MotDePasseHache::depuis_clair(&pwd))
         };
+        etat.definir_mot_de_passe(hache)?;
         self.ecrire_json(FICHIER_NON_SURVEILLE, &etat)
     }
 
-    /// Vérifie un mot de passe candidat contre le hachage persisté (`false` si
-    /// aucun mot de passe n'est configuré).
+    /// Vérifie un mot de passe candidat contre le hachage persisté (déchiffré au
+    /// vol) — `false` si aucun mot de passe n'est configuré.
     pub(crate) fn verifier_mot_de_passe_non_surveille(&self, pwd: String) -> Result<bool, String> {
         let _garde = self.verrouiller();
-        let etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
-        Ok(etat.mot_de_passe.is_some_and(|h| h.verifier(&pwd)))
+        let etat = self.lire_non_surveille()?;
+        Ok(etat.mot_de_passe_hache()?.is_some_and(|h| h.verifier(&pwd)))
+    }
+
+    /// L'ID fait-il partie des **appareils de confiance** de l'accès non
+    /// surveillé ? Consulté par le contrôle d'admission automatique
+    /// ([`crate::flux::demarrer_hote_non_surveille`]) en **union** avec la liste
+    /// blanche d'admission ([`Magasin::admission_contient`]) : toute erreur de
+    /// lecture y vaut refus (fermé par défaut).
+    pub(crate) fn appareil_de_confiance(&self, id: u64) -> Result<bool, String> {
+        let _garde = self.verrouiller();
+        let etat = self.lire_non_surveille()?;
+        Ok(etat.appareils.contains(&id))
     }
 
     pub(crate) fn ajouter_appareil_confiance(&self, id: u64) -> Result<(), String> {
         let _garde = self.verrouiller();
-        let mut etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
+        let mut etat = self.lire_non_surveille()?;
         if !etat.appareils.contains(&id) {
             etat.appareils.push(id);
         }
@@ -512,7 +645,7 @@ impl Magasin {
 
     pub(crate) fn retirer_appareil_confiance(&self, id: u64) -> Result<(), String> {
         let _garde = self.verrouiller();
-        let mut etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
+        let mut etat = self.lire_non_surveille()?;
         let avant = etat.appareils.len();
         etat.appareils.retain(|d| *d != id);
         if etat.appareils.len() == avant {
@@ -524,11 +657,58 @@ impl Magasin {
         self.ecrire_json(FICHIER_NON_SURVEILLE, &etat)
     }
 
+    // --- 6bis. Liste blanche d'admission (ACL) -----------------------------
+    //
+    // Liste d'ID admis **sans mot de passe** en accès non surveillé, persistée
+    // dans le même fichier que l'accès non surveillé. Elle est consultée par le
+    // vérificateur d'admission en **union** avec les appareils de confiance
+    // (`appareil_de_confiance`) : liste blanche ∪ appareils de confiance.
+
+    /// Liste blanche d'admission (ordre d'insertion).
+    pub(crate) fn admission_liste(&self) -> Result<Vec<u64>, String> {
+        let _garde = self.verrouiller();
+        Ok(self.lire_non_surveille()?.admission_autorisee)
+    }
+
+    /// Ajoute un ID à la liste blanche d'admission (sans effet s'il y figure déjà).
+    pub(crate) fn admission_ajouter(&self, id: u64) -> Result<(), String> {
+        let _garde = self.verrouiller();
+        let mut etat = self.lire_non_surveille()?;
+        if !etat.admission_autorisee.contains(&id) {
+            etat.admission_autorisee.push(id);
+        }
+        self.ecrire_json(FICHIER_NON_SURVEILLE, &etat)
+    }
+
+    /// Retire un ID de la liste blanche d'admission. Erreur s'il n'y figure pas.
+    pub(crate) fn admission_retirer(&self, id: u64) -> Result<(), String> {
+        let _garde = self.verrouiller();
+        let mut etat = self.lire_non_surveille()?;
+        let avant = etat.admission_autorisee.len();
+        etat.admission_autorisee.retain(|x| *x != id);
+        if etat.admission_autorisee.len() == avant {
+            return Err(format!(
+                "l'appareil {} n'est pas dans la liste blanche d'admission",
+                NovaId(id)
+            ));
+        }
+        self.ecrire_json(FICHIER_NON_SURVEILLE, &etat)
+    }
+
+    /// L'ID figure-t-il dans la **liste blanche d'admission** ? Consulté par le
+    /// vérificateur d'admission ([`crate::flux::demarrer_hote_non_surveille`]) en
+    /// union avec les appareils de confiance : un ID de l'une **ou** l'autre liste
+    /// est admis sans mot de passe. Toute erreur de lecture y vaut refus.
+    pub(crate) fn admission_contient(&self, id: u64) -> Result<bool, String> {
+        let _garde = self.verrouiller();
+        Ok(self.lire_non_surveille()?.admission_autorisee.contains(&id))
+    }
+
     /// Ajoute une entrée au **journal des accès** (append), borné à
     /// [`MAX_JOURNAL_ACCES`].
     pub(crate) fn enregistrer_acces(&self, peer_id: u64, accepte: bool) -> Result<(), String> {
         let _garde = self.verrouiller();
-        let mut etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
+        let mut etat = self.lire_non_surveille()?;
         etat.journal.push(EntreeJournal {
             peer_id,
             timestamp: maintenant_unix(),
@@ -544,7 +724,7 @@ impl Magasin {
     /// Journal des accès, du plus récent au plus ancien.
     pub(crate) fn journal_acces(&self) -> Result<Vec<AccessLogEntryDto>, String> {
         let _garde = self.verrouiller();
-        let etat: NonSurveilleStocke = self.lire_json(FICHIER_NON_SURVEILLE)?;
+        let etat = self.lire_non_surveille()?;
         Ok(etat
             .journal
             .into_iter()
@@ -592,17 +772,72 @@ impl CarnetStocke {
 /// Configuration d'accès non surveillé persistée.
 #[derive(Default, Serialize, Deserialize)]
 struct NonSurveilleStocke {
-    #[serde(default)]
+    /// **Ancien** champ : haché du mot de passe écrit en clair sur disque.
+    /// Conservé en lecture pour la **migration transparente** vers
+    /// `mot_de_passe_protege` ; jamais ré-écrit (voir [`Magasin::lire_non_surveille`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mot_de_passe: Option<MotDePasseHache>,
+    /// Haché du mot de passe **protégé au repos** (DPAPI sous Windows) :
+    /// hexadécimal du blob chiffré enveloppant le JSON de [`MotDePasseHache`].
+    /// Format courant — le clair du hachage n'est plus écrit tel quel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mot_de_passe_protege: Option<String>,
     #[serde(default)]
     appareils: Vec<u64>,
     #[serde(default)]
     journal: Vec<EntreeJournal>,
+    /// Liste blanche d'admission (ACL) : ID admis **sans mot de passe** en accès
+    /// non surveillé, au même titre que les appareils de confiance (union à
+    /// l'admission — voir [`crate::flux::demarrer_hote_non_surveille`]).
+    #[serde(default)]
+    admission_autorisee: Vec<u64>,
+}
+
+impl NonSurveilleStocke {
+    /// Un mot de passe permanent est-il configuré (forme protégée ou ancien clair) ?
+    fn a_mot_de_passe(&self) -> bool {
+        self.mot_de_passe_protege.is_some() || self.mot_de_passe.is_some()
+    }
+
+    /// Définit (ou efface avec `None`) le haché du mot de passe en le **protégeant
+    /// au repos** (DPAPI). Vide toujours l'ancien champ en clair : un secret non
+    /// protégé ne subsiste jamais.
+    fn definir_mot_de_passe(&mut self, hache: Option<MotDePasseHache>) -> Result<(), String> {
+        self.mot_de_passe = None;
+        self.mot_de_passe_protege = match hache {
+            Some(h) => {
+                let clair = serde_json::to_vec(&h)
+                    .map_err(|e| format!("sérialisation du mot de passe impossible : {e}"))?;
+                let protege = crate::plateforme::proteger(&clair)?;
+                Some(hex_minuscule(&protege))
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// Renvoie le haché du mot de passe : depuis le champ **protégé** (déchiffré à
+    /// la volée) en priorité, sinon depuis l'ancien champ en clair (avant
+    /// migration), sinon `None`.
+    fn mot_de_passe_hache(&self) -> Result<Option<MotDePasseHache>, String> {
+        if let Some(hex) = &self.mot_de_passe_protege {
+            let protege = decoder_hex(hex).ok_or_else(|| {
+                "mot de passe protégé illisible (hexadécimal mal formé)".to_owned()
+            })?;
+            let clair = crate::plateforme::deproteger(&protege)?;
+            let hache = serde_json::from_slice(&clair)
+                .map_err(|e| format!("mot de passe protégé illisible : {e}"))?;
+            Ok(Some(hache))
+        } else {
+            Ok(self.mot_de_passe.clone())
+        }
+    }
 }
 
 /// Mot de passe permanent haché : sel aléatoire + `BLAKE3(sel || mot de passe)`,
-/// tout deux en hexadécimal. Le clair n'est jamais stocké.
-#[derive(Serialize, Deserialize)]
+/// tout deux en hexadécimal. Le clair n'est jamais stocké ; ce hachage est en
+/// outre chiffré au repos (DPAPI) via [`NonSurveilleStocke::definir_mot_de_passe`].
+#[derive(Clone, Serialize, Deserialize)]
 struct MotDePasseHache {
     sel: String,
     empreinte: String,
@@ -651,7 +886,7 @@ fn reglages_par_defaut(racine: &Path) -> BTreeMap<String, String> {
         (CLE_DOSSIER_ENREGISTREMENT, dossier_enregistrement),
         ("theme", "systeme".to_owned()),
         ("langue", "fr".to_owned()),
-        ("demarrer_avec_systeme", "false".to_owned()),
+        (CLE_DEMARRER_AVEC_SYSTEME, "false".to_owned()),
     ]
     .into_iter()
     .map(|(cle, valeur)| (cle.to_owned(), valeur))
@@ -997,8 +1232,158 @@ mod tests {
     }
 
     #[test]
+    fn identite_chiffree_au_repos_des_le_premier_lancement() {
+        let (mag, dir) = magasin_temporaire();
+        let ident = mag.identite_locale().expect("identité");
+
+        // Le fichier de clé est chiffré au repos (préfixe dédié), pas en clair.
+        let brut = std::fs::read(dir.path().join(FICHIER_IDENTITE_CLE)).expect("clé");
+        assert!(
+            brut.starts_with(ENTETE_CLE_CHIFFREE),
+            "la clé d'identité doit être chiffrée au repos dès la création"
+        );
+
+        // Réouverture depuis le fichier chiffré : identité stable (déchiffrée).
+        let mag2 = Magasin::nouveau(dir.path().to_path_buf());
+        assert_eq!(mag2.identite_locale().expect("réouverture chiffrée"), ident);
+    }
+
+    #[test]
+    fn identite_migre_ancien_fichier_clair_vers_chiffre() {
+        let (mag, dir) = magasin_temporaire();
+        std::fs::create_dir_all(dir.path()).expect("dir");
+
+        // Écrit un ANCIEN fichier d'identité EN CLAIR (3 lignes d'`IdentityStore`).
+        let paire = nd_crypto::generate_static_keypair().expect("paire");
+        let priv_hex = hex_minuscule(&paire.private);
+        let contenu = format!(
+            "novadesk-identite v1\n{priv_hex}\n{}\n",
+            hex_minuscule(&paire.public)
+        );
+        let chemin = dir.path().join(FICHIER_IDENTITE_CLE);
+        std::fs::write(&chemin, contenu.as_bytes()).expect("écrit clair");
+
+        // Première lecture : migre (chiffre au repos) SANS changer l'identité.
+        let ident1 = mag.identite_locale().expect("identité migrée");
+
+        // Le fichier n'est plus l'ancien clair : préfixe chiffré présent.
+        let brut = std::fs::read(&chemin).expect("relecture");
+        assert!(
+            brut.starts_with(ENTETE_CLE_CHIFFREE),
+            "l'ancien fichier en clair doit avoir été migré (chiffré au repos)"
+        );
+        // Sous Windows (DPAPI réel), le hex de la clé privée n'apparaît plus en
+        // clair. Hors Windows, le repli identité le conserve (documenté) : pas
+        // d'assertion.
+        #[cfg(windows)]
+        {
+            let aiguille = priv_hex.as_bytes();
+            let present = brut.windows(aiguille.len()).any(|f| f == aiguille);
+            assert!(!present, "la clé privée ne doit plus figurer en clair");
+        }
+
+        // Réouverture depuis le disque (désormais chiffré) : identité inchangée.
+        let mag2 = Magasin::nouveau(dir.path().to_path_buf());
+        let ident2 = mag2.identite_locale().expect("réouverture");
+        assert_eq!(
+            ident1, ident2,
+            "la migration ne doit pas changer l'identité"
+        );
+    }
+
+    #[test]
+    fn mot_de_passe_non_surveille_migre_ancien_clair_vers_protege() {
+        let (mag, dir) = magasin_temporaire();
+        std::fs::create_dir_all(dir.path()).expect("dir");
+
+        // ANCIEN format : haché du mot de passe écrit EN CLAIR dans le JSON.
+        let ancien = NonSurveilleStocke {
+            mot_de_passe: Some(MotDePasseHache::depuis_clair("motdepasse-perm")),
+            ..NonSurveilleStocke::default()
+        };
+        std::fs::write(
+            dir.path().join(FICHIER_NON_SURVEILLE),
+            serde_json::to_vec_pretty(&ancien).expect("json ancien"),
+        )
+        .expect("écrit ancien");
+
+        // Lecture : migre vers le champ protégé et vérifie toujours le mot de passe.
+        assert!(mag
+            .verifier_mot_de_passe_non_surveille("motdepasse-perm".to_owned())
+            .expect("vérif après migration"));
+
+        // Le fichier a été ré-écrit au format protégé (plus d'ancien champ clair).
+        let brut =
+            std::fs::read_to_string(dir.path().join(FICHIER_NON_SURVEILLE)).expect("relecture");
+        assert!(
+            brut.contains("mot_de_passe_protege"),
+            "le mot de passe doit être migré vers le champ protégé"
+        );
+        assert!(
+            !brut.contains("\"mot_de_passe\":"),
+            "l'ancien champ en clair ne doit plus subsister après migration"
+        );
+
+        // Réouverture : toujours vérifiable, configuration cohérente.
+        let mag2 = Magasin::nouveau(dir.path().to_path_buf());
+        assert!(mag2.config_non_surveille().expect("config").a_mot_de_passe);
+        assert!(mag2
+            .verifier_mot_de_passe_non_surveille("motdepasse-perm".to_owned())
+            .expect("vérif après réouverture"));
+    }
+
+    #[test]
+    fn liste_blanche_admission_persistee_et_consultee() {
+        let (mag, dir) = magasin_temporaire();
+        assert!(mag.admission_liste().expect("vide").is_empty());
+        assert!(!mag.admission_contient(42).expect("absent"));
+
+        mag.admission_ajouter(42).expect("ajout");
+        mag.admission_ajouter(42).expect("doublon ignoré");
+        mag.admission_ajouter(43).expect("ajout2");
+        assert_eq!(mag.admission_liste().expect("liste"), vec![42, 43]);
+        assert!(mag.admission_contient(42).expect("membre"));
+        assert!(!mag.admission_contient(999).expect("non membre"));
+
+        // Persistée après réouverture depuis le disque.
+        let mag2 = Magasin::nouveau(dir.path().to_path_buf());
+        assert!(mag2.admission_contient(43).expect("réouverture"));
+        mag2.admission_retirer(42).expect("retrait");
+        assert!(mag2.admission_retirer(999).is_err());
+        assert_eq!(mag2.admission_liste().expect("liste"), vec![43]);
+    }
+
+    #[test]
+    fn admission_liste_blanche_distincte_des_appareils_de_confiance() {
+        // Liste blanche d'admission et appareils de confiance : deux listes
+        // distinctes que l'admission réunit (l'union est faite côté `flux`). Ici,
+        // on vérifie leur indépendance de stockage et de consultation.
+        let (mag, _dir) = magasin_temporaire();
+        mag.admission_ajouter(7).expect("liste blanche");
+        mag.ajouter_appareil_confiance(9).expect("confiance");
+
+        assert_eq!(mag.admission_liste().expect("liste blanche"), vec![7]);
+        assert_eq!(
+            mag.config_non_surveille()
+                .expect("config")
+                .appareils_de_confiance,
+            vec![9]
+        );
+        assert!(mag.admission_contient(7).expect("membre liste blanche"));
+        assert!(!mag
+            .admission_contient(9)
+            .expect("confiance ∉ liste blanche"));
+        assert!(mag.appareil_de_confiance(9).expect("membre confiance"));
+        assert!(!mag
+            .appareil_de_confiance(7)
+            .expect("liste blanche ∉ confiance"));
+    }
+
+    #[test]
     fn appareils_de_confiance_et_journal_acces() {
         let (mag, _dir) = magasin_temporaire();
+        // Liste vide (premier lancement) : personne n'est de confiance.
+        assert!(!mag.appareil_de_confiance(111).expect("liste vide"));
         mag.ajouter_appareil_confiance(111).expect("ajout");
         mag.ajouter_appareil_confiance(111).expect("doublon ignoré");
         mag.ajouter_appareil_confiance(222).expect("ajout");
@@ -1008,8 +1393,12 @@ mod tests {
                 .appareils_de_confiance,
             vec![111, 222]
         );
+        // Test d'appartenance : celui du contrôle d'admission automatique.
+        assert!(mag.appareil_de_confiance(111).expect("membre"));
+        assert!(!mag.appareil_de_confiance(999).expect("non membre"));
         mag.retirer_appareil_confiance(111).expect("retrait");
         assert!(mag.retirer_appareil_confiance(999).is_err());
+        assert!(!mag.appareil_de_confiance(111).expect("retiré"));
         assert_eq!(
             mag.config_non_surveille()
                 .expect("config")

@@ -403,9 +403,56 @@ class FrbNativeApi implements NativeApi {
   }
 
   @override
+  Future<List<EntreeFsDto>> sessionListRemoteDir(
+    int sessionId,
+    String chemin,
+  ) async {
+    try {
+      final entrees = await frb.sessionListRemoteDir(
+        sessionId: BigInt.from(sessionId),
+        chemin: chemin,
+      );
+      return entrees.map(_entreeFsDepuis).toList();
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
   Future<void> sendWol(String mac, {String? broadcast}) async {
     try {
       await frb.sendWol(mac: mac, broadcast: broadcast);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Découverte LAN — délégation aux fonctions générées ; les `Result<_, String>`
+  // du cœur (identité indisponible, port d'écoute occupé…) sont retransformés
+  // en [NovaApiException] au message français affichable.
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<void> discoveryStart(String nom, int port) async {
+    try {
+      await frb.discoveryStart(nom: nom, port: port);
+    } catch (e) {
+      throw NovaApiException(_message(e));
+    }
+  }
+
+  @override
+  Future<List<DiscoveredPeerDto>> discoveryPeers() async {
+    // Jamais d'erreur côté cœur : liste vide si la découverte est arrêtée.
+    final pairs = await frb.discoveryPeers();
+    return pairs.map(_pairDecouvertDepuis).toList();
+  }
+
+  @override
+  Future<void> discoveryStop() async {
+    try {
+      await frb.discoveryStop();
     } catch (e) {
       throw NovaApiException(_message(e));
     }
@@ -752,6 +799,24 @@ class FrbNativeApi implements NativeApi {
         principal: m.principal,
       );
 
+  /// Aplatit une entrée de listing distant générée (taille et horodatage de
+  /// modification `u64` ⇄ `BigInt`).
+  static EntreeFsDto _entreeFsDepuis(frb.EntreeFsDto e) => EntreeFsDto(
+        nom: e.nom,
+        taille: e.taille.toInt(),
+        estDossier: e.estDossier,
+        modifieLe: e.modifieLe?.toInt(),
+      );
+
+  /// Aplatit un pair découvert généré (id `u64` ⇄ `BigInt`).
+  static DiscoveredPeerDto _pairDecouvertDepuis(frb.DiscoveredPeerDto p) =>
+      DiscoveredPeerDto(
+        id: p.id.toInt(),
+        idFormate: p.idFormate,
+        nom: p.nom,
+        adresse: p.adresse,
+      );
+
   static frb.AnnotationDto _annotationVers(AnnotationDto a) => frb.AnnotationDto(
         genre: a.genre,
         points: a.points,
@@ -833,6 +898,9 @@ class FrbNativeApi implements NativeApi {
         extendedFeatures: o.extendedFeatures,
         transferDir: o.transferDir,
         transportReconnect: o.transportReconnect,
+        // Mot de passe d'admission automatique (accès non surveillé) : relayé
+        // tel quel, `null` = dialogue d'approbation manuel côté hôte.
+        motDePasse: o.motDePasse,
       );
 
   /// Conversion des statistiques (u64 ⇄ BigInt ; `targetBitrateKbps`,

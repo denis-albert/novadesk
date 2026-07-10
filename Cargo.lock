@@ -1791,6 +1791,8 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "nd-proto",
+ "nd-rendezvous",
+ "nd-signaling",
  "serde",
  "serde_json",
  "sha2",
@@ -1894,6 +1896,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows",
 ]
 
 [[package]]
@@ -1942,7 +1945,10 @@ dependencies = [
 name = "nd-signaling"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "nd-api",
  "nd-proto",
+ "nd-rendezvous",
  "nd-transport",
 ]
 
