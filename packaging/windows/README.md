@@ -7,7 +7,8 @@
 | `wix/NovaDesk.wxs` | Source WiX v4 de l'installeur **MSI** (app + service + raccourcis + ressources). |
 | `wix/License.rtf` | EULA **placeholder** (à remplacer avant distribution). |
 | `novadesk-cli.ps1` | **CLI de déploiement** parité AnyDesk (install/remove/get-id/set-password/register-license). |
-| `sign.ps1` | Signature **Authenticode** SHA-256 + horodatage (placeholders + secrets CI). |
+| `sign.ps1` | Signature **Authenticode** SHA-256 + horodatage RFC 3161 + vérification (paramétrable : empreinte magasin/jeton, PFX, secrets CI). |
+| `CERTIFICAT.md` | **Obtention et usage d'un vrai certificat** (OV vs EV, achat, jeton/HSM, SmartScreen, CI). |
 
 ## Prérequis (machine de build Windows, droits admin)
 
@@ -43,20 +44,38 @@ runner Flutter n'expose pas encore ce drapeau).
 
 ## Signer (Authenticode)
 
-```powershell
-# Certificat EV sur HSM (recommandé) : empreinte dans le magasin.
-$env:NOVADESK_SIGN_THUMBPRINT = '<empreinte SHA1 du certificat>'
-./packaging/windows/sign.ps1 -Path dist\NovaDesk-0.1.0-x86_64.msi
+`sign.ps1` signe EXE/DLL/MSI en **SHA-256** avec **horodatage RFC 3161**
+(la signature survit à l'expiration du certificat), vérifie chaque fichier
+(`signtool verify /pa /all` + `Get-AuthenticodeSignature`), est **idempotent**
+(fichier déjà signé par le même certificat → ignoré, re-signer avec `-Force`)
+et renvoie un code non nul au moindre échec.
 
-# …ou PFX fourni par un secret CI (base64), supprimé après usage :
-$env:NOVADESK_SIGN_PFX_BASE64  = $env:SECRET_PFX_B64
-$env:NOVADESK_SIGN_PFX_PASSWORD = $env:SECRET_PFX_PWD
-./packaging/windows/sign.ps1 -Path dist\NovaDesk-0.1.0-x86_64.msi
+```powershell
+# Vrai certificat (magasin Windows / jeton EV / HSM cloud) — voie recommandée :
+./packaging/windows/sign.ps1 -Files dist\NovaDesk-0.1.0-x86_64.msi `
+    -Thumbprint '<empreinte SHA1 du certificat>'
+
+# Plusieurs cibles : fichiers, jokers, dossiers (récursif exe/dll/msi) :
+./packaging/windows/sign.ps1 -Files ui\build\windows\x64\runner\Release, dist\*.msi `
+    -Thumbprint '<empreinte>'
+
+# PFX (test / CA interne) :
+./packaging/windows/sign.ps1 -Files dist\*.msi -PfxPath .\cert.pfx -Password $pwd
+
+# Secrets CI (aucun paramètre) : NOVADESK_SIGN_THUMBPRINT, ou
+# NOVADESK_SIGN_PFX_BASE64 (+ NOVADESK_SIGN_PFX_PASSWORD), NOVADESK_TIMESTAMP_URL.
+$env:NOVADESK_SIGN_THUMBPRINT = '<empreinte>'
+./packaging/windows/sign.ps1 -Files dist\NovaDesk-0.1.0-x86_64.msi
 ```
 
-`sign.ps1 -DryRun` imprime la commande `signtool` sans rien signer (validation
-sans certificat). Signer **tous** les binaires livrés (l'.exe et les DLL du
-runner) avant de les empaqueter, puis le MSI final.
+Options : `-TimestampUrl` (défaut DigiCert), `-DualSign` (SHA-1 + SHA-256 `/as`,
+compat héritée, PE uniquement), `-Description`/`-DescriptionUrl` (`/d`, `/du`),
+`-AllowUntrusted` (tolère l'échec de chaîne du **certificat auto-signé de
+test** uniquement), `-DryRun` (imprime les commandes sans signer).
+
+Signer **tous** les binaires livrés (l'.exe et les DLL du runner) avant de les
+empaqueter, puis le MSI final. Pour l'obtention d'un **vrai certificat**
+(OV/EV, jeton/HSM, SmartScreen, CI) : voir **`CERTIFICAT.md`**.
 
 ## CLI de déploiement (parité AnyDesk)
 
@@ -82,6 +101,14 @@ runner) avant de les empaqueter, puis le MSI final.
   exécution à blanc des scripts PowerShell (`sign.ps1 -DryRun`, `novadesk-cli.ps1
   --help/--get-id`). Les `.ps1` sont encodés **UTF-8 avec BOM** (sinon Windows
   PowerShell 5.1 corrompt les accents).
-- **À valider sur machine Windows + droits** : `wix build` réel, la pose
-  `msiexec`, l'enregistrement du service, et la signature `signtool` avec un vrai
-  certificat. Aucun de ces outils/certificats n'existe sur le poste de dev.
+- **Vérifié ici (2026-07-10) — pipeline de signature complet** : `sign.ps1` a
+  réellement signé et **horodaté (RFC 3161, DigiCert)** les 5 artefacts
+  (`novadesk_ui.exe` Release/Debug, `nd_ffi.dll`, `novadesk-svc.exe`, MSI) avec
+  le certificat **auto-signé de test** (`FC32C2EB4EDB5F19BCD1D97D87B03EC2890830F0`,
+  option `-AllowUntrusted`). `Get-AuthenticodeSignature` confirme le
+  `TimeStamperCertificate` DigiCert ; le statut `UnknownError` (chaîne non
+  approuvée) est **attendu** en auto-signé — voir `CERTIFICAT.md`.
+- **À valider sur machine de build / restant** : `wix build` réel, la pose
+  `msiexec`, l'enregistrement du service, et la signature avec un **vrai
+  certificat d'autorité** (achat OV/EV — parcours documenté dans
+  `CERTIFICAT.md` ; le pipeline s'utilise ensuite tel quel).
