@@ -27,31 +27,13 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use nd_proto::{MonitorId, NdError, Result};
 
 use crate::{
-    CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, MonitorInfo, PixelFormat,
-    Rect, ScreenCapturer,
+    clamp_region, CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, MonitorInfo,
+    PixelFormat, Rect, ScreenCapturer,
 };
 
 /// Convertit un code `CGError` en [`NdError::Capture`].
 fn cap_cg(contexte: &str, code: CGError) -> NdError {
     NdError::Capture(format!("{contexte} : CGError {code}"))
-}
-
-/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
-/// `(x, y, largeur, hauteur)` toujours non vide et dans les bornes (`None` = plein
-/// cadre). Une origine hors cadre est ramenée au dernier pixel valide — jamais
-/// d'agrandissement au plein écran (la zone hors-cadre ne doit pas fuiter).
-fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
-    match region {
-        None => (0, 0, w, h),
-        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
-        Some(r) => {
-            let x = r.x.min(w - 1);
-            let y = r.y.min(h - 1);
-            let rw = r.w.min(w - x).max(1);
-            let rh = r.h.min(h - y).max(1);
-            (x, y, rw, rh)
-        }
-    }
 }
 
 /// Énumère les écrans actifs via `CGGetActiveDisplayList`.

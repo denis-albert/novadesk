@@ -32,33 +32,13 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 use crate::{
-    CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, MonitorInfo, PixelFormat,
-    Rect, ScreenCapturer,
+    clamp_region, CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, MonitorInfo,
+    PixelFormat, Rect, ScreenCapturer,
 };
 
 /// Convertit une erreur `windows` en `NdError::Capture` (partagé avec [`crate::win_cursor`]).
 pub(crate) fn cap(e: windows::core::Error) -> NdError {
     NdError::Capture(e.to_string())
-}
-
-/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
-/// `(x, y, largeur, hauteur)` **toujours non vide et dans les bornes**.
-///
-/// `None` ⇒ plein cadre `(0, 0, w, h)`. Une région partiellement hors cadre est
-/// rognée ; une origine hors cadre est ramenée au dernier pixel valide (jamais
-/// d'agrandissement au plein écran — la zone hors-cadre ne doit pas fuiter).
-fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
-    match region {
-        None => (0, 0, w, h),
-        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
-        Some(r) => {
-            let x = r.x.min(w - 1);
-            let y = r.y.min(h - 1);
-            let rw = r.w.min(w - x).max(1);
-            let rh = r.h.min(h - y).max(1);
-            (x, y, rw, rh)
-        }
-    }
 }
 
 /// Intersecte un `RECT` DXGI (coordonnées moniteur) avec la fenêtre de capture
@@ -545,56 +525,8 @@ mod tests {
         }
     }
 
-    /// `clamp_region` : plein cadre par défaut, rognage dans les bornes, jamais vide,
-    /// jamais d'agrandissement au plein écran sur origine hors cadre.
-    #[test]
-    fn clamp_region_borne_sans_deborder() {
-        // None → plein cadre.
-        assert_eq!(clamp_region(None, 1920, 1080), (0, 0, 1920, 1080));
-        // Région interne inchangée.
-        assert_eq!(
-            clamp_region(
-                Some(Rect {
-                    x: 100,
-                    y: 50,
-                    w: 640,
-                    h: 480
-                }),
-                1920,
-                1080
-            ),
-            (100, 50, 640, 480)
-        );
-        // Débordement droite/bas → rogné à la limite.
-        assert_eq!(
-            clamp_region(
-                Some(Rect {
-                    x: 1800,
-                    y: 1000,
-                    w: 400,
-                    h: 400
-                }),
-                1920,
-                1080
-            ),
-            (1800, 1000, 120, 80)
-        );
-        // Origine hors cadre → ramenée au dernier pixel, largeur/hauteur ≥ 1
-        // (pas de repli plein écran : la zone hors-cadre ne fuite pas).
-        assert_eq!(
-            clamp_region(
-                Some(Rect {
-                    x: 5000,
-                    y: 5000,
-                    w: 10,
-                    h: 10
-                }),
-                1920,
-                1080
-            ),
-            (1919, 1079, 1, 1)
-        );
-    }
+    // NOTE : le test de `clamp_region` vit désormais dans `lib.rs` (logique
+    // partagée par tous les backends, testée sur toutes les plateformes).
 
     /// `clip_rect_into_region` : intersection + translation dans le repère de la
     /// sous-région ; `None` hors cadre ; bords négatifs/débordants bornés.

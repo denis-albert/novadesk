@@ -37,7 +37,7 @@ use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
 use nd_proto::{NdError, Result};
 
-use crate::codec::{echantillons_par_trame, DecodeurOpus, EncodeurOpus};
+use crate::codec::{echantillons_par_trame, horodatage_media_us, DecodeurOpus, EncodeurOpus};
 use crate::convert::{f32_vers_octets, octets_vers_f32, FormatEchantillon};
 use crate::{AudioCapturer, AudioFormat, AudioPacket, AudioPlayer};
 
@@ -140,7 +140,7 @@ impl MoteurCapturePulse {
 
         // Horloge média : position en échantillons convertie en microsecondes,
         // monotone et sans dérive vis-à-vis du flux (synchro A/V, plan 08).
-        let timestamp_us = self.echantillons_emis * 1_000_000 / u64::from(self.format.sample_rate);
+        let timestamp_us = horodatage_media_us(self.echantillons_emis, self.format.sample_rate);
         self.echantillons_emis += echantillons_par_trame(self.format) as u64;
 
         Ok(AudioPacket { data, timestamp_us })

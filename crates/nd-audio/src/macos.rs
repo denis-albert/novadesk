@@ -80,7 +80,7 @@ use objc2_screen_capture_kit::{
     SCStreamOutputType, SCWindow,
 };
 
-use crate::codec::{DecodeurOpus, EncodeurOpus, TRAME_MS};
+use crate::codec::{horodatage_media_us, DecodeurOpus, EncodeurOpus, TRAME_MS};
 use crate::convert::{planaire_vers_stereo, vers_stereo};
 use crate::{AudioCapturer, AudioFormat, AudioPacket, AudioPlayer};
 
@@ -330,24 +330,35 @@ impl Completion {
 }
 
 /// Attend la complétion (5 s max) sans paniquer.
+///
+/// L'échéance est **absolue** : un réveil parasite du condvar ne réarme pas le
+/// délai de 5 s (l'ancienne version repartait de zéro à chaque réveil).
 fn attendre(etat: &Arc<(Mutex<Completion>, Condvar)>) -> Result<()> {
     let (lock, cvar) = &**etat;
+    let echeance = Instant::now() + Duration::from_secs(5);
     let mut garde = lock.lock().unwrap_or_else(|p| p.into_inner());
     while !garde.fait {
-        let (g, delai) = cvar
-            .wait_timeout(garde, Duration::from_secs(5))
-            .unwrap_or_else(|p| p.into_inner());
-        garde = g;
-        if delai.timed_out() && !garde.fait {
+        let restant = echeance.saturating_duration_since(Instant::now());
+        if restant.is_zero() {
             return Err(NdError::Capture(
                 "screencapturekit : délai d'attente de la complétion dépassé".into(),
             ));
         }
+        garde = cvar
+            .wait_timeout(garde, restant)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
     }
     Ok(())
 }
 
 /// Découvre le contenu partageable (écrans) en bloquant sur la complétion.
+///
+/// NOTE (revue) : si l'attente expire (5 s) et que le rappel système arrive
+/// *ensuite*, l'objet retenu transféré via `pointeur` n'est réclamé par
+/// personne — fuite ponctuelle d'un `SCShareableContent` sur ce chemin
+/// d'erreur rare. Assumé pour ce jet (un échec de découverte est déjà fatal
+/// pour la capture) ; à revoir avec le portage sur machine macOS réelle.
 fn decouvrir_contenu() -> Result<Retained<SCShareableContent>> {
     let etat = Completion::en_attente();
     let etat_bloc = Arc::clone(&etat);
@@ -581,7 +592,7 @@ impl SckSystemCapturer {
         };
         let data = self.encodeur.encoder(&pcm)?;
 
-        let timestamp_us = self.echantillons_emis * 1_000_000 / u64::from(self.format.sample_rate);
+        let timestamp_us = horodatage_media_us(self.echantillons_emis, self.format.sample_rate);
         self.echantillons_emis += (besoin / usize::from(self.format.channels)) as u64;
         Ok(AudioPacket { data, timestamp_us })
     }

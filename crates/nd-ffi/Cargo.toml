@@ -61,11 +61,21 @@ irondash_engine_context = "0.5"
 #     (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`).
 # Spécifique à Windows (repli documenté « clair » hors Windows, cf. `plateforme`).
 # Version alignée sur nd-capture (0.58) pour ne pas dédoubler la dépendance.
+# Les fonctionnalités Direct3D/DXGI/LibraryLoader portent le rendu vidéo par
+# **texture GPU D3D11 partagée** (module `d3d11`) : device D3D11, texture
+# partagée DXGI composée par Flutter sans copie, conversion NV12→RGBA sur GPU
+# (`ID3D11VideoProcessor`), résolution des symboles du registre de textures
+# dans `flutter_windows.dll`.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [dev-dependencies]

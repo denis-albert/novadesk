@@ -35,6 +35,19 @@ pub fn echantillons_par_trame(format: AudioFormat) -> usize {
     format.sample_rate as usize * TRAME_MS as usize / 1000
 }
 
+/// Horodatage média (microsecondes) d'une position exprimée en échantillons
+/// **par canal**, à la fréquence donnée : `échantillons · 1e6 / fréquence`.
+///
+/// C'est l'horloge monotone commune A/V (voir plan 08 §synchro) — **même formule
+/// pour tous les backends** de capture (WASAPI, PulseAudio, ScreenCaptureKit) ;
+/// isolée et testée ici pour éviter que les copies par plateforme ne divergent.
+/// `frequence_hz` est borné à ≥ 1 pour ne jamais diviser par zéro (un format
+/// dégénéré à 0 Hz renvoie 0 plutôt que de paniquer).
+#[must_use]
+pub fn horodatage_media_us(echantillons_par_canal: u64, frequence_hz: u32) -> u64 {
+    echantillons_par_canal * 1_000_000 / u64::from(frequence_hz.max(1))
+}
+
 /// Message d'erreur libopus pour le code renvoyé par l'API C.
 fn texte_erreur(code: c_int) -> String {
     // SAFETY : opus_strerror renvoie une chaîne C statique valide (ou nulle)
@@ -273,6 +286,28 @@ mod tests {
     #[test]
     fn trame_par_defaut_960_echantillons() {
         assert_eq!(echantillons_par_trame(AudioFormat::default()), 960);
+    }
+
+    /// Horloge média : formule commune A/V partagée par les backends WASAPI,
+    /// PulseAudio et ScreenCaptureKit (voir `horodatage_media_us`).
+    #[test]
+    fn horodatage_media_progression_reguliere() {
+        // À 48 kHz, une trame de 20 ms = 960 échantillons/canal → 20 000 µs.
+        let f = 48_000;
+        assert_eq!(horodatage_media_us(0, f), 0);
+        assert_eq!(horodatage_media_us(960, f), 20_000);
+        assert_eq!(horodatage_media_us(2 * 960, f), 40_000);
+        // 1 s pile d'échantillons = 1 000 000 µs.
+        assert_eq!(horodatage_media_us(u64::from(f), f), 1_000_000);
+        // 48 kHz mono (micro) : même cadence par canal.
+        assert_eq!(horodatage_media_us(480, 48_000), 10_000);
+    }
+
+    /// Fréquence dégénérée (0 Hz) : bornée à 1, aucune division par zéro.
+    #[test]
+    fn horodatage_media_frequence_nulle_sans_panique() {
+        assert_eq!(horodatage_media_us(0, 0), 0);
+        assert_eq!(horodatage_media_us(5, 0), 5_000_000);
     }
 
     #[test]

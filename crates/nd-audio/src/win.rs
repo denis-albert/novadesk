@@ -35,7 +35,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
-use crate::codec::{EncodeurOpus, TRAME_MS};
+use crate::codec::{horodatage_media_us, EncodeurOpus, TRAME_MS};
 use crate::convert::{
     depuis_stereo, octets_vers_f32, vers_stereo, FormatEchantillon, Reechantillonneur,
 };
@@ -318,7 +318,7 @@ impl MoteurCapture {
 
         // Horloge média : position en échantillons convertie en microsecondes,
         // monotone et sans dérive vis-à-vis du flux (synchro A/V, plan 08).
-        let timestamp_us = self.echantillons_emis * 1_000_000 / u64::from(self.format.sample_rate);
+        let timestamp_us = horodatage_media_us(self.echantillons_emis, self.format.sample_rate);
         self.echantillons_emis += frames_trame as u64;
 
         Ok(AudioPacket { data, timestamp_us })

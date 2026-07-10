@@ -94,13 +94,63 @@ pub trait VideoEncoder: Send {
     }
 }
 
-/// Image décodée : dimensions + pixels RGBA prêts pour l'affichage (voir plan 10).
+/// Image décodée : dimensions + pixels prêts pour l'affichage (voir plan 10).
+///
+/// Deux représentations possibles, exclusives en pratique :
+///
+/// * **RGBA** (chemin historique) : `rgba` plein, `nv12 = None` — prêt pour le
+///   rendu CPU (`decodeImageFromPixels`) ou la texture PixelBuffer ;
+/// * **NV12** (chemin texture GPU D3D11, opt-in par [`preferer_sortie_nv12`]) :
+///   `nv12 = Some(plan Y + plan UV entrelacé)`, `rgba` vide — 2,7× moins
+///   d'octets à téléverser, conversion couleur faite **sur GPU** par
+///   l'affichage. Tout consommateur qui exige du RGBA passe par [`Self::en_rgba`]
+///   (repli CPU, [`nv12_vers_rgba`]).
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    /// Pixels RGBA (largeur × hauteur × 4 octets), ordre R, G, B, A.
+    /// Pixels RGBA (largeur × hauteur × 4 octets), ordre R, G, B, A. **Vide**
+    /// quand l'image est portée par `nv12` (sortie NV12 préférée).
     pub rgba: Vec<u8>,
+    /// Image NV12 (largeur × hauteur × 3/2 octets : plan Y puis plan UV
+    /// entrelacé), BT.601 pleine plage. `None` sur le chemin RGBA historique.
+    pub nv12: Option<Vec<u8>>,
+}
+
+impl DecodedFrame {
+    /// Rend les pixels **RGBA** de l'image, quelle que soit sa représentation :
+    /// `rgba` tel quel s'il est porteur, sinon conversion CPU de repli depuis
+    /// `nv12` ([`nv12_vers_rgba`] ; un NV12 malformé rend un tampon vide plutôt
+    /// que de paniquer — même dégradé que l'absence d'image).
+    #[must_use]
+    pub fn en_rgba(self) -> Vec<u8> {
+        if !self.rgba.is_empty() {
+            return self.rgba;
+        }
+        match self.nv12 {
+            Some(nv12) => nv12_vers_rgba(&nv12, self.width, self.height).unwrap_or_default(),
+            None => self.rgba,
+        }
+    }
+}
+
+/// Préférence **globale au processus** pour la sortie des décodeurs :
+/// `true` = NV12 (chemin texture GPU D3D11 : téléversement réduit + conversion
+/// couleur sur GPU), `false` (défaut) = RGBA historique. Posée par la couche
+/// d'affichage (nd-ffi) quand une texture D3D11 avec conversion GPU est
+/// vivante ; lue **à chaque trame** par les décodeurs (bascule à chaud sûre :
+/// tout consommateur RGBA passe par [`DecodedFrame::en_rgba`]).
+static SORTIE_NV12: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Règle la préférence globale de sortie des décodeurs (voir [`SORTIE_NV12`]).
+pub fn preferer_sortie_nv12(actif: bool) {
+    SORTIE_NV12.store(actif, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lit la préférence globale de sortie des décodeurs (voir [`SORTIE_NV12`]).
+#[must_use]
+pub fn sortie_nv12_preferee() -> bool {
+    SORTIE_NV12.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Décodeur vidéo côté viewer. Le rendu de la texture décodée est confié à l'UI
@@ -139,10 +189,15 @@ mod rate;
 /// 100 % portable : aucune FFI, aucune dépendance plateforme.
 mod metrics;
 
+/// Aides NV12 (chemin texture GPU D3D11) : re-empaquetage I420 → NV12 côté
+/// décodeur et conversion CPU de repli NV12 → RGBA. 100 % portable.
+mod nv12;
+
 pub use metrics::{mse_rgba, psnr_luma, psnr_par_canal_rgba, psnr_rgba, ssim_luma, write_y4m};
 pub use negotiation::{
     available_encoders, negotiate, BitrateLadder, ContentProfile, NetworkEstimate,
 };
+pub use nv12::nv12_vers_rgba;
 pub use rate::RateController;
 
 /// Crée l'encodeur pour le codec demandé.

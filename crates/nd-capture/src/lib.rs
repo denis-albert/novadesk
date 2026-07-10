@@ -27,6 +27,11 @@ mod linux_pipewire;
 mod linux_portal;
 #[cfg(target_os = "macos")]
 mod macos;
+// Conversions de pixels **pures** (sans appel OS), partagées par les backends
+// Linux (X11 ZPixmap, PipeWire) : compilées et testées sur toutes les plateformes,
+// y compris Windows, pour couvrir par les tests le code des cibles non
+// compilables depuis ce poste.
+mod pixel;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -88,6 +93,34 @@ pub struct Rect {
     pub y: u32,
     pub w: u32,
     pub h: u32,
+}
+
+/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
+/// `(x, y, largeur, hauteur)` **toujours non vide et dans les bornes**.
+///
+/// `None` ⇒ plein cadre `(0, 0, w, h)`. Une région partiellement hors cadre est
+/// rognée ; une origine hors cadre est ramenée au dernier pixel valide (jamais
+/// d'agrandissement au plein écran — la zone hors-cadre ne doit pas fuiter).
+///
+/// Logique **partagée par tous les backends** (DXGI, CoreGraphics, X11) — une seule
+/// implémentation, testée sur toutes les plateformes, plutôt que trois copies dont
+/// deux (macOS/Linux) ne seraient jamais exercées depuis le poste Windows.
+#[cfg_attr(
+    not(any(windows, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+pub(crate) fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    match region {
+        None => (0, 0, w, h),
+        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
+        Some(r) => {
+            let x = r.x.min(w - 1);
+            let y = r.y.min(h - 1);
+            let rw = r.w.min(w - x).max(1);
+            let rh = r.h.min(h - y).max(1);
+            (x, y, rw, rh)
+        }
+    }
 }
 
 /// Format de pixel d'une frame capturée.
@@ -306,6 +339,87 @@ pub fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `clamp_region` : plein cadre par défaut, rognage dans les bornes, jamais vide,
+    /// jamais d'agrandissement au plein écran sur origine hors cadre. Ces invariants
+    /// protègent la garantie de confidentialité du « cadre d'écran » sur **tous** les
+    /// backends (DXGI, CoreGraphics, X11) puisque la fonction est partagée.
+    #[test]
+    fn clamp_region_borne_sans_deborder() {
+        // None → plein cadre.
+        assert_eq!(clamp_region(None, 1920, 1080), (0, 0, 1920, 1080));
+        // Région interne inchangée.
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 100,
+                    y: 50,
+                    w: 640,
+                    h: 480
+                }),
+                1920,
+                1080
+            ),
+            (100, 50, 640, 480)
+        );
+        // Débordement droite/bas → rogné à la limite.
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 1800,
+                    y: 1000,
+                    w: 400,
+                    h: 400
+                }),
+                1920,
+                1080
+            ),
+            (1800, 1000, 120, 80)
+        );
+        // Origine hors cadre → ramenée au dernier pixel, largeur/hauteur ≥ 1
+        // (pas de repli plein écran : la zone hors-cadre ne fuite pas).
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 5000,
+                    y: 5000,
+                    w: 10,
+                    h: 10
+                }),
+                1920,
+                1080
+            ),
+            (1919, 1079, 1, 1)
+        );
+        // Région de dimensions nulles → jamais vide (1×1 au point demandé).
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 10,
+                    y: 20,
+                    w: 0,
+                    h: 0
+                }),
+                1920,
+                1080
+            ),
+            (10, 20, 1, 1)
+        );
+        // Cadre dégénéré (0×0) : renvoyé tel quel, sans soustraction débordante.
+        assert_eq!(
+            clamp_region(
+                Some(Rect {
+                    x: 1,
+                    y: 1,
+                    w: 1,
+                    h: 1
+                }),
+                0,
+                0
+            ),
+            (0, 0, 0, 0)
+        );
+    }
 
     /// `capture_cursor_shape` ne panique jamais et, quand une forme est renvoyée,
     /// ses dimensions et la taille de son buffer RGBA (`w*h*4`) sont cohérentes.

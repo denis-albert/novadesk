@@ -504,10 +504,15 @@ pub struct VideoFrameDto {
 
 impl From<DecodedFrame> for VideoFrameDto {
     fn from(frame: DecodedFrame) -> Self {
+        // `en_rgba` : rend le RGBA tel quel s'il est porteur, sinon convertit le
+        // NV12 (repli CPU). Robuste quand la préférence globale de sortie NV12 est
+        // active (texture GPU D3D11 vivante) alors qu'un consommateur CPU — flux
+        // RGBA, collecte synchrone, relecture d'enregistrement — reçoit la trame.
+        let (width, height) = (frame.width, frame.height);
         VideoFrameDto {
-            width: frame.width,
-            height: frame.height,
-            rgba: frame.rgba,
+            width,
+            height,
+            rgba: frame.en_rgba(),
         }
     }
 }

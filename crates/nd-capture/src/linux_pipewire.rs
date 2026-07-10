@@ -417,6 +417,9 @@ fn run_pipewire_loop(
 /// * RGBx / RGBA : échange R↔B pour obtenir du BGRA (alpha forcé opaque pour RGBx).
 ///
 /// Renvoie `None` pour tout format non géré par ce chemin CPU (NV12, YUY2, I420…).
+/// Seul le mapping des formats SPA vit ici : la conversion elle-même
+/// ([`crate::pixel::convertit_bgra`]) est de la logique pure, testée sur toutes
+/// les plateformes (y compris Windows, où ce module ne compile pas).
 fn convert_to_bgra(
     src: &[u8],
     width: usize,
@@ -436,40 +439,9 @@ fn convert_to_bgra(
         _ => return None,
     };
 
-    let dst_stride = width * 4;
-    let mut out = vec![0u8; dst_stride * height];
-
-    for y in 0..height {
-        let s_off = y * src_stride;
-        let d_off = y * dst_stride;
-        // Garde-fou : ne jamais déborder du buffer source (padding, tailles limites…).
-        if s_off + dst_stride > src.len() {
-            break;
-        }
-        let s = &src[s_off..s_off + dst_stride];
-        let d = &mut out[d_off..d_off + dst_stride];
-
-        if swap_rb {
-            for x in 0..width {
-                let p = x * 4;
-                d[p] = s[p + 2]; // B <- R
-                d[p + 1] = s[p + 1]; // G
-                d[p + 2] = s[p]; // R <- B
-                d[p + 3] = if has_alpha { s[p + 3] } else { 255 };
-            }
-        } else {
-            // Ordre de canaux déjà BGRA : copie directe…
-            d.copy_from_slice(s);
-            // … puis on force l'opacité si le format n'a pas d'alpha (BGRx).
-            if !has_alpha {
-                for x in 0..width {
-                    d[x * 4 + 3] = 255;
-                }
-            }
-        }
-    }
-
-    Some(out)
+    Some(crate::pixel::convertit_bgra(
+        src, width, height, src_stride, swap_rb, has_alpha,
+    ))
 }
 
 /// Construit le POD `EnumFormat` proposé à PipeWire : vidéo brute, un jeu de formats

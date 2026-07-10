@@ -271,6 +271,15 @@ mod plateforme;
 /// texture par [`flux`] ; le chemin RGBA-CPU historique reste le repli.
 mod texture;
 
+/// Rendu vidéo **zéro-copie D3D11** (Windows) : surface GPU **partagée** composée
+/// directement par Flutter (enregistrée auprès de l'embedder via
+/// `flutter_windows.dll`), alimentée par une conversion **NV12 → RGBA sur GPU**
+/// (`ID3D11VideoProcessor`). C'est le chemin **préféré** de [`texture`] ; toute
+/// défaillance retombe sur la texture PixelBuffer puis sur le flux RGBA CPU. Hors
+/// du périmètre scanné par le codegen (aucun `StreamSink`).
+#[cfg(windows)]
+mod d3d11;
+
 pub use api::*;
 
 // `StreamSink` (défini par le pont généré) apparaît dans les signatures publiques de

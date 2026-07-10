@@ -398,12 +398,33 @@ impl VideoEncoder for Openh264Encoder {
 /// Décodeur H.264 logiciel (pour vérification et pour le côté viewer).
 pub struct Openh264Decoder {
     inner: Decoder,
+    /// Forçage local de la sortie NV12 : `Some(true/false)` court-circuite la
+    /// préférence globale [`crate::sortie_nv12_preferee`] (utilisé par les
+    /// tests, qui tournent en parallèle et ne doivent pas se disputer l'état
+    /// global) ; `None` (défaut) = suivre la préférence globale, relue **à
+    /// chaque trame** (bascule à chaud quand la texture GPU s'attache).
+    sortie_nv12: Option<bool>,
 }
 
 impl Openh264Decoder {
     pub fn new() -> Result<Self> {
         let dec = Decoder::new().map_err(codec_err)?;
-        Ok(Self { inner: dec })
+        Ok(Self {
+            inner: dec,
+            sortie_nv12: None,
+        })
+    }
+
+    /// Force (ou libère, avec `None`) la sortie NV12 de **ce** décodeur,
+    /// indépendamment de la préférence globale. Voir le champ `sortie_nv12`.
+    ///
+    /// **Réservé aux tests** : la production pilote la sortie NV12 par la
+    /// préférence globale du processus ([`crate::preferer_sortie_nv12`], posée par
+    /// la couche d'affichage quand une texture GPU D3D11 est vivante) ; ce forçage
+    /// par décodeur n'existe que pour isoler les tests parallèles de l'état global.
+    #[cfg(test)]
+    pub fn regler_sortie_nv12(&mut self, forcee: Option<bool>) {
+        self.sortie_nv12 = forcee;
     }
 }
 
@@ -415,17 +436,32 @@ impl VideoDecoder for Openh264Decoder {
         if chunk.data.is_empty() {
             return Ok(None);
         }
-        // Le rendu de la YUV décodée sera confié à l'UI (voir plan 10) ; ici on renvoie
-        // les dimensions décodées comme preuve de décodage.
+        let nv12_voulu = self.sortie_nv12.unwrap_or_else(crate::sortie_nv12_preferee);
+        // Le rendu de la YUV décodée est confié à l'UI (voir plan 10) : RGBA
+        // (chemin CPU historique) ou NV12 (chemin texture GPU D3D11 — simple
+        // re-empaquetage des plans, la conversion couleur part sur le GPU).
         match self.inner.decode(&chunk.data).map_err(codec_err)? {
             Some(yuv) => {
                 let (w, h) = yuv.dimensions();
+                // NV12 exige des dimensions paires (garanties par nos encodeurs) ;
+                // par prudence, une image impaire reste sur le chemin RGBA.
+                if nv12_voulu && w % 2 == 0 && h % 2 == 0 {
+                    let nv12 =
+                        crate::nv12::i420_vers_nv12(yuv.y(), yuv.u(), yuv.v(), yuv.strides(), w, h);
+                    return Ok(Some(DecodedFrame {
+                        width: w as u32,
+                        height: h as u32,
+                        rgba: Vec::new(),
+                        nv12: Some(nv12),
+                    }));
+                }
                 let mut rgba = vec![0u8; w * h * 4];
                 yuv.write_rgba8(&mut rgba);
                 Ok(Some(DecodedFrame {
                     width: w as u32,
                     height: h as u32,
                     rgba,
+                    nv12: None,
                 }))
             }
             None => Ok(None),
@@ -753,5 +789,47 @@ mod tests {
             timestamp_us: 0,
         };
         assert!(dec.decode(&chunk).expect("répétition acceptée").is_none());
+    }
+
+    /// Sortie NV12 (chemin texture GPU D3D11) : le même flux décodé en NV12 puis
+    /// converti par le repli CPU ([`crate::nv12_vers_rgba`]) est fidèle à la
+    /// sortie RGBA historique (les deux ne diffèrent que par l'arrondi des deux
+    /// conversions YUV→RGB — PSNR élevé exigé). Le forçage local évite l'état
+    /// global (tests parallèles).
+    #[test]
+    fn decodeur_sortie_nv12_fidele_au_rgba() {
+        let (w, h) = (320u32, 240u32);
+        let mut enc = Openh264Encoder::new();
+        enc.configure(config(w, h, 4_000)).expect("configure");
+        let chunk = enc
+            .encode(&frame_texturee(w, h, 0xABCD_1234, 0), true)
+            .expect("encode");
+
+        let mut dec_rgba = Openh264Decoder::new().expect("décodeur RGBA");
+        dec_rgba.regler_sortie_nv12(Some(false));
+        let reference = dec_rgba
+            .decode(&chunk)
+            .expect("décodage RGBA")
+            .expect("image RGBA");
+        assert!(!reference.rgba.is_empty());
+        assert!(reference.nv12.is_none());
+
+        let mut dec_nv12 = Openh264Decoder::new().expect("décodeur NV12");
+        dec_nv12.regler_sortie_nv12(Some(true));
+        let image = dec_nv12
+            .decode(&chunk)
+            .expect("décodage NV12")
+            .expect("image NV12");
+        assert!(image.rgba.is_empty(), "la sortie NV12 ne porte pas de RGBA");
+        let nv12 = image.nv12.as_ref().expect("tampon NV12");
+        assert_eq!(nv12.len(), (w * h + w * h / 2) as usize, "taille NV12");
+
+        let rgba = image.en_rgba();
+        assert_eq!(rgba.len(), reference.rgba.len());
+        let psnr = psnr_luma(&reference.rgba, &rgba).expect("psnr");
+        assert!(
+            psnr > 40.0,
+            "NV12 + repli CPU doit rester fidèle au RGBA direct (PSNR = {psnr:.1} dB)"
+        );
     }
 }

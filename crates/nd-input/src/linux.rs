@@ -32,6 +32,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
+use crate::keysym::keysym_pour_char;
 use crate::screen::{point_absolu, MonitorRect};
 use crate::{InputInjector, MouseButton};
 
@@ -357,18 +358,8 @@ fn en_i16(v: f64) -> i16 {
     v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
 
-/// Keysym X11 d'un caractère Unicode.
-///
-/// Latin-1 imprimable : keysym = point de code. Sinon, convention « keysym Unicode » :
-/// `0x0100_0000 + point de code` (annexe du protocole X11).
-fn keysym_pour_char(ch: char) -> Keysym {
-    let cp = u32::from(ch);
-    if (0x20..=0x7e).contains(&cp) || (0xa0..=0xff).contains(&cp) {
-        cp
-    } else {
-        0x0100_0000 + cp
-    }
-}
+// NOTE : `keysym_pour_char` (caractère Unicode → keysym X11) vit dans
+// `crate::keysym` — logique pure compilée et testée sur toutes les plateformes.
 
 /// Cherche un keycode sans aucun keysym associé, réutilisable pour la saisie Unicode.
 ///
@@ -410,16 +401,8 @@ fn change_mapping(conn: &RustConnection, keycode: u8, sym: Keysym) -> Result<()>
 mod tests {
     use super::*;
 
-    #[test]
-    fn keysym_latin1_direct_et_unicode_decale() {
-        // ASCII et Latin-1 imprimables : identité.
-        assert_eq!(keysym_pour_char('a'), 0x61);
-        assert_eq!(keysym_pour_char('é'), 0xE9);
-        // Hors Latin-1 : convention 0x0100_0000 + point de code.
-        assert_eq!(keysym_pour_char('€'), 0x0100_0000 + 0x20AC);
-        // Les contrôles (ex. retour à la ligne) passent aussi par la forme Unicode.
-        assert_eq!(keysym_pour_char('\n'), 0x0100_000A);
-    }
+    // NOTE : les tests de `keysym_pour_char` vivent dans `crate::keysym`
+    // (exécutés sur toutes les plateformes, y compris Windows).
 
     #[test]
     fn boutons_x11_distincts_et_hors_molette() {

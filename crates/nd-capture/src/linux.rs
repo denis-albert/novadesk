@@ -43,9 +43,10 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
+use crate::pixel::{canal, stride_zpixmap, valeur_pixel};
 use crate::{
-    CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, MonitorInfo, PixelFormat,
-    Rect, ScreenCapturer,
+    clamp_region, CaptureConfig, CaptureEvent, CapturedFrame, CursorState, FrameImage, MonitorInfo,
+    PixelFormat, Rect, ScreenCapturer,
 };
 
 /// Session Wayland « pure » : `WAYLAND_DISPLAY` défini sans serveur X joignable
@@ -63,24 +64,6 @@ pub(crate) fn create_capturer() -> Result<Box<dyn ScreenCapturer>> {
         return Ok(Box::new(crate::linux_pipewire::PipeWireCapturer::new()));
     }
     Ok(Box::new(X11Capturer::new()?))
-}
-
-/// Borne la sous-région `region` (« cadre d'écran ») à un cadre `w`×`h` et renvoie
-/// `(x, y, largeur, hauteur)` toujours non vide et dans les bornes (`None` = plein
-/// cadre). Une origine hors cadre est ramenée au dernier pixel valide — jamais
-/// d'agrandissement au plein écran (la zone hors-cadre ne doit pas fuiter).
-fn clamp_region(region: Option<Rect>, w: u32, h: u32) -> (u32, u32, u32, u32) {
-    match region {
-        None => (0, 0, w, h),
-        Some(_) if w == 0 || h == 0 => (0, 0, w, h),
-        Some(r) => {
-            let x = r.x.min(w - 1);
-            let y = r.y.min(h - 1);
-            let rw = r.w.min(w - x).max(1);
-            let rh = r.h.min(h - y).max(1);
-            (x, y, rw, rh)
-        }
-    }
 }
 
 /// Énumère les moniteurs X11 de l'écran par défaut (RandR ≥ 1.5).
@@ -357,10 +340,9 @@ fn zpixmap_en_bgra(
         )));
     }
     let octets_par_pixel = bpp / 8;
-    // `scanline_pad` est exprimé en bits (8, 16 ou 32) ; chaque ligne est arrondie
-    // au multiple supérieur.
-    let pad = usize::from(format.scanline_pad).max(8) / 8;
-    let stride_source = (largeur as usize * octets_par_pixel).div_ceil(pad) * pad;
+    // Stride ZPixmap (arrondi de chaque ligne au `scanline_pad` du format, en bits) :
+    // logique pure partagée et testée sur toutes les plateformes (voir `crate::pixel`).
+    let stride_source = stride_zpixmap(largeur, bpp, format.scanline_pad);
     if reply.data.len() < stride_source * hauteur as usize {
         return Err(NdError::Capture(format!(
             "GetImage : {} octets reçus, {} attendus",
@@ -402,48 +384,5 @@ fn zpixmap_en_bgra(
     Ok(bgra)
 }
 
-/// Assemble la valeur d'un pixel ZPixmap (2 à 4 octets) selon l'ordre d'octets
-/// du serveur (`image_byte_order` du Setup).
-fn valeur_pixel(octets: &[u8], msb_first: bool) -> u32 {
-    if msb_first {
-        octets
-            .iter()
-            .fold(0u32, |acc, &o| (acc << 8) | u32::from(o))
-    } else {
-        octets
-            .iter()
-            .rev()
-            .fold(0u32, |acc, &o| (acc << 8) | u32::from(o))
-    }
-}
-
-/// Extrait un canal 8 bits via son masque contigu (canaux 8 bits en 24/32 bpp).
-fn canal(valeur: u32, masque: u32) -> u8 {
-    if masque == 0 {
-        return 0;
-    }
-    ((valeur & masque) >> masque.trailing_zeros()) as u8
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// L'assemblage d'un pixel respecte l'ordre d'octets du serveur.
-    #[test]
-    fn valeur_pixel_selon_ordre_octets() {
-        let octets = [0x11, 0x22, 0x33, 0x44];
-        assert_eq!(valeur_pixel(&octets, false), 0x4433_2211);
-        assert_eq!(valeur_pixel(&octets, true), 0x1122_3344);
-    }
-
-    /// L'extraction de canal gère les décalages et le masque nul.
-    #[test]
-    fn canal_extrait_selon_masque() {
-        let v = 0x00a1_b2c3;
-        assert_eq!(canal(v, 0x00ff_0000), 0xa1);
-        assert_eq!(canal(v, 0x0000_ff00), 0xb2);
-        assert_eq!(canal(v, 0x0000_00ff), 0xc3);
-        assert_eq!(canal(v, 0), 0);
-    }
-}
+// NOTE : `valeur_pixel` et `canal` (décodage d'un pixel ZPixmap) vivent dans
+// `crate::pixel` — logique pure compilée et testée sur toutes les plateformes.

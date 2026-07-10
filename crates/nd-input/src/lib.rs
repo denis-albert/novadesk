@@ -7,6 +7,9 @@
 
 use nd_proto::{MonitorId, Result};
 
+/// Correspondance caractère Unicode → keysym X11 (agnostique OS, testée
+/// partout — voir [`keysym`]). Utilisée par la saisie Unicode du backend Linux.
+mod keysym;
 /// Cartographie multi-écran des coordonnées absolues (agnostique OS, testée
 /// partout — voir [`screen`]). Utilisée par les backends Windows/macOS/Linux.
 mod screen;

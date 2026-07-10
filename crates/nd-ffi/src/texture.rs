@@ -15,14 +15,25 @@
 //! (CPU→GPU) et affiche `Texture(textureId: …)`. Aucun pixel ne transite alors
 //! par le pont FRB (le flux Dart ne reçoit qu'un « tick » de dimensions).
 //!
-//! # Honnêteté PixelBuffer vs zéro-copie
+//! # Deux modes de texture (préféré → repli)
 //!
-//! C'est une texture **PixelBuffer** : l'upload CPU→GPU est fait par Flutter à
-//! partir d'un `Vec<u8>` RGBA. Ce n'est **pas** du zéro-copie D3D11 partagé (qui
-//! exigerait `irondash_texture` en mode `TextureDescriptor`/`ID3D11Texture2D` et
-//! que l'encodeur/décodeur expose une surface GPU partagée). Le gain par rapport
-//! au chemin CPU : plus de `decodeImageFromPixels` côté Dart ni de marshalling
-//! des pixels par le pont ; l'affichage passe par le compositeur GPU de Flutter.
+//! 1. **Zéro-copie D3D11** (Windows, [`crate::d3d11`]) — chemin **préféré** : une
+//!    `ID3D11Texture2D` RGBA **partagée** (handle DXGI) est enregistrée auprès de
+//!    l'embedder Flutter et composée **directement sur le GPU**, sans copie
+//!    système. Le décodeur émet du **NV12** ([`nd_codec::preferer_sortie_nv12`]),
+//!    téléversé une fois (1,5 o/px) puis converti NV12→RGBA **sur GPU**
+//!    (`ID3D11VideoProcessor`). `irondash_texture` 0.5 n'exposant aucun
+//!    constructeur public pour ce mode, on enregistre la surface directement (voir
+//!    [`crate::d3d11`]).
+//! 2. **PixelBuffer** ([`FournisseurPixels`]) — **repli** : l'upload CPU→GPU est
+//!    fait par Flutter à partir d'un `Vec<u8>` RGBA. Pas de zéro-copie GPU, mais
+//!    déjà plus de `decodeImageFromPixels` côté Dart ni de marshalling des pixels
+//!    par le pont ; l'affichage passe par le compositeur GPU de Flutter.
+//!
+//! Honnêteté : le décodeur restant **logiciel** (openh264), **une** copie
+//! subsiste même en mode D3D11 — l'upload NV12 CPU→GPU. Le zéro-copie *total*
+//! exigerait un décodeur matériel D3D11 sortant une surface NV12 (hors de ce lot,
+//! voir [`crate::d3d11`]).
 //!
 //! # Threads
 //!
@@ -79,11 +90,20 @@ impl PayloadProvider<BoxedPixelData> for FournisseurPixels {
     }
 }
 
-/// Une texture vivante : sa poignée « envoyable » (signal inter-thread) et le
-/// tampon partagé avec son fournisseur de pixels.
-struct HolderTexture {
-    sendable: Arc<SendableTexture<BoxedPixelData>>,
-    tampon: Arc<Mutex<Option<TrameRgba>>>,
+/// Une texture vivante, selon son mode de rendu.
+enum HolderTexture {
+    /// Texture **PixelBuffer** (repli universel) : Flutter téléverse chaque trame
+    /// RGBA depuis un `Vec<u8>` CPU. Sa poignée « envoyable » (signal inter-thread)
+    /// et le tampon partagé avec son fournisseur de pixels.
+    PixelBuffer {
+        sendable: Arc<SendableTexture<BoxedPixelData>>,
+        tampon: Arc<Mutex<Option<TrameRgba>>>,
+    },
+    /// Texture **zéro-copie D3D11** (Windows) : surface GPU partagée composée
+    /// directement par Flutter, alimentée par conversion NV12→RGBA sur GPU
+    /// (voir [`crate::d3d11`]).
+    #[cfg(windows)]
+    D3d11(Arc<crate::d3d11::TextureD3d11>),
 }
 
 /// Table des textures vivantes, indexée par `textureId`.
@@ -114,12 +134,32 @@ fn verrou_assoc() -> MutexGuard<'static, HashMap<u64, i64>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Crée une texture PixelBuffer liée au moteur `engine_handle`, l'enregistre et
-/// renvoie son `textureId` (`>= 0`), ou `-1` en cas d'échec (handle inconnu,
-/// registre de textures indisponible…).
+/// Crée une texture liée au moteur `engine_handle`, l'enregistre et renvoie son
+/// `textureId` (`>= 0`), ou `-1` en cas d'échec.
+///
+/// Deux chemins, du plus performant au repli :
+/// 1. **Zéro-copie D3D11** (Windows) : surface GPU partagée composée directement
+///    par Flutter, conversion NV12→RGBA sur GPU (voir [`crate::d3d11`]). En cas de
+///    succès, le décodeur bascule en sortie **NV12** ([`nd_codec::preferer_sortie_nv12`]).
+/// 2. **PixelBuffer** (repli universel) : Flutter téléverse le RGBA CPU par trame.
 ///
 /// **À appeler sur le thread plateforme** (cf. doc du module).
 pub(crate) fn creer_texture(engine_handle: i64) -> i64 {
+    // 1. Chemin préféré : texture zéro-copie D3D11 (surface GPU partagée). Toute
+    //    défaillance (pas de GPU, symboles embedder absents, VideoProcessor
+    //    indisponible…) tombe sur le repli PixelBuffer ci-dessous.
+    #[cfg(windows)]
+    if let Ok(texture) = crate::d3d11::TextureD3d11::creer(engine_handle) {
+        let id = texture.id();
+        // Le décodeur émet désormais du NV12 : upload réduit (1,5 o/px) et
+        // conversion couleur déléguée au GPU. Tout consommateur RGBA reste couvert
+        // par `DecodedFrame::en_rgba` (repli CPU).
+        nd_codec::preferer_sortie_nv12(true);
+        verrou_textures().insert(id, HolderTexture::D3d11(Arc::new(texture)));
+        return id;
+    }
+
+    // 2. Repli : texture PixelBuffer (upload RGBA CPU→GPU par Flutter).
     let tampon: Arc<Mutex<Option<TrameRgba>>> = Arc::new(Mutex::new(None));
     let fournisseur = Arc::new(FournisseurPixels {
         tampon: Arc::clone(&tampon),
@@ -130,7 +170,7 @@ pub(crate) fn creer_texture(engine_handle: i64) -> i64 {
     };
     let id = texture.id();
     let sendable = texture.into_sendable_texture();
-    verrou_textures().insert(id, HolderTexture { sendable, tampon });
+    verrou_textures().insert(id, HolderTexture::PixelBuffer { sendable, tampon });
     id
 }
 
@@ -150,6 +190,15 @@ pub(crate) fn attacher(session_id: u64, texture_id: i64) -> i32 {
 pub(crate) fn liberer_texture(texture_id: i64) {
     verrou_textures().remove(&texture_id);
     verrou_assoc().retain(|_, tid| *tid != texture_id);
+    // Plus aucune texture D3D11 vivante ⇒ le décodeur peut revenir au RGBA (évite
+    // le re-empaquetage NV12 inutile quand seule une texture CPU/PixelBuffer sert).
+    #[cfg(windows)]
+    if !verrou_textures()
+        .values()
+        .any(|h| matches!(h, HolderTexture::D3d11(_)))
+    {
+        nd_codec::preferer_sortie_nv12(false);
+    }
 }
 
 /// Détache toute texture de la session `id` (appelé à l'arrêt de la session).
@@ -173,26 +222,58 @@ pub(crate) fn consommer_frame(
     let Some(texture_id) = verrou_assoc().get(&session_id).copied() else {
         return Err(frame);
     };
-    // Clone les `Arc` sous verrou puis relâche la table avant l'upload : le
-    // verrou des textures n'est jamais tenu pendant `mark_frame_available`.
-    let (sendable, tampon) = {
+    // Clone la cible sous verrou puis relâche la table avant tout upload : le
+    // verrou des textures n'est jamais tenu pendant `mark_frame_available` / la
+    // conversion GPU.
+    let cible = {
         let table = verrou_textures();
         match table.get(&texture_id) {
-            Some(h) => (Arc::clone(&h.sendable), Arc::clone(&h.tampon)),
+            Some(HolderTexture::PixelBuffer { sendable, tampon }) => CibleTexture::PixelBuffer {
+                sendable: Arc::clone(sendable),
+                tampon: Arc::clone(tampon),
+            },
+            #[cfg(windows)]
+            Some(HolderTexture::D3d11(t)) => CibleTexture::D3d11(Arc::clone(t)),
             None => return Err(frame),
         }
     };
+
     let (largeur, hauteur) = (frame.width, frame.height);
-    {
-        let mut garde = tampon.lock().unwrap_or_else(PoisonError::into_inner);
-        *garde = Some(TrameRgba {
-            largeur: largeur as i32,
-            hauteur: hauteur as i32,
-            rgba: frame.rgba,
-        });
+    match cible {
+        CibleTexture::PixelBuffer { sendable, tampon } => {
+            {
+                let mut garde = tampon.lock().unwrap_or_else(PoisonError::into_inner);
+                *garde = Some(TrameRgba {
+                    largeur: largeur as i32,
+                    hauteur: hauteur as i32,
+                    // `en_rgba` : couvre une trame NV12 (repli CPU) si la sortie
+                    // NV12 est active alors que cette texture est en PixelBuffer.
+                    rgba: frame.en_rgba(),
+                });
+            }
+            sendable.mark_frame_available();
+            Ok((largeur, hauteur))
+        }
+        // Surface GPU partagée : conversion NV12→RGBA sur GPU + signal Flutter. En
+        // cas d'échec GPU (rare : device perdu…), on rend la trame en repli — le
+        // Dart en mode texture l'ignore, la trame suivante réessaie (pas de crash).
+        #[cfg(windows)]
+        CibleTexture::D3d11(texture) => match texture.pousser_frame(&frame) {
+            Ok(()) => Ok((largeur, hauteur)),
+            Err(_) => Err(frame),
+        },
     }
-    sendable.mark_frame_available();
-    Ok((largeur, hauteur))
+}
+
+/// Cible résolue d'une trame : clones sortis de la table sous verrou, travaillés
+/// hors verrou (cf. [`consommer_frame`]).
+enum CibleTexture {
+    PixelBuffer {
+        sendable: Arc<SendableTexture<BoxedPixelData>>,
+        tampon: Arc<Mutex<Option<TrameRgba>>>,
+    },
+    #[cfg(windows)]
+    D3d11(Arc<crate::d3d11::TextureD3d11>),
 }
 
 // ---------------------------------------------------------------------------

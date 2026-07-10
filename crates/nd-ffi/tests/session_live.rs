@@ -23,6 +23,8 @@ fn conversion_frame_decodee_en_dto() {
         width: 2,
         height: 3,
         rgba: vec![7u8; 2 * 3 * 4],
+        // Chemin RGBA historique : pas de plan NV12.
+        nv12: None,
     };
     let dto = VideoFrameDto::from(frame);
     assert_eq!((dto.width, dto.height), (2, 3));
