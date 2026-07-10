@@ -4,19 +4,43 @@
 /// de navigation** 50 px (Accueil, Carnet, Enregistrements, Accès non
 /// surveillé, Réglages) et barre d'état 26 px.
 ///
-/// Contrainte no-admin : sans plugin natif de fenêtrage, cette barre est
-/// applicative (dessinée sous le chrome OS) ; ─ ▢ passent par le shim no-op
-/// `window_shim.dart`, ✕ ferme l'application.
+/// Fenêtrage natif réel : la barre de titre applicative est dessinée par-dessus
+/// la fenêtre sans chrome OS (`TitleBarStyle.hidden`, cf. `main.dart`). Les
+/// contrôles ─ ▢ ✕ pilotent le vrai plugin `window_manager` (via le point
+/// d'entrée `window_shim.dart`) : minimiser, agrandir/restaurer, fermer ; la
+/// zone vide de la barre déplace la fenêtre (`startDragging`) et le double-clic
+/// l'agrandit/restaure.
 library;
 
+import 'dart:async' show unawaited;
+import 'dart:io' show Platform;
+
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../platform/window_shim.dart';
 import '../state/providers.dart';
 import '../theme/nova_theme.dart';
 import 'nova_icons.dart';
 import 'nova_kit.dart';
+
+/// Vrai si le fenêtrage natif (`window_manager`) est disponible : desktop hors
+/// web. Ailleurs, les contrôles de fenêtre restent inertes (ou ✕ = quitter).
+bool get _fenetrageNatifDispo =>
+    !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+
+/// Agrandit la fenêtre ou la restaure selon son état courant (bouton ▢ et
+/// double-clic sur la barre de titre).
+Future<void> _basculerAgrandissement() async {
+  if (!_fenetrageNatifDispo) return;
+  if (await windowManager.isMaximized()) {
+    await windowManager.unmaximize();
+  } else {
+    await windowManager.maximize();
+  }
+}
 
 /// Vue active — pilote la mise en évidence du rail et de l'onglet.
 enum NovaVue { accueil, carnet, enregistrements, nonSurveille, reglages, session }
@@ -124,10 +148,20 @@ class _BarreTitre extends ConsumerWidget {
         color: t.barre,
         border: Border(bottom: BorderSide(color: t.filet)),
       ),
-      child: Row(
-        children: [
-          const SizedBox(width: 12),
-          const NovaLogo(),
+      // Déplacement de la fenêtre par la zone vide de la barre (les boutons,
+      // opaques, gardent leurs clics) et agrandissement au double-clic — parité
+      // AnyDesk. Inerte hors desktop.
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onPanStart: _fenetrageNatifDispo
+            ? (_) => unawaited(windowManager.startDragging())
+            : null,
+        onDoubleTap:
+            _fenetrageNatifDispo ? () => unawaited(_basculerAgrandissement()) : null,
+        child: Row(
+          children: [
+            const SizedBox(width: 12),
+            const NovaLogo(),
           const SizedBox(width: 8),
           Text(
             'NovaDesk',
@@ -159,8 +193,9 @@ class _BarreTitre extends ConsumerWidget {
                 context, 'Gestion du compte — à venir.',
                 info: true),
           ),
-          const _ControlesFenetre(),
-        ],
+            const _ControlesFenetre(),
+          ],
+        ),
       ),
     );
   }
@@ -386,18 +421,28 @@ class _ControlesFenetre extends StatelessWidget {
         _BoutonFenetre(
           icone: NovaIcones.reduire,
           infobulle: 'Réduire',
-          onTap: () {},
+          onTap: () {
+            if (_fenetrageNatifDispo) unawaited(windowManager.minimize());
+          },
         ),
         _BoutonFenetre(
           icone: NovaIcones.agrandir,
           infobulle: 'Agrandir',
-          onTap: () {},
+          onTap: () => unawaited(_basculerAgrandissement()),
         ),
         _BoutonFenetre(
           icone: NovaIcones.fermer,
           infobulle: 'Fermer',
           fermeture: true,
-          onTap: () => SystemNavigator.pop(),
+          // Fermeture réelle de la fenêtre native (déclenche la sortie propre de
+          // l'app) ; repli `SystemNavigator.pop()` hors desktop.
+          onTap: () {
+            if (_fenetrageNatifDispo) {
+              unawaited(windowManager.close());
+            } else {
+              SystemNavigator.pop();
+            }
+          },
         ),
       ],
     );

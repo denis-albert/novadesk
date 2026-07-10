@@ -15,6 +15,7 @@ members = [
     "crates/nd-features",
     "crates/nd-core",
     "crates/nd-ffi",
+    "crates/nd-service",
     "crates/nd-wasm",
     "server/nd-rendezvous",
     "server/nd-relay",

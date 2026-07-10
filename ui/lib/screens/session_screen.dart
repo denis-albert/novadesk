@@ -51,7 +51,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart' show LucideIcons;
 
 import '../app_routes.dart';
+import '../bridge/frb_api.dart' show FrbNativeApi;
 import '../bridge/native_api.dart';
+import '../platform/texture_video.dart';
 import '../platform/window_shim.dart';
 import '../state/providers.dart';
 import '../theme/motion.dart';
@@ -200,8 +202,33 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   /// indicateur sur la ligne du fichier et garde anti double-clic.
   final Set<String> _telechargementsEnCours = <String>{};
 
-  /// Trame vidéo courante décodée en `ui.Image`, peinte par [_PeintreVideo].
+  /// Trame vidéo courante décodée en `ui.Image`, peinte par [_PeintreVideo]
+  /// (chemin **CPU** de repli). En mode texture, cette valeur reste nulle.
   final ValueNotifier<ui.Image?> _trameCourante = ValueNotifier<ui.Image?>(null);
+
+  // --- Rendu par TEXTURE GPU (irondash) -------------------------------------
+  //
+  // Chemin préféré quand le cœur natif est actif et le plugin `irondash`
+  // disponible : le cœur alimente une `Texture` Flutter (voir
+  // `platform/texture_video.dart` + `crates/nd-ffi/src/texture.rs`) et l'UI
+  // affiche `Texture(textureId: …)`. **Repli automatique** sur le chemin CPU
+  // (`decodeImageFromPixels` → [_PeintreVideo]) si la texture échoue.
+
+  /// Pont dart:ffi vers la texture GPU (chargé si le plugin/DLL est présent).
+  TextureVideo? _texture;
+
+  /// Identifiant de la texture Flutter en cours (`null` = pas de texture).
+  int? _textureId;
+
+  /// Vrai quand la surface distante est rendue par `Texture` (mode texture) ;
+  /// faux = repli CPU. Bascule additive et réversible.
+  bool _modeTexture = false;
+
+  /// Dernière taille (pixels) de l'image distante, connue dans les **deux**
+  /// modes (les « ticks » du flux vidéo portent largeur/hauteur même sans
+  /// pixels) : letterbox commun au peintre CPU, à la couche d'annotations et à
+  /// la sélection de cadre.
+  final ValueNotifier<Size?> _tailleDistante = ValueNotifier<Size?>(null);
 
   bool _aRecuUneTrame = false;
   bool _decodageEnCours = false;
@@ -367,8 +394,13 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
     unawaited(_abonnementAnnotations?.cancel());
     _minuterieStats?.cancel();
     unawaited(_arreterMoteur());
+    // Libère la texture GPU (le cœur a déjà cessé de l'alimenter à l'arrêt de
+    // la session) : la table Rust des textures retire l'entrée.
+    final textureId = _textureId;
+    if (textureId != null) _texture?.liberer(textureId);
     _trameCourante.value?.dispose();
     _trameCourante.dispose();
+    _tailleDistante.dispose();
     _apercuAnnotation.dispose();
     _revisionAnnotations.dispose();
     if (_pleinEcran && _estDesktop) {
@@ -450,9 +482,49 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
           // Annotation illisible : ignorée, le flux continue.
         },
       );
+      // Rendu par TEXTURE GPU si possible (additif, best-effort) : n'échoue
+      // jamais et laisse le repli CPU en place le cas échéant.
+      unawaited(_activerTextureSiPossible());
     } catch (e) {
       _signalerErreurFatale(_messageErreur(e));
     }
+  }
+
+  /// Tente d'activer le **rendu par texture GPU** (irondash) pour cette session.
+  ///
+  /// Best-effort et entièrement **réversible** : si le cœur natif n'est pas
+  /// actif (façade mock — ses frames n'alimentent pas la texture), si le plugin
+  /// / la DLL n'expose pas les symboles `nd_texture_*`, ou si la création de la
+  /// texture échoue, on garde le **repli CPU** (`decodeImageFromPixels`). En cas
+  /// de succès, le cœur route les frames vers la texture (`session_texture_attach`)
+  /// et l'UI affiche `Texture(textureId: …)`.
+  Future<void> _activerTextureSiPossible() async {
+    if (!_estDesktop) return;
+    // Le mock (Dart) ne passe pas par le cœur natif : ses frames n'alimentent
+    // pas la texture. On n'active la texture qu'avec la façade réelle.
+    if (_api is! FrbNativeApi) return;
+    final id = _sessionId;
+    if (id == null) return;
+    final texture = TextureVideo.charger();
+    if (texture == null) return; // plugin/DLL absent → repli CPU
+    final textureId = await texture.creer();
+    if (textureId == null) return; // création impossible → repli CPU
+    if (!mounted) {
+      texture.liberer(textureId);
+      return;
+    }
+    if (!texture.attacher(id, textureId)) {
+      texture.liberer(textureId);
+      return;
+    }
+    setState(() {
+      _texture = texture;
+      _textureId = textureId;
+      _modeTexture = true;
+      // Libère l'éventuelle image CPU déjà décodée : inutile en mode texture.
+      _trameCourante.value?.dispose();
+      _trameCourante.value = null;
+    });
   }
 
   Future<void> _surEtat(SessionStateDto etat) async {
@@ -509,6 +581,21 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   }
 
   void _surTrameVideo(VideoFrameDto trame) {
+    // Taille de l'image distante — renseignée dans les deux modes (le tick
+    // texture porte largeur/hauteur même sans pixels) : pilote le letterbox
+    // commun (peintre CPU, annotations, sélection de cadre).
+    if (trame.width > 0 && trame.height > 0) {
+      final taille = Size(trame.width.toDouble(), trame.height.toDouble());
+      if (_tailleDistante.value != taille) _tailleDistante.value = taille;
+    }
+    // Mode texture : les pixels sont téléversés côté Rust ; le tick ne sert
+    // qu'à révéler la surface (masquer l'overlay de connexion).
+    if (_modeTexture) {
+      if (!_aRecuUneTrame && mounted) {
+        setState(() => _aRecuUneTrame = true);
+      }
+      return;
+    }
     if (_decodageEnCours) return;
     _decodageEnCours = true;
     ui.decodeImageFromPixels(
@@ -1288,7 +1375,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
                       child: RepaintBoundary(
                         child: CustomPaint(
                           painter: _PeintreAnnotations(
-                            trame: _trameCourante,
+                            tailleDistante: _tailleDistante,
                             annotations: _annotations,
                             apercu: _apercuAnnotation,
                             revision: _revisionAnnotations,
@@ -1466,14 +1553,16 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   Widget _contenuSurface() {
     final montrerVideo = _aRecuUneTrame && _etat != SessionStateDto.closed;
     if (!montrerVideo) return _apercuSimule();
-    Widget surface = SizedBox.expand(
-      child: RepaintBoundary(
-        child: CustomPaint(
-          painter: _PeintreVideo(_trameCourante, _modeVideo),
-          size: Size.infinite,
-        ),
-      ),
-    );
+    Widget surface = _modeTexture && _textureId != null
+        ? _surfaceTexture()
+        : SizedBox.expand(
+            child: RepaintBoundary(
+              child: CustomPaint(
+                painter: _PeintreVideo(_trameCourante, _modeVideo),
+                size: Size.infinite,
+              ),
+            ),
+          );
     // « Mode nuit (inverser) » : inversion des couleurs côté visionneuse.
     if (_modeNuit) {
       surface = ColorFiltered(
@@ -1487,6 +1576,39 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
       );
     }
     return surface;
+  }
+
+  /// Surface distante rendue par **texture GPU** : le widget `Texture` est
+  /// positionné **exactement** sur le rectangle vidéo letterboxé
+  /// ([_rectAffichageVideo]) — les mêmes coordonnées que la couche
+  /// d'annotations et la sélection de cadre, pour un alignement au pixel près.
+  /// Se recompose quand la résolution distante ([_tailleDistante]) ou le mode
+  /// d'affichage changent.
+  Widget _surfaceTexture() {
+    final textureId = _textureId!;
+    return LayoutBuilder(
+      builder: (context, contraintes) {
+        final taille = contraintes.biggest;
+        return ValueListenableBuilder<Size?>(
+          valueListenable: _tailleDistante,
+          builder: (context, tailleImage, _) {
+            final rect = _rectAffichageVideo(taille, tailleImage, _modeVideo);
+            if (rect.isEmpty) return const SizedBox.expand();
+            return Stack(
+              children: [
+                Positioned.fromRect(
+                  rect: rect,
+                  child: Texture(
+                    textureId: textureId,
+                    filterQuality: FilterQuality.medium,
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   /// Aperçu du bureau distant tant qu'aucune trame n'est décodée : dégradé
@@ -2444,7 +2566,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   /// Projette une position locale de la surface dans les coordonnées
   /// normalisées `0..1` de l'image distante affichée (letterbox déduit).
   Offset _normaliserPoint(Offset local, Size taille) {
-    final rect = _rectAffichageVideo(taille, _trameCourante.value, _modeVideo);
+    final rect = _rectAffichageVideo(taille, _tailleDistante.value, _modeVideo);
     if (rect.width <= 0 || rect.height <= 0) return Offset.zero;
     return Offset(
       math.min(1.0, math.max(0.0, (local.dx - rect.left) / rect.width)),
@@ -2663,7 +2785,7 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
       _informer("Cadre d'écran : session non démarrée.");
       return;
     }
-    if (_trameCourante.value == null) {
+    if (_tailleDistante.value == null) {
       _informer("Cadre d'écran : attendez la première image distante.");
       return;
     }
@@ -2723,22 +2845,25 @@ class _SessionScreenState extends ConsumerState<SessionScreen> {
   /// les **pixels de l'écran distant**, borné à l'image courante ; `null` si
   /// la sélection est trop petite ou hors de l'image.
   RegionDto? _regionDepuisRect(Rect local, Size taille) {
-    final image = _trameCourante.value;
-    if (image == null) return null;
-    final rectVideo = _rectAffichageVideo(taille, image, _modeVideo);
+    final tailleImage = _tailleDistante.value;
+    if (tailleImage == null) return null;
+    final int imgW = tailleImage.width.round();
+    final int imgH = tailleImage.height.round();
+    if (imgW <= 0 || imgH <= 0) return null;
+    final rectVideo = _rectAffichageVideo(taille, tailleImage, _modeVideo);
     if (rectVideo.width <= 0 || rectVideo.height <= 0) return null;
     final zone = local.intersect(rectVideo);
     if (zone.width < 4 || zone.height < 4) return null;
     int borner(int v, int minimum, int maximum) =>
         v < minimum ? minimum : (v > maximum ? maximum : v);
-    final sx = image.width / rectVideo.width;
-    final sy = image.height / rectVideo.height;
+    final sx = imgW / rectVideo.width;
+    final sy = imgH / rectVideo.height;
     final x =
-        borner(((zone.left - rectVideo.left) * sx).round(), 0, image.width - 1);
+        borner(((zone.left - rectVideo.left) * sx).round(), 0, imgW - 1);
     final y =
-        borner(((zone.top - rectVideo.top) * sy).round(), 0, image.height - 1);
-    final largeur = borner((zone.width * sx).round(), 1, image.width - x);
-    final hauteur = borner((zone.height * sy).round(), 1, image.height - y);
+        borner(((zone.top - rectVideo.top) * sy).round(), 0, imgH - 1);
+    final largeur = borner((zone.width * sx).round(), 1, imgW - x);
+    final hauteur = borner((zone.height * sy).round(), 1, imgH - y);
     return RegionDto(x: x, y: y, largeur: largeur, hauteur: hauteur);
   }
 
@@ -3876,15 +4001,20 @@ enum _ModeAffichageVideo {
   etirer,
 }
 
-/// Rectangle d'affichage effectif de la trame [image] dans une surface de
-/// [taille] donnée pour le [mode] choisi — partagé par le peintre vidéo, la
-/// couche d'annotations et la sélection du cadre, afin que projections et
-/// conversions restent alignées au pixel près. Sans image : toute la surface.
+/// Rectangle d'affichage effectif d'une image distante de dimensions
+/// [tailleImage] dans une surface de [taille] donnée pour le [mode] choisi —
+/// partagé par le peintre vidéo (CPU), la surface texture, la couche
+/// d'annotations et la sélection du cadre, afin que projections et conversions
+/// restent alignées au pixel près. Sans dimensions connues : toute la surface.
+///
+/// [tailleImage] porte la **résolution en pixels** de l'image distante (et non
+/// une taille logique) : elle vient de l'`ui.Image` décodée (mode CPU) ou des
+/// « ticks » du flux vidéo (mode texture).
 Rect _rectAffichageVideo(
-    Size taille, ui.Image? image, _ModeAffichageVideo mode) {
-  if (image == null || taille.isEmpty) return Offset.zero & taille;
-  final double iw = image.width.toDouble();
-  final double ih = image.height.toDouble();
+    Size taille, Size? tailleImage, _ModeAffichageVideo mode) {
+  if (tailleImage == null || taille.isEmpty) return Offset.zero & taille;
+  final double iw = tailleImage.width;
+  final double ih = tailleImage.height;
   if (iw <= 0 || ih <= 0) return Offset.zero & taille;
   final double dw;
   final double dh;
@@ -3927,7 +4057,7 @@ class _PeintreVideo extends CustomPainter {
     final double iw = image.width.toDouble();
     final double ih = image.height.toDouble();
     if (iw <= 0 || ih <= 0) return;
-    final destination = _rectAffichageVideo(size, image, mode);
+    final destination = _rectAffichageVideo(size, Size(iw, ih), mode);
     if (destination.isEmpty) return;
     canvas.drawImageRect(
       image,
@@ -3949,14 +4079,16 @@ class _PeintreVideo extends CustomPainter {
 /// [trame] (letterbox recalculé à chaque nouvelle définition d'image).
 class _PeintreAnnotations extends CustomPainter {
   _PeintreAnnotations({
-    required this.trame,
+    required this.tailleDistante,
     required this.annotations,
     required this.apercu,
     required ValueListenable<int> revision,
     required this.mode,
-  }) : super(repaint: Listenable.merge([trame, apercu, revision]));
+  }) : super(repaint: Listenable.merge([tailleDistante, apercu, revision]));
 
-  final ValueListenable<ui.Image?> trame;
+  /// Dimensions (pixels) de l'image distante — source du letterbox, valable en
+  /// mode CPU comme en mode texture (voir [_rectAffichageVideo]).
+  final ValueListenable<Size?> tailleDistante;
   final List<AnnotationDto> annotations;
   final ValueListenable<AnnotationDto?> apercu;
   final _ModeAffichageVideo mode;
@@ -3964,7 +4096,7 @@ class _PeintreAnnotations extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (size.isEmpty) return;
-    final rect = _rectAffichageVideo(size, trame.value, mode);
+    final rect = _rectAffichageVideo(size, tailleDistante.value, mode);
     if (rect.width <= 0 || rect.height <= 0) return;
     for (final annotation in annotations) {
       _peindreAnnotation(canvas, rect, annotation);
@@ -4064,7 +4196,7 @@ class _PeintreAnnotations extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _PeintreAnnotations old) =>
-      old.trame != trame ||
+      old.tailleDistante != tailleDistante ||
       old.annotations != annotations ||
       old.apercu != apercu ||
       old.mode != mode;

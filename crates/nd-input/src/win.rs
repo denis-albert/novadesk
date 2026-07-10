@@ -556,6 +556,18 @@ mod tests {
         assert_eq!(inj.pressed_counts(), (0, 0));
     }
 
+    /// La séquence d'attention sécurisée est exposée comme **action hôte
+    /// déclenchable** (câblée dans `nd-core` via `HostAction::SendCtrlAltDel`, et
+    /// autorisée par la politique `SoftwareSASGeneration` que pose le service). On
+    /// valide ici sa **signature** de fonction hôte sans la déclencher : un vrai
+    /// envoi exige le contexte service/SYSTEM et le bureau sécurisé, et
+    /// perturberait la session de test.
+    #[test]
+    fn sas_exposee_comme_action_hote() {
+        let action: Option<fn() -> Result<()>> = Some(send_secure_attention_sequence);
+        assert!(action.is_some());
+    }
+
     #[test]
     fn button_code_est_bijectif() {
         for btn in [

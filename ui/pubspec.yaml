@@ -26,6 +26,18 @@ dependencies:
   # variantes porteuses (ex. InputEventDto) en classes scellées freezed.
   freezed_annotation: ^2.4.4
   lucide_icons_flutter: ^3.1.14+2
+  # Gestion de **fenêtre native réelle** (remplace la façade no-op
+  # `lib/platform/window_shim.dart`) : minimiser/agrandir/restaurer/fermer,
+  # plein écran, déplacement par la barre de titre custom (`titleBarStyle:
+  # hidden`). Plugin natif desktop — compile grâce aux droits admin (support des
+  # liens symboliques Windows).
+  window_manager: ^0.4.3
+  # Rendu vidéo par **texture GPU** : accès au *handle* du moteur Flutter
+  # (`IrondashEngineContext.getEngineHandle`) transmis au cœur Rust (`nd-ffi`),
+  # qui crée une `Texture` PixelBuffer alimentée par les frames de session (voir
+  # `lib/platform/texture_video.dart` + `crates/nd-ffi/src/texture.rs`). Version
+  # alignée sur la crate Rust homonyme (0.5.x). Plugin natif desktop.
+  irondash_engine_context: ^0.5.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

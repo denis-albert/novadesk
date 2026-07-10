@@ -295,6 +295,9 @@ pub(crate) fn arreter_session(id: u64) -> Result<(), String> {
     // Ferme d'abord les tunnels TCP de la session (cesse d'accepter, joint les
     // fils d'acceptation), puis arrête le moteur.
     fermer_tunnels_interne(id);
+    // Détache toute texture GPU de la session (la texture elle-même est libérée
+    // par le Dart au `dispose` de l'écran ; ici on cesse juste de l'alimenter).
+    crate::texture::detacher_session(id);
     entree.poignee.stop();
     Ok(())
 }
@@ -656,16 +659,58 @@ pub(crate) fn flux_etats(id: u64, sink: StreamSink<SessionStateDto>) -> Result<(
 
 /// Branche le flux vidéo (fonction clé du rendu UI) : prend définitivement le
 /// récepteur de frames et lance son thread de drainage vers `sink`.
+///
+/// Le drainage vidéo est **spécialisé** ([`demarrer_drain_video`]) : quand une
+/// **texture GPU** est attachée à la session (`nd_texture_attach`), chaque trame
+/// est acheminée vers la texture (`crate::texture`) et seul un « tick »
+/// (dimensions, sans pixels) part vers le Dart. Sans texture, comportement
+/// historique : la trame RGBA complète est poussée (repli CPU
+/// `decodeImageFromPixels`).
 pub(crate) fn flux_video(id: u64, sink: StreamSink<VideoFrameDto>) -> Result<(), String> {
     let frames = avec_entree(id, |entree| entree.frames.take())?.ok_or_else(|| {
         format!("le flux vidéo de la session {id} est déjà consommé (flux ou lecture en cours)")
     })?;
-    demarrer_drain(
-        format!("nd-ffi-video-{id}"),
-        frames,
-        sink,
-        VideoFrameDto::from,
-    )
+    demarrer_drain_video(format!("nd-ffi-video-{id}"), id, frames, sink)
+}
+
+/// Draine les frames vidéo de la session `id` vers `sink`, en acheminant chaque
+/// trame vers la **texture GPU** de la session quand une texture est attachée.
+///
+/// En mode texture, la trame est consommée par la texture ([`crate::texture`]
+/// remplit son tampon et signale « image disponible ») et seul un `VideoFrameDto`
+/// « tick » (largeur/hauteur, `rgba` vide) part vers le Dart : l'UI sait qu'une
+/// image est prête **sans copier les pixels par le pont**. Sans texture, la
+/// trame RGBA complète est poussée (repli CPU). Même cycle de vie que
+/// [`demarrer_drain`] : fin de session (canal déconnecté) ou flux annulé côté
+/// Dart (`add` en échec).
+fn demarrer_drain_video(
+    nom: String,
+    id: u64,
+    rx: Receiver<DecodedFrame>,
+    sink: StreamSink<VideoFrameDto>,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name(nom.clone())
+        .spawn(move || {
+            while let Ok(frame) = rx.recv() {
+                let dto = match crate::texture::consommer_frame(id, frame) {
+                    // Consommée par la texture : « tick » sans pixels.
+                    Ok((largeur, hauteur)) => VideoFrameDto {
+                        width: largeur,
+                        height: hauteur,
+                        rgba: Vec::new(),
+                    },
+                    // Aucune texture : trame RGBA complète (repli CPU).
+                    Err(frame) => VideoFrameDto::from(frame),
+                };
+                if sink.add(dto).is_err() {
+                    // Flux annulé côté Dart : on cesse de drainer.
+                    break;
+                }
+            }
+        })
+        .map(|_poignee| ())
+        .map_err(|e| format!("création du thread « {nom} » impossible : {e}"))
 }
 
 /// Branche le flux de chat (mode étendu) : prend définitivement le récepteur de

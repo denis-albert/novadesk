@@ -1,0 +1,56 @@
+# Binaire de **service Windows** de NovaDesk : hôte « accès non surveillé »
+# tournant en LocalSystem (session 0), prérequis du vrai accès non surveillé
+# persistant et du bureau sécurisé (SAS). Voir la documentation du module `main`.
+[package]
+name = "nd-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Service Windows NovaDesk (hôte accès non surveillé en LocalSystem, SAS)."
+
+# Un seul binaire : `novadesk-svc` (sous-commandes install / uninstall / run /
+# run-console / probe-session). Le SCM appelle `novadesk-svc run`.
+[[bin]]
+name = "novadesk-svc"
+path = "src/main.rs"
+
+[dependencies]
+# Cœur : hôte non surveillé (machine à états, admission dans le canal Noise).
+nd-core = { workspace = true }
+# Ensemble de permissions accordées aux sessions servies par l'hôte.
+nd-features = { workspace = true }
+# Identité TLS persistée (certificat épinglable publié au rendez-vous).
+nd-transport = { workspace = true }
+# NovaId (identifiant à 9 chiffres publié au rendez-vous).
+nd-proto = { workspace = true }
+# Source d'aléa (CSPRNG du workspace) pour le sel du haché de mot de passe —
+# même primitive que `nd-ffi::etat` (repli horloge si indisponible).
+nd-crypto = { workspace = true }
+# Persistance pur Rust : configuration machine JSON sous ProgramData.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Haché salé du mot de passe non surveillé (jamais stocké en clair) — même
+# schéma que `nd-ffi::etat` (BLAKE3(sel || mot de passe)).
+blake3 = "1"
+
+# Spécifique Windows : gestion du service (SCM) via `windows-service`, et FFI
+# Win32 pour la politique SAS (registre HKLM) et l'interaction session 0 ↔
+# session utilisateur active (WTS / CreateProcessAsUser). Version `windows`
+# alignée sur nd-input / nd-ffi (0.58) pour ne pas dédoubler la dépendance.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Environment",
+] }
+
+[dev-dependencies]
+# Répertoires temporaires uniques pour les tests de configuration (round-trips).
+tempfile = "3"
+
+[lints]
+workspace = true

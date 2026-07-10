@@ -38,6 +38,15 @@ blake3 = "1"
 # résolu dans ui/pubspec.lock (2.12.0) : codegen, crate runtime et paquet Dart
 # doivent partager la même version.
 flutter_rust_bridge = "=2.12.0"
+# Rendu vidéo par **TEXTURE GPU** (plan « texture ») : pont Rust ↔ registre de
+# textures Flutter. `irondash_texture` crée une texture PixelBuffer alimentée
+# depuis le cœur (upload CPU→GPU par Flutter) ; `irondash_engine_context` relie
+# la texture au moteur Flutter via le handle passé par le Dart
+# (`IrondashEngineContext.getEngineHandle`). Versions alignées sur les paquets
+# Dart homonymes de `ui/pubspec.yaml` (0.5.x). Le chemin RGBA-CPU historique
+# (`decodeImageFromPixels`) reste le repli quand la texture échoue.
+irondash_texture = "0.5"
+irondash_engine_context = "0.5"
 
 # Durcissement du stockage local **sans droits administrateur** (module `plateforme`) :
 #   * chiffrement des secrets au repos via DPAPI (`CryptProtectData`/`CryptUnprotectData`,

@@ -41,14 +41,19 @@ Future<void> main() async {
   // NOTE : une fois le binding flutter_rust_bridge généré (lib/bridge/README.md),
   // initialiser ici le runtime Rust : `await RustLib.init();`.
 
-  // Fenêtrage desktop : taille initiale/minimale et titre.
+  // Fenêtrage desktop natif réel (plugin `window_manager`) : taille
+  // initiale/minimale, titre, et **barre de titre masquée**
+  // (`TitleBarStyle.hidden`) — la barre de titre custom de l'app (onglets +
+  // contrôles ─ ▢ ✕) est conservée, dessinée par-dessus, et son déplacement se
+  // fait via `windowManager.startDragging()` (voir `widgets/app_frame.dart`).
   if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
     await windowManager.ensureInitialized();
-    final options = WindowOptions(
-      size: const Size(1120, 720),
-      minimumSize: const Size(880, 560),
+    const options = WindowOptions(
+      size: Size(1120, 720),
+      minimumSize: Size(880, 560),
       center: true,
       title: 'NovaDesk',
+      titleBarStyle: TitleBarStyle.hidden,
     );
     unawaited(windowManager.waitUntilReadyToShow(options, () async {
       await windowManager.show();

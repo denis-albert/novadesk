@@ -262,6 +262,15 @@ mod lecture;
 /// par le codegen.
 mod plateforme;
 
+/// Rendu vidéo par **texture GPU** : pont entre les frames décodées et le
+/// registre de textures Flutter (`irondash_texture` / `irondash_engine_context`).
+/// Expose trois symboles C directs (`nd_texture_init` / `nd_texture_attach` /
+/// `nd_texture_dispose`) appelés par le Dart via `dart:ffi` — **aucune
+/// régénération `frb` requise** (aucun `StreamSink`, hors du périmètre scanné
+/// par le codegen). Les trames de la session attachée sont acheminées vers la
+/// texture par [`flux`] ; le chemin RGBA-CPU historique reste le repli.
+mod texture;
+
 pub use api::*;
 
 // `StreamSink` (défini par le pont généré) apparaît dans les signatures publiques de
