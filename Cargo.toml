@@ -28,6 +28,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.90"
 authors = ["Équipe NovaDesk"]
+license = "AGPL-3.0-or-later"
 
 # Dépendances internes (chemins). Les dépendances externes lourdes (tokio, quinn,
 # snow, windows-rs...) sont ajoutées crate par crate au fil de l'implémentation.

@@ -6,11 +6,10 @@ chiffrement de bout en bout (Noise), injection d'entrées, audio Opus, transfert
 fichiers et presse-papiers partagé — plus les services serveur (rendez-vous, relais,
 comptes, API).
 
-Le **plan technique complet** qui gouverne ce code se trouve dans
-[`../plan-technique/`](../plan-technique/) — commencez par
-[`00-README.md`](../plan-technique/00-README.md) et
-[`01-architecture-globale.md`](../plan-technique/01-architecture-globale.md).
-Chaque crate cite le fichier de plan qui la spécifie.
+Le développement suit un **plan technique interne** (documents 00 à 16, non
+versionnés dans ce dépôt) ; les numéros de « plan » cités dans le code et les
+tableaux ci-dessous y renvoient. La vue d'ensemble de l'architecture est dans
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## État
 
@@ -20,7 +19,7 @@ chiffrée Noise XX par-dessus QUIC, boucle de contrôle clavier/souris, audio WA
 Opus, transfert de fichiers BLAKE3 avec reprise, presse-papiers riche, et connexion
 **par ID** via le serveur de rendez-vous. Les backends macOS/Linux (plans 02, 07, 08,
 12), le NAT traversal complet (plan 05) et l'UI Flutter (plan 10) suivent la
-[roadmap](../plan-technique/16-roadmap-planning.md).
+roadmap du plan technique (plan 16).
 
 Le workspace compte 17 crates (~20 000 lignes) et plus de 300 tests automatisés ;
 Clippy strict (`-D warnings`) passe à zéro avertissement.
@@ -111,6 +110,14 @@ celles marquées `--release` sont sensibles à la vitesse de l'encodeur logiciel
 - **Release** : [`.github/workflows/release.yml`](.github/workflows/release.yml) —
   squelette déclenché sur tag `v*` (build `--release`, artefacts par OS).
 - **Packaging** : [`packaging/README.md`](packaging/README.md) — notes MSI/MSIX,
-  .dmg/notarisation, .deb/.rpm/AppImage/Flatpak, alignées sur le
-  [plan 15](../plan-technique/15-deploiement-mise-a-jour.md).
+  .dmg/notarisation, .deb/.rpm/AppImage/Flatpak, alignées sur le plan 15.
 - **Contribuer** : [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Licence et sécurité
+
+NovaDesk est distribué sous licence **AGPL-3.0-or-later** — voir
+[`LICENSE`](LICENSE). Tout fork ou service dérivé doit republier ses sources
+dans les mêmes conditions.
+
+Pour signaler une vulnérabilité, suivre [`SECURITY.md`](SECURITY.md) — pas
+d'issue publique pour une faille exploitable.
